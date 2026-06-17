@@ -148,6 +148,7 @@ function CommandDeck() {
   const [histIdx, setHistIdx]       = useState(-1);
   const [rightTab, setRightTab]     = useState<"tasks" | "trace" | "tools">("tasks");
   const [reactorFlash, setReactorFlash] = useState(false);
+  const [streamLine, setStreamLine] = useState("");
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
@@ -217,7 +218,11 @@ function CommandDeck() {
           if (txt) addLineRef.current("system", txt);
         }
         if (d.type === "transcription" || d.type === "transcript") addLineRef.current("user", txt);
+        if (d.type === "llm_chunk" && d.text) {
+          setStreamLine(prev => prev + (d.text as string));
+        }
         if (d.type === "llm_response" || d.type === "response") {
+          setStreamLine("");
           flashReactorRef.current();
           addLineRef.current("agent", txt);
           refreshRef.current();
@@ -482,6 +487,22 @@ function CommandDeck() {
                 </motion.div>
               ))}
             </AnimatePresence>
+
+            {streamLine && (
+              <div className="hud-msg hud-msg--agent" style={{ opacity: 0.85 }}>
+                <span className="hud-msg-time">{new Date().toTimeString().slice(0, 8)}</span>
+                <span className="hud-msg-role hud-msg-role--amber">JARVIS</span>
+                <span className="hud-msg-text">
+                  {streamLine}
+                  <motion.span
+                    animate={{ opacity: [1, 0] }}
+                    transition={{ duration: 0.6, repeat: Infinity, ease: "easeInOut" }}
+                    style={{ display: "inline-block", marginLeft: 2, width: 6, height: "1em",
+                             background: "oklch(0.68 0.22 38)", verticalAlign: "middle" }}
+                  />
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Quick actions */}
