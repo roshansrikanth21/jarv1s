@@ -55,6 +55,24 @@ except ImportError:
     _HAS_ANTHROPIC = False
     USE_CLAUDE = False
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL   = "llama-3.3-70b-versatile"
+USE_GROQ     = bool(GROQ_API_KEY)
+
+try:
+    import openai as _openai_mod
+    _HAS_GROQ = True
+except ImportError:
+    _HAS_GROQ = False
+    USE_GROQ  = False
+
+
+def _active_model() -> str:
+    if USE_GROQ and _HAS_GROQ:        return GROQ_MODEL
+    if USE_CLAUDE and _HAS_ANTHROPIC: return CLAUDE_MODEL
+    return OLLAMA_MODEL
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="JARVIS Backend", docs_url=None, redoc_url=None)
 app.add_middleware(
@@ -469,6 +487,70 @@ async def _emit_final(text: str) -> None:
     asyncio.create_task(_speak(text))
 
 
+# ── Groq agent loop (primary — free 70B, ~500 tok/s, streaming) ────────────────
+async def _agent_groq(text: str) -> None:
+    client = _openai_mod.AsyncOpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": _build_system_prompt()},
+        {"role": "user",   "content": text},
+    ]
+
+    for _ in range(8):
+        stream = await client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
+            max_tokens=4096,
+            stream=True,
+        )
+
+        full_text = ""
+        tool_calls_raw: dict[int, dict] = {}
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if not delta:
+                continue
+            if delta.content:
+                full_text += delta.content
+                await broadcast({"type": "llm_chunk", "text": delta.content})
+            if delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_raw:
+                        tool_calls_raw[idx] = {"id": "", "name": "", "arguments": ""}
+                    if tc.id:                   tool_calls_raw[idx]["id"]   = tc.id
+                    if tc.function.name:        tool_calls_raw[idx]["name"] = tc.function.name
+                    if tc.function.arguments:   tool_calls_raw[idx]["arguments"] += tc.function.arguments
+
+        if not tool_calls_raw:
+            if full_text.strip():
+                await _emit_final(full_text.strip())
+            break
+
+        messages.append({
+            "role": "assistant",
+            "content": full_text or None,
+            "tool_calls": [
+                {"id": tc["id"], "type": "function",
+                 "function": {"name": tc["name"], "arguments": tc["arguments"]}}
+                for tc in tool_calls_raw.values()
+            ],
+        })
+
+        for tc in tool_calls_raw.values():
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {}
+            obs = await _run_tool(tc["name"], args)
+            messages.append({"role": "tool", "tool_call_id": tc["id"], "content": obs})
+
+
 # ── Claude agent loop ───────────────────────────────────────────────────────────
 async def _agent_claude(text: str) -> None:
     client   = _AnthropicClient(api_key=ANTHROPIC_API_KEY)
@@ -551,7 +633,9 @@ async def handle_command(text: str) -> None:
     await broadcast({"type": "state", "status": "thinking", "text": "Processing directive..."})
 
     try:
-        if USE_CLAUDE:
+        if USE_GROQ and _HAS_GROQ:
+            await _agent_groq(text)
+        elif USE_CLAUDE and _HAS_ANTHROPIC:
             await _agent_claude(text)
         else:
             await _agent_ollama(text)
@@ -702,8 +786,8 @@ async def agent_status() -> dict:
     disk = psutil.disk_usage("C:\\")
     return {
         "brain": {
-            "primary_llm":          MODEL,
-            "local_model":          MODEL,
+            "primary_llm":          _active_model(),
+            "local_model":          OLLAMA_MODEL,
             "max_agent_steps":      8,
             "use_llm_intent_router": False,
         },
@@ -738,7 +822,7 @@ async def command_endpoint(body: dict) -> dict:
 async def health() -> dict:
     return {
         "status":   "ok",
-        "model":    MODEL,
+        "model":    _active_model(),
         "time":     datetime.now().isoformat(),
         "memories": len(memories),
     }
@@ -749,7 +833,8 @@ async def health() -> dict:
 async def on_startup() -> None:
     global _main_loop
     _main_loop = asyncio.get_event_loop()
-    print(f"[JARVIS] Backend online — model: {MODEL}")
+    brain = "Groq" if (USE_GROQ and _HAS_GROQ) else "Claude" if (USE_CLAUDE and _HAS_ANTHROPIC) else "Ollama"
+    print(f"[JARVIS] Backend online — model: {_active_model()} ({brain})")
     print(f"[JARVIS] Memory: {len(memories)} entries | Tools: {len(TOOLS)}")
 
     dist_dir = BASE_DIR / "jarvis" / "dist"
