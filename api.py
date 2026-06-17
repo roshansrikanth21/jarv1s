@@ -488,6 +488,40 @@ async def _emit_final(text: str) -> None:
 
 
 # ── Groq agent loop (primary — free 70B, ~500 tok/s, streaming) ────────────────
+async def _groq_round(client, messages: list[dict], allow_tools: bool):
+    """One streaming round. Returns (full_text, tool_calls_raw dict)."""
+    kwargs: dict = {
+        "model": GROQ_MODEL,
+        "messages": messages,
+        "max_tokens": 4096,
+        "stream": True,
+    }
+    if allow_tools:
+        kwargs["tools"] = TOOLS
+        kwargs["tool_choice"] = "auto"
+
+    stream = await client.chat.completions.create(**kwargs)
+
+    full_text = ""
+    tool_calls_raw: dict[int, dict] = {}
+    async for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if not delta:
+            continue
+        if delta.content:
+            full_text += delta.content
+            await broadcast({"type": "llm_chunk", "text": delta.content})
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tool_calls_raw:
+                    tool_calls_raw[idx] = {"id": "", "name": "", "arguments": ""}
+                if tc.id:                 tool_calls_raw[idx]["id"]   = tc.id
+                if tc.function.name:      tool_calls_raw[idx]["name"] = tc.function.name
+                if tc.function.arguments: tool_calls_raw[idx]["arguments"] += tc.function.arguments
+    return full_text, tool_calls_raw
+
+
 async def _agent_groq(text: str) -> None:
     client = _openai_mod.AsyncOpenAI(
         api_key=GROQ_API_KEY,
@@ -499,33 +533,14 @@ async def _agent_groq(text: str) -> None:
     ]
 
     for _ in range(8):
-        stream = await client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-            max_tokens=4096,
-            stream=True,
-        )
-
-        full_text = ""
-        tool_calls_raw: dict[int, dict] = {}
-
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if not delta:
-                continue
-            if delta.content:
-                full_text += delta.content
-                await broadcast({"type": "llm_chunk", "text": delta.content})
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_raw:
-                        tool_calls_raw[idx] = {"id": "", "name": "", "arguments": ""}
-                    if tc.id:                   tool_calls_raw[idx]["id"]   = tc.id
-                    if tc.function.name:        tool_calls_raw[idx]["name"] = tc.function.name
-                    if tc.function.arguments:   tool_calls_raw[idx]["arguments"] += tc.function.arguments
+        try:
+            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=True)
+        except _openai_mod.APIError:
+            # Intermittent llama-3.3-70b quirk: model emits a malformed tool call
+            # that Groq's parser rejects mid-stream (surfaces as APIError, not
+            # BadRequestError, because the stream already opened). Retry this turn
+            # forcing a text answer — prior tool results stay in context.
+            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
 
         if not tool_calls_raw:
             if full_text.strip():
@@ -546,6 +561,8 @@ async def _agent_groq(text: str) -> None:
             try:
                 args = json.loads(tc["arguments"]) if tc["arguments"] else {}
             except json.JSONDecodeError:
+                args = {}
+            if not isinstance(args, dict):   # Groq sometimes streams 'null'
                 args = {}
             obs = await _run_tool(tc["name"], args)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": obs})
