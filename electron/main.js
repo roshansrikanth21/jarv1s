@@ -33,11 +33,16 @@ function resolvePythonPath() {
     return { path: packagedBackend, isPackaged: true };
   }
 
+  const venvPy = (root) =>
+    isWindows ? path.join(root, "venv", "Scripts", "python.exe") : path.join(root, "venv", "bin", "python");
+
   const candidates = [
-    isWindows ? path.join(appRoot, "venv", "Scripts", "python.exe") : path.join(appRoot, "venv", "bin", "python"),
+    process.env.JARVIS_PYTHON,        // explicit override
+    venvPy(appRoot),                  // venv inside the repo (portable)
+    venvPy(path.resolve(appRoot, "..")), // venv one level up (e.g. C:\Users\rosha\venv)
     isWindows ? "py" : "python3",
     "python",
-  ];
+  ].filter(Boolean);
   const found = candidates.find((candidate) => candidate === "py" || candidate === "python3" || candidate === "python" || fs.existsSync(candidate));
   return { path: found, isPackaged: false };
 }
