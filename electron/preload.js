@@ -6,4 +6,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   toggleMaximize: () => ipcRenderer.send("window-toggle-maximize"),
   closeWindow: () => ipcRenderer.send("window-close"),
   restartBackend: () => ipcRenderer.invoke("backend-restart"),
+  onMaximizeChange: (cb) => {
+    const handler = (_e, isMax) => cb(isMax);
+    ipcRenderer.on("window-maximized", handler);
+    return () => ipcRenderer.removeListener("window-maximized", handler);
+  },
 });

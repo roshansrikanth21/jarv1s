@@ -157,6 +157,10 @@ function createWindow() {
   mainWindow.on("closed", () => {
     mainWindow = undefined;
   });
+
+  // Notify the renderer so the maximize/restore button shows the right icon.
+  mainWindow.on("maximize", () => mainWindow?.webContents.send("window-maximized", true));
+  mainWindow.on("unmaximize", () => mainWindow?.webContents.send("window-maximized", false));
 }
 
 async function loadApp() {
