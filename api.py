@@ -20,7 +20,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import ollama
 import psutil
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -400,6 +399,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "capture_screen":
         try:
             import mss
+            import ollama
             from PIL import Image
 
             with mss.mss() as sct:
@@ -422,7 +422,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             )
             return resp.message.content
         except ImportError:
-            return "mss/Pillow not installed. Run: pip install mss Pillow"
+            return "Vision deps missing. Run: pip install mss Pillow ollama (and run Ollama + llava locally)."
         except Exception as exc:
             return f"Screen capture failed: {exc}"
 
@@ -608,6 +608,7 @@ async def _agent_claude(text: str) -> None:
 
 # ── Ollama agent loop (fallback) ────────────────────────────────────────────────
 async def _agent_ollama(text: str) -> None:
+    import ollama
     client   = ollama.AsyncClient()
     messages: list[dict] = [
         {"role": "system", "content": _build_system_prompt()},
