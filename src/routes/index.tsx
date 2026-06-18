@@ -237,9 +237,19 @@ function CommandDeck() {
           const audio = new Audio(url);
           audioRef.current = audio;
           setSpeaking(true);
-          audio.onended = () => { setSpeaking(false); URL.revokeObjectURL(url); audioRef.current = null; };
-          audio.onerror = () => { setSpeaking(false); URL.revokeObjectURL(url); audioRef.current = null; };
-          audio.play().catch(() => setSpeaking(false));
+          // Tell the backend the exact playback window so it mutes the mic and
+          // never transcribes JARVIS's own voice (feedback-loop prevention).
+          const ttsEnd = () => {
+            setSpeaking(false);
+            URL.revokeObjectURL(url);
+            audioRef.current = null;
+            wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+          };
+          audio.onended = ttsEnd;
+          audio.onerror = ttsEnd;
+          audio.play()
+            .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
+            .catch(() => ttsEnd());
         }
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
