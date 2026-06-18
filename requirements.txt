@@ -1,0 +1,30 @@
+# JARVIS backend dependencies — install into a venv at ./venv:
+#   python -m venv venv
+#   venv\Scripts\pip install -r requirements.txt   (Windows)
+#   venv/bin/pip install -r requirements.txt        (macOS/Linux)
+
+# Web server
+fastapi
+uvicorn[standard]
+websockets
+
+# Brain / vision / STT — all via Groq's free OpenAI-compatible API
+openai
+
+# Text-to-speech (Microsoft Edge neural voices, free, cloud)
+edge-tts
+
+# Voice input capture + VAD
+sounddevice
+numpy
+
+# System tools
+psutil
+
+# Screen capture (for cloud vision)
+mss
+Pillow
+
+# Optional fallback brains (only if you set the keys / run Ollama locally)
+anthropic
+ollama

@@ -63,6 +63,7 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "medium")    # low | medium | high (gpt-oss only)
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
@@ -418,7 +419,6 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "capture_screen":
         try:
             import mss
-            import ollama
             from PIL import Image
 
             with mss.mss() as sct:
@@ -427,23 +427,46 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
                 img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
                 img.thumbnail((1280, 720), Image.LANCZOS)
                 buf = io.BytesIO()
-                img.save(buf, format="PNG", optimize=True)
+                img.save(buf, format="JPEG", quality=70)
                 img_bytes = buf.getvalue()
-
-            # Use llava (vision model) to describe the screen
-            resp = ollama.chat(
-                model=VISION_MODEL,
-                messages=[{
-                    "role": "user",
-                    "content": "Describe what is on this screen concisely. Focus on the main content and any important details.",
-                    "images": [img_bytes],
-                }],
-            )
-            return resp.message.content
         except ImportError:
-            return "Vision deps missing. Run: pip install mss Pillow ollama (and run Ollama + llava locally)."
+            return "Vision deps missing. Run: pip install mss Pillow."
         except Exception as exc:
             return f"Screen capture failed: {exc}"
+
+        prompt = ("Describe what is on this screen concisely. Focus on the main "
+                  "content, active app, and any important details.")
+
+        # Preferred: Groq cloud vision (Llama 4, multimodal) — no GPU, no Ollama.
+        if USE_GROQ and _HAS_GROQ:
+            try:
+                b64 = base64.b64encode(img_bytes).decode()
+                client = _openai_mod.OpenAI(
+                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                )
+                resp = client.chat.completions.create(
+                    model=GROQ_VISION_MODEL,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url",
+                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                    ]}],
+                    max_tokens=500,
+                )
+                return resp.choices[0].message.content
+            except Exception as exc:
+                return f"Vision read failed: {exc}"
+
+        # Fallback: local llava via Ollama (needs Ollama running + llava pulled).
+        try:
+            import ollama
+            resp = ollama.chat(
+                model=VISION_MODEL,
+                messages=[{"role": "user", "content": prompt, "images": [img_bytes]}],
+            )
+            return resp.message.content
+        except Exception as exc:
+            return f"Screen capture failed (no Groq key and Ollama unavailable): {exc}"
 
     if name == "run_command":
         cmd = args["command"]
