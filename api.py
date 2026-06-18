@@ -54,9 +54,15 @@ except ImportError:
     _HAS_ANTHROPIC = False
     USE_CLAUDE = False
 
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = "llama-3.3-70b-versatile"
-USE_GROQ     = bool(GROQ_API_KEY)
+GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+# Default: gpt-oss-120b — true reasoning model. Keeps chain-of-thought on a hidden
+# channel and returns clean, concise answers (ideal for TTS). 8k TPM is fine for
+# personal use; rate limits degrade gracefully. For max throughput / no throttling
+# set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
+GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "medium")    # low | medium | high (gpt-oss only)
+STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
+USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
     import openai as _openai_mod
@@ -452,6 +458,8 @@ Roshan: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensic
 
 Personality: calm, sharp, dry wit. Never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
 
+Your replies are read aloud by text-to-speech. So: speak in plain spoken sentences. NEVER use markdown, headers, bullet points, asterisks, code fences, or LaTeX/math notation. Spell math out in words ("ninety minus sixty"). Keep answers to one or two sentences unless explicitly asked for detail or code. For code, keep prose minimal around it.
+
 You have full system access: filesystem, shell, browser launch, screen capture, memory, web search. Use tools aggressively when the answer requires real data — never fake it."""
 
 
@@ -487,15 +495,17 @@ async def _emit_final(text: str) -> None:
     asyncio.create_task(_speak(text))
 
 
-# ── Groq agent loop (primary — free 70B, ~500 tok/s, streaming) ────────────────
+# ── Groq agent loop (primary — gpt-oss-120b reasoning model, streaming) ────────
 async def _groq_round(client, messages: list[dict], allow_tools: bool):
     """One streaming round. Returns (full_text, tool_calls_raw dict)."""
     kwargs: dict = {
         "model": GROQ_MODEL,
         "messages": messages,
-        "max_tokens": 4096,
+        "max_tokens": 2048,   # room for hidden reasoning + a concise answer, still under TPM
         "stream": True,
     }
+    if "gpt-oss" in GROQ_MODEL:
+        kwargs["reasoning_effort"] = GROQ_REASONING
     if allow_tools:
         kwargs["tools"] = TOOLS
         kwargs["tool_choice"] = "auto"
@@ -504,10 +514,16 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool):
 
     full_text = ""
     tool_calls_raw: dict[int, dict] = {}
+    thinking_sent = False
     async for chunk in stream:
         delta = chunk.choices[0].delta if chunk.choices else None
         if not delta:
             continue
+        # gpt-oss streams chain-of-thought on a separate `reasoning` channel —
+        # don't speak/display it, just flag that the model is thinking.
+        if getattr(delta, "reasoning", None) and not thinking_sent:
+            thinking_sent = True
+            await broadcast({"type": "state", "status": "thinking", "text": "Reasoning..."})
         if delta.content:
             full_text += delta.content
             await broadcast({"type": "llm_chunk", "text": delta.content})
@@ -532,19 +548,37 @@ async def _agent_groq(text: str) -> None:
         {"role": "user",   "content": text},
     ]
 
+    emitted = False
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=True)
+        except _openai_mod.RateLimitError:
+            await _emit_final("I've hit Groq's per-minute rate limit. Give me a few seconds and ask again.")
+            emitted = True
+            break
         except _openai_mod.APIError:
-            # Intermittent llama-3.3-70b quirk: model emits a malformed tool call
-            # that Groq's parser rejects mid-stream (surfaces as APIError, not
-            # BadRequestError, because the stream already opened). Retry this turn
-            # forcing a text answer — prior tool results stay in context.
-            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
+            # Model emitted a malformed tool call that Groq rejected mid-stream
+            # (surfaces as APIError, not BadRequestError, because the SSE stream
+            # already opened). Retry this turn forcing a text answer — prior tool
+            # results stay in context.
+            try:
+                full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
+            except _openai_mod.APIError:
+                break
 
         if not tool_calls_raw:
             if full_text.strip():
                 await _emit_final(full_text.strip())
+                emitted = True
+            elif not emitted:
+                # Empty answer, no tools — retry once without tools, then give up gracefully.
+                try:
+                    retry_text, _ = await _groq_round(client, messages, allow_tools=False)
+                except _openai_mod.APIError:
+                    retry_text = ""
+                if retry_text.strip():
+                    await _emit_final(retry_text.strip())
+                    emitted = True
             break
 
         messages.append({
@@ -566,6 +600,10 @@ async def _agent_groq(text: str) -> None:
                 args = {}
             obs = await _run_tool(tc["name"], args)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": obs})
+
+    # Never leave the user staring at silence.
+    if not emitted:
+        await _emit_final("I didn't get a usable response that time — try rephrasing, or wait a moment if Groq is busy.")
 
 
 # ── Claude agent loop ───────────────────────────────────────────────────────────
@@ -706,6 +744,31 @@ def _stop_voice() -> None:
     broadcast_from_thread({"type": "state", "status": "idle", "text": "Mic off."})
 
 
+# Whisper hallucinates these on silence/noise — drop them.
+_STT_NOISE = {"", "you", "thank you.", "thank you", ".", "thanks for watching!", "bye."}
+
+
+def _transcribe(wav_bytes: bytes) -> str:
+    """Transcribe WAV audio via Groq Whisper. Returns text (or '' on failure)."""
+    if not (USE_GROQ and _HAS_GROQ):
+        return ""
+    try:
+        client = _openai_mod.OpenAI(
+            api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+        )
+        result = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=("speech.wav", wav_bytes, "audio/wav"),
+            response_format="text",
+            language="en",
+        )
+        text = (result or "").strip()
+        return "" if text.lower() in _STT_NOISE else text
+    except Exception as exc:
+        broadcast_from_thread({"type": "system", "text": f"Transcription failed: {exc}"})
+        return ""
+
+
 def _voice_worker() -> None:
     import queue as Q
     import wave
@@ -713,31 +776,50 @@ def _voice_worker() -> None:
     try:
         import sounddevice as sd
         import numpy as np
-        import speech_recognition as sr
     except ImportError as exc:
         broadcast_from_thread({
             "type": "system",
-            "text": f"Voice deps missing: {exc}. Run: pip install sounddevice SpeechRecognition",
+            "text": f"Voice deps missing: {exc}. Run: pip install sounddevice numpy",
         })
         return
 
+    if not (USE_GROQ and _HAS_GROQ):
+        broadcast_from_thread({"type": "system", "text": "Voice input needs a GROQ_API_KEY for Whisper transcription."})
+        return
+
     RATE = 16000
-    CHUNK = 1024          # ~64ms per callback at 16kHz
-    SPEECH_THRESH = 500   # mean absolute value → speech onset
-    SILENCE_THRESH = 150  # mean absolute value → silence
-    SILENCE_CHUNKS = 20   # ~1.3 s of silence ends the utterance
+    CHUNK = 1024            # ~64ms per callback at 16kHz
+    SPEECH_THRESH = 500     # mean absolute value → speech onset
+    SILENCE_THRESH = 150    # mean absolute value → silence
+    SILENCE_CHUNKS = 18     # ~1.2 s of trailing silence ends the utterance
+    MIN_UTTER_CHUNKS = 6    # ignore sub-~0.4s blips (claps, key taps)
 
     audio_q: Q.Queue = Q.Queue()
 
     def _cb(indata, frames, time_info, status):
         audio_q.put(indata.copy())
 
-    r = sr.Recognizer()
+    def _flush(utterance: list) -> None:
+        if len(utterance) < MIN_UTTER_CHUNKS:
+            return
+        all_audio = np.concatenate(utterance, axis=0)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(RATE)
+            wf.writeframes(all_audio.tobytes())
+        broadcast_from_thread({"type": "state", "status": "thinking", "text": "Transcribing..."})
+        text = _transcribe(buf.getvalue())
+        if text:
+            broadcast_from_thread({"type": "transcription", "text": text})
+            if _main_loop and not _main_loop.is_closed():
+                asyncio.run_coroutine_threadsafe(handle_command(text), _main_loop)
 
     try:
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
                             blocksize=CHUNK, callback=_cb):
-            broadcast_from_thread({"type": "system", "text": "Mic online."})
+            broadcast_from_thread({"type": "system", "text": "Mic online. Listening..."})
 
             recording = False
             utterance: list = []
@@ -764,31 +846,14 @@ def _voice_worker() -> None:
                         if silence_cnt >= SILENCE_CHUNKS:
                             recording = False
                             silence_cnt = 0
-                            all_audio = np.concatenate(utterance, axis=0)
+                            _flush(utterance)
                             utterance = []
-
-                            buf = io.BytesIO()
-                            with wave.open(buf, "wb") as wf:
-                                wf.setnchannels(1)
-                                wf.setsampwidth(2)
-                                wf.setframerate(RATE)
-                                wf.writeframes(all_audio.tobytes())
-                            buf.seek(0)
-
-                            try:
-                                with sr.AudioFile(buf) as source:
-                                    audio = r.record(source)
-                                text = r.recognize_google(audio)
-                                if text and text.strip():
-                                    broadcast_from_thread({"type": "transcription", "text": text})
-                                    if _main_loop and not _main_loop.is_closed():
-                                        asyncio.run_coroutine_threadsafe(
-                                            handle_command(text), _main_loop
-                                        )
-                            except sr.UnknownValueError:
-                                pass
                     else:
                         silence_cnt = 0
+
+            # flush a final in-progress utterance when mic is turned off
+            if recording:
+                _flush(utterance)
 
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Voice error: {exc}"})
