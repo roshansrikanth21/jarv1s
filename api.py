@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -96,6 +97,10 @@ memories:    list[dict] = []
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
 _listen_thread: threading.Thread | None = None
+# Echo-cancellation: suppress the mic while JARVIS is speaking so it doesn't
+# transcribe its own TTS output and trigger a runaway self-talk loop.
+_tts_playing = False          # set by the frontend for the exact playback window
+_mic_suppress_until = 0.0     # backend safety estimate + post-playback cooldown
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
@@ -140,6 +145,7 @@ def broadcast_from_thread(data: dict) -> None:
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+    global _tts_playing, _mic_suppress_until
     await websocket.accept()
     active_connections.append(websocket)
     await websocket.send_json({
@@ -157,6 +163,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 asyncio.create_task(_start_voice())
             elif action == "stop_listening":
                 _stop_voice()
+            elif action == "tts_start":
+                # Frontend began playing TTS audio — mute the mic precisely.
+                _tts_playing = True
+            elif action == "tts_end":
+                # Playback finished — keep muted briefly to swallow room echo/reverb.
+                _tts_playing = False
+                _mic_suppress_until = time.time() + 0.8
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -703,6 +716,7 @@ async def handle_command(text: str) -> None:
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
 async def _speak(text: str) -> None:
+    global _mic_suppress_until
     try:
         import edge_tts
     except ImportError:
@@ -720,6 +734,10 @@ async def _speak(text: str) -> None:
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
         if audio_bytes:
+            # Safety estimate so the mic stays muted for the whole playback even if
+            # the frontend's exact tts_end signal is delayed or dropped. Ryan speaks
+            # ~13 chars/sec; pad generously. The frontend refines this downward.
+            _mic_suppress_until = time.time() + len(clean) / 13.0 + 1.5
             b64 = base64.b64encode(audio_bytes).decode()
             await broadcast({"type": "tts_audio", "data": b64})
     except Exception:
@@ -729,9 +747,11 @@ async def _speak(text: str) -> None:
 
 # ── STT ────────────────────────────────────────────────────────────────────────
 async def _start_voice() -> None:
-    global _listening, _listen_thread
+    global _listening, _listen_thread, _tts_playing, _mic_suppress_until
     if _listening:
         return
+    _tts_playing = False
+    _mic_suppress_until = 0.0
     _listening = True
     await broadcast({"type": "state", "status": "listening", "text": "Listening..."})
     _listen_thread = threading.Thread(target=_voice_worker, daemon=True)
@@ -744,12 +764,32 @@ def _stop_voice() -> None:
     broadcast_from_thread({"type": "state", "status": "idle", "text": "Mic off."})
 
 
-# Whisper hallucinates these on silence/noise — drop them.
-_STT_NOISE = {"", "you", "thank you.", "thank you", ".", "thanks for watching!", "bye."}
+# Whisper hallucinates these stock phrases on silence/noise — drop them.
+_STT_NOISE = {
+    "", "you", ".", "..", "...", "thank you", "thank you.", "thanks for watching",
+    "thanks for watching!", "bye", "bye.", "okay", "ok", "so", "uh", "um", "yeah",
+    "thank you for watching", "please subscribe", "subscribe", "the end", "music",
+    "[music]", "(music)", "[silence]", "i'm sorry", "hmm", "mm", "mhm",
+}
+
+
+def _is_stt_noise(text: str) -> bool:
+    """True if the transcription is almost certainly a hallucination, not a command."""
+    t = text.strip().lower()
+    if t in _STT_NOISE:
+        return True
+    # Strip to letters/digits — reject if there's basically no real content.
+    alnum = re.sub(r"[^a-z0-9]", "", t)
+    if len(alnum) < 2:
+        return True
+    # A single very short word is almost always a noise artifact.
+    if len(t.split()) == 1 and len(alnum) <= 2:
+        return True
+    return False
 
 
 def _transcribe(wav_bytes: bytes) -> str:
-    """Transcribe WAV audio via Groq Whisper. Returns text (or '' on failure)."""
+    """Transcribe WAV audio via Groq Whisper. Returns text (or '' on failure/noise)."""
     if not (USE_GROQ and _HAS_GROQ):
         return ""
     try:
@@ -763,7 +803,7 @@ def _transcribe(wav_bytes: bytes) -> str:
             language="en",
         )
         text = (result or "").strip()
-        return "" if text.lower() in _STT_NOISE else text
+        return "" if _is_stt_noise(text) else text
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Transcription failed: {exc}"})
         return ""
@@ -789,10 +829,10 @@ def _voice_worker() -> None:
 
     RATE = 16000
     CHUNK = 1024            # ~64ms per callback at 16kHz
-    SPEECH_THRESH = 500     # mean absolute value → speech onset
+    SPEECH_THRESH = 650     # mean absolute value → speech onset (raised: ignore ambient noise)
     SILENCE_THRESH = 150    # mean absolute value → silence
     SILENCE_CHUNKS = 18     # ~1.2 s of trailing silence ends the utterance
-    MIN_UTTER_CHUNKS = 6    # ignore sub-~0.4s blips (claps, key taps)
+    MIN_UTTER_CHUNKS = 8    # ignore sub-~0.5s blips (claps, key taps, coughs)
 
     audio_q: Q.Queue = Q.Queue()
 
@@ -829,6 +869,16 @@ def _voice_worker() -> None:
                 try:
                     chunk = audio_q.get(timeout=0.3)
                 except Q.Empty:
+                    continue
+
+                # Echo guard: while JARVIS is speaking (or just finished), throw the
+                # mic audio away so it can't transcribe its own voice and loop.
+                if _tts_playing or time.time() < _mic_suppress_until:
+                    if recording:
+                        recording = False
+                        utterance = []
+                        silence_cnt = 0
+                    broadcast_from_thread({"type": "audio_level", "level": 0})
                     continue
 
                 energy = int(np.abs(chunk).mean())
