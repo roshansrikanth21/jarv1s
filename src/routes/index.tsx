@@ -10,8 +10,10 @@ import {
   Database,
   Eye,
   Lock,
+  Maximize2,
   Mic,
   MicOff,
+  Minimize2,
   Minus,
   Radio,
   Send,
@@ -66,8 +68,10 @@ declare global {
   interface Window {
     electronAPI?: {
       minimizeWindow?: () => void;
+      toggleMaximize?: () => void;
       closeWindow?: () => void;
       restartBackend?: () => Promise<void>;
+      onMaximizeChange?: (cb: (isMax: boolean) => void) => (() => void) | void;
     };
   }
 }
@@ -149,6 +153,7 @@ function CommandDeck() {
   const [rightTab, setRightTab]     = useState<"tasks" | "trace" | "tools">("tasks");
   const [reactorFlash, setReactorFlash] = useState(false);
   const [streamLine, setStreamLine] = useState("");
+  const [maximized, setMaximized]   = useState(false);
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
@@ -283,6 +288,12 @@ function CommandDeck() {
     scrollRef.current?.scrollTo({ top: 9e6, behavior: reduced ? "auto" : "smooth" });
   }, [lines.length, reduced]);
 
+  // Keep the maximize/restore icon in sync with the actual window state.
+  useEffect(() => {
+    const off = window?.electronAPI?.onMaximizeChange?.((isMax) => setMaximized(isMax));
+    return () => { if (typeof off === "function") off(); };
+  }, []);
+
   const sendCommand = useCallback(async (cmd = input) => {
     const text = cmd.trim();
     if (!text) return;
@@ -387,6 +398,9 @@ function CommandDeck() {
           <IconBtn onClick={() => window?.electronAPI?.restartBackend?.()} title="Restart backend"><Zap className="w-3.5 h-3.5" /></IconBtn>
           <div className="hud-sep" />
           <IconBtn onClick={() => window?.electronAPI?.minimizeWindow?.()} title="Minimize"><Minus className="w-3.5 h-3.5" /></IconBtn>
+          <IconBtn onClick={() => window?.electronAPI?.toggleMaximize?.()} title={maximized ? "Restore" : "Maximize"}>
+            {maximized ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+          </IconBtn>
           <IconBtn danger onClick={() => window?.electronAPI?.closeWindow?.()} title="Close"><X className="w-3.5 h-3.5" /></IconBtn>
         </div>
       </header>
