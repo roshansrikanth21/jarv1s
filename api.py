@@ -83,6 +83,19 @@ TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-GB-RyanNeural")
 TTS_RATE  = os.environ.get("JARVIS_TTS_RATE", "+8%")
 TTS_PITCH = os.environ.get("JARVIS_TTS_PITCH", "+0Hz")
 
+# Voices the user can pick from at runtime (curated subset of Edge neural voices).
+VOICE_OPTIONS = [
+    {"id": "en-GB-RyanNeural",        "label": "Ryan · British male (JARVIS)"},
+    {"id": "en-GB-ThomasNeural",      "label": "Thomas · British male, warm"},
+    {"id": "en-US-GuyNeural",         "label": "Guy · US male, deep"},
+    {"id": "en-US-ChristopherNeural", "label": "Christopher · US male"},
+    {"id": "en-US-EricNeural",        "label": "Eric · US male, calm"},
+    {"id": "en-AU-WilliamNeural",     "label": "William · Australian male"},
+    {"id": "en-GB-SoniaNeural",       "label": "Sonia · British female"},
+    {"id": "en-US-AriaNeural",        "label": "Aria · US female"},
+    {"id": "en-US-JennyNeural",       "label": "Jenny · US female, friendly"},
+]
+
 # Spoken filler so longer tasks don't sit in dead silence while JARVIS works.
 # Only fires for genuinely slow tools — fast ones (system info, tasks) answer
 # quickly enough that a filler would just talk over the reply.
@@ -139,6 +152,7 @@ _speaking_text = ""           # current TTS text (lowercased) — used as an ech
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task   = None          # in-flight _speak task (for barge-in cancel)
 _history: list[dict] = []     # rolling conversation turns for multi-turn context
+_tts_voice = TTS_VOICE        # runtime-selectable voice (changed via set_voice)
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
@@ -183,7 +197,7 @@ def broadcast_from_thread(data: dict) -> None:
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    global _tts_playing, _speaking_text
+    global _tts_playing, _speaking_text, _tts_voice
     await websocket.accept()
     active_connections.append(websocket)
     await websocket.send_json({
@@ -211,6 +225,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 # Playback finished — clear the echo guard so the mic acts normally.
                 _tts_playing = False
                 _speaking_text = ""
+            elif action == "set_voice":
+                vid = data.get("voice", "")
+                if vid in {v["id"] for v in VOICE_OPTIONS}:
+                    _tts_voice = vid
+                    await broadcast({"type": "voice_changed", "voice": vid})
+                    asyncio.create_task(_speak("Voice updated. This is how I sound now."))
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -971,7 +991,7 @@ async def _speak(text: str) -> None:
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
         audio_bytes = b""
-        communicate = edge_tts.Communicate(clean, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
+        communicate = edge_tts.Communicate(clean, _tts_voice, rate=TTS_RATE, pitch=TTS_PITCH)
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
@@ -1185,6 +1205,10 @@ async def agent_status() -> dict:
         "council": {
             "panel": [_short_model(m) for m in MOA_PROPOSERS],
             "chair": _short_model(MOA_AGGREGATOR),
+        },
+        "voice": {
+            "current": _tts_voice,
+            "options": VOICE_OPTIONS,
         },
         "memory": {
             "available": True,
