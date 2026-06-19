@@ -61,9 +61,18 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 # personal use; rate limits degrade gracefully. For max throughput / no throttling
 # set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "medium")    # low | medium | high (gpt-oss only)
+GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+
+# Wake word: voice commands only fire when prefixed with one of these. Includes
+# common Whisper mis-hears of "jarvis". Set JARVIS_WAKE_REQUIRED=0 to disable.
+WAKE_WORDS = [w.strip().lower() for w in os.environ.get(
+    "JARVIS_WAKE_WORDS", "jarvis,jarvis.,jervis,javis,jarvus,jarvi,travis,charvis,jarvix"
+).split(",") if w.strip()]
+WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
+STOP_WORDS = {"stop", "stop talking", "shut up", "be quiet", "quiet", "cancel",
+              "enough", "shut up jarvis", "nevermind", "never mind"}
 USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
@@ -98,10 +107,10 @@ memories:    list[dict] = []
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
 _listen_thread: threading.Thread | None = None
-# Echo-cancellation: suppress the mic while JARVIS is speaking so it doesn't
-# transcribe its own TTS output and trigger a runaway self-talk loop.
-_tts_playing = False          # set by the frontend for the exact playback window
-_mic_suppress_until = 0.0     # backend safety estimate + post-playback cooldown
+_tts_playing = False          # frontend reports the exact playback window
+_speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
+_current_task = None          # in-flight handle_command task (for barge-in cancel)
+_speak_task   = None          # in-flight _speak task (for barge-in cancel)
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
@@ -146,7 +155,7 @@ def broadcast_from_thread(data: dict) -> None:
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    global _tts_playing, _mic_suppress_until
+    global _tts_playing, _speaking_text
     await websocket.accept()
     active_connections.append(websocket)
     await websocket.send_json({
@@ -159,18 +168,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             data = await websocket.receive_json()
             action = data.get("action", "")
             if action == "command":
-                asyncio.create_task(handle_command(data.get("text", "")))
+                # Typed command — also barges in on anything in flight.
+                asyncio.create_task(dispatch_command(data.get("text", "")))
             elif action == "start_listening":
                 asyncio.create_task(_start_voice())
             elif action == "stop_listening":
                 _stop_voice()
+            elif action == "stop":
+                # Explicit interrupt button.
+                asyncio.create_task(_stop_speaking())
             elif action == "tts_start":
-                # Frontend began playing TTS audio — mute the mic precisely.
                 _tts_playing = True
             elif action == "tts_end":
-                # Playback finished — keep muted briefly to swallow room echo/reverb.
+                # Playback finished — clear the echo guard so the mic acts normally.
                 _tts_playing = False
-                _mic_suppress_until = time.time() + 0.8
+                _speaking_text = ""
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -527,8 +539,9 @@ async def _run_tool(name: str, args: dict) -> str:
 
 
 async def _emit_final(text: str) -> None:
+    global _speak_task
     await broadcast({"type": "llm_response", "text": text})
-    asyncio.create_task(_speak(text))
+    _speak_task = asyncio.create_task(_speak(text))
 
 
 # ── Groq agent loop (primary — gpt-oss-120b reasoning model, streaming) ────────
@@ -715,6 +728,60 @@ async def _agent_ollama(text: str) -> None:
             messages.append({"role": "tool", "content": obs})
 
 
+# ── Wake word + barge-in ─────────────────────────────────────────────────────────
+def _match_wake_word(text: str):
+    """Return the command after the wake word, '' if only the wake word was said,
+    or None if no wake word is present."""
+    t = text.lower().strip()
+    best = None
+    for w in WAKE_WORDS:
+        idx = t.find(w)
+        if idx != -1 and (best is None or idx < best[0]):
+            best = (idx, w)
+    if best is None:
+        return None
+    return t[best[0] + len(best[1]):].lstrip(" ,.!?:;-'\"")
+
+
+def _is_echo(cmd: str) -> bool:
+    """True if cmd is mostly contained in what JARVIS is currently saying — i.e. the
+    mic picked up JARVIS's own voice rather than the user."""
+    sp = _speaking_text
+    if not sp:
+        return False
+    words = [w for w in re.findall(r"[a-z']+", cmd.lower()) if len(w) > 2]
+    if not words:
+        return False
+    hits = sum(1 for w in words if w in sp)
+    return hits / len(words) >= 0.6
+
+
+async def _stop_speaking() -> None:
+    """Cancel any in-flight response + TTS and tell the frontend to stop audio."""
+    global _current_task, _speak_task, _speaking_text
+    if _speak_task and not _speak_task.done():
+        _speak_task.cancel()
+    if _current_task and not _current_task.done():
+        _current_task.cancel()
+    _speaking_text = ""
+    await broadcast({"type": "tts_stop"})
+    await broadcast({"type": "state", "status": "idle"})
+
+
+async def dispatch_command(text: str) -> None:
+    """Entry point for every command (voice or typed). Barges in on whatever is
+    currently running — thinking OR speaking — so a new directive takes over."""
+    global _current_task
+    busy = (
+        (_current_task and not _current_task.done())
+        or (_speak_task and not _speak_task.done())
+        or _tts_playing
+    )
+    if busy:
+        await _stop_speaking()
+    _current_task = asyncio.create_task(handle_command(text))
+
+
 # ── Agent dispatch ──────────────────────────────────────────────────────────────
 async def handle_command(text: str) -> None:
     global agent_trace
@@ -731,6 +798,8 @@ async def handle_command(text: str) -> None:
             await _agent_claude(text)
         else:
             await _agent_ollama(text)
+    except asyncio.CancelledError:
+        raise
     except Exception as exc:
         await broadcast({"type": "llm_response", "text": f"Agent error: {exc}"})
 
@@ -739,7 +808,7 @@ async def handle_command(text: str) -> None:
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
 async def _speak(text: str) -> None:
-    global _mic_suppress_until
+    global _speaking_text
     try:
         import edge_tts
     except ImportError:
@@ -749,6 +818,9 @@ async def _speak(text: str) -> None:
     if not clean:
         return
 
+    # Record what we're about to say so the mic can tell JARVIS's own voice (echo)
+    # apart from the user. Cleared by the frontend's tts_end signal.
+    _speaking_text = clean.lower()
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
         audio_bytes = b""
@@ -757,12 +829,11 @@ async def _speak(text: str) -> None:
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
         if audio_bytes:
-            # Safety estimate so the mic stays muted for the whole playback even if
-            # the frontend's exact tts_end signal is delayed or dropped. Ryan speaks
-            # ~13 chars/sec; pad generously. The frontend refines this downward.
-            _mic_suppress_until = time.time() + len(clean) / 13.0 + 1.5
             b64 = base64.b64encode(audio_bytes).decode()
             await broadcast({"type": "tts_audio", "data": b64})
+    except asyncio.CancelledError:
+        _speaking_text = ""
+        raise
     except Exception:
         pass
     await broadcast({"type": "state", "status": "idle"})
@@ -770,13 +841,14 @@ async def _speak(text: str) -> None:
 
 # ── STT ────────────────────────────────────────────────────────────────────────
 async def _start_voice() -> None:
-    global _listening, _listen_thread, _tts_playing, _mic_suppress_until
+    global _listening, _listen_thread, _tts_playing, _speaking_text
     if _listening:
         return
     _tts_playing = False
-    _mic_suppress_until = 0.0
+    _speaking_text = ""
     _listening = True
-    await broadcast({"type": "state", "status": "listening", "text": "Listening..."})
+    hint = f"Listening — say \"{WAKE_WORDS[0]}\" to wake me." if WAKE_REQUIRED else "Listening..."
+    await broadcast({"type": "state", "status": "listening", "text": hint})
     _listen_thread = threading.Thread(target=_voice_worker, daemon=True)
     _listen_thread.start()
 
@@ -854,13 +926,17 @@ def _voice_worker() -> None:
     CHUNK = 1024            # ~64ms per callback at 16kHz
     SPEECH_THRESH = 650     # mean absolute value → speech onset (raised: ignore ambient noise)
     SILENCE_THRESH = 150    # mean absolute value → silence
-    SILENCE_CHUNKS = 18     # ~1.2 s of trailing silence ends the utterance
+    SILENCE_CHUNKS = 12     # ~0.8 s of trailing silence ends the utterance (snappier)
     MIN_UTTER_CHUNKS = 8    # ignore sub-~0.5s blips (claps, key taps, coughs)
 
     audio_q: Q.Queue = Q.Queue()
 
     def _cb(indata, frames, time_info, status):
         audio_q.put(indata.copy())
+
+    def _run(coro):
+        if _main_loop and not _main_loop.is_closed():
+            asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
     def _flush(utterance: list) -> None:
         if len(utterance) < MIN_UTTER_CHUNKS:
@@ -872,12 +948,27 @@ def _voice_worker() -> None:
             wf.setsampwidth(2)
             wf.setframerate(RATE)
             wf.writeframes(all_audio.tobytes())
-        broadcast_from_thread({"type": "state", "status": "thinking", "text": "Transcribing..."})
         text = _transcribe(buf.getvalue())
-        if text:
-            broadcast_from_thread({"type": "transcription", "text": text})
-            if _main_loop and not _main_loop.is_closed():
-                asyncio.run_coroutine_threadsafe(handle_command(text), _main_loop)
+        if not text:
+            return
+
+        # Wake-word gate: ignore anything not addressed to JARVIS.
+        cmd = _match_wake_word(text) if WAKE_REQUIRED else text
+        if cmd is None:
+            return
+        cmd = cmd.strip()
+
+        # Echo guard: drop the case where the mic heard JARVIS's own voice.
+        if _is_echo(cmd):
+            return
+
+        # Bare wake word, or a "stop" — just interrupt whatever JARVIS is doing.
+        if not cmd or cmd.lower() in STOP_WORDS:
+            _run(_stop_speaking())
+            return
+
+        broadcast_from_thread({"type": "transcription", "text": cmd})
+        _run(dispatch_command(cmd))
 
     try:
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
@@ -894,16 +985,9 @@ def _voice_worker() -> None:
                 except Q.Empty:
                     continue
 
-                # Echo guard: while JARVIS is speaking (or just finished), throw the
-                # mic audio away so it can't transcribe its own voice and loop.
-                if _tts_playing or time.time() < _mic_suppress_until:
-                    if recording:
-                        recording = False
-                        utterance = []
-                        silence_cnt = 0
-                    broadcast_from_thread({"type": "audio_level", "level": 0})
-                    continue
-
+                # Note: the mic stays live even while JARVIS speaks, so you can
+                # barge in with the wake word. Self-talk is prevented by the
+                # wake-word gate + echo guard in _flush(), not by muting.
                 energy = int(np.abs(chunk).mean())
                 broadcast_from_thread({"type": "audio_level", "level": min(energy * 5, 32767)})
 
