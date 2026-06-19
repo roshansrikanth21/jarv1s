@@ -101,7 +101,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -364,6 +364,26 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "ict_scan",
+            "description": (
+                "Scan an Indian-market instrument (Nifty 50, Sensex, Bank Nifty, or any "
+                "NSE stock) for ICT / Smart-Money price-action setups: market structure "
+                "(BOS/CHoCH), fair value gaps, order blocks, and liquidity levels. "
+                "Returns analysis and a directional bias. Analysis only — never places trades."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "symbol":   {"type": "string", "description": "nifty, sensex, banknifty, or an NSE ticker like RELIANCE / TCS"},
+                    "interval": {"type": "string", "description": "Candle size: 5m, 15m, 30m, 60m, 1d (default 15m)"},
+                },
+                "required": ["symbol"],
+            },
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -544,7 +564,132 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
         except Exception as exc:
             return f"Command failed: {exc}"
 
+    if name == "ict_scan":
+        return _ict_scan(args.get("symbol", "nifty"), args.get("interval", "15m"))
+
     return f"Unknown tool: {name}"
+
+
+# ── ICT / Smart-Money scanner (Indian markets) ─────────────────────────────────
+_INDIAN_SYMBOLS = {
+    "nifty": "^NSEI", "nifty50": "^NSEI", "nifty 50": "^NSEI", "nse": "^NSEI",
+    "sensex": "^BSESN", "bse": "^BSESN",
+    "banknifty": "^NSEBANK", "bank nifty": "^NSEBANK", "nifty bank": "^NSEBANK",
+    "finnifty": "NIFTY_FIN_SERVICE.NS",
+}
+
+
+def _resolve_symbol(sym: str) -> tuple[str, str]:
+    """Map a friendly name to a Yahoo symbol. Defaults bare tickers to NSE (.NS)."""
+    s = sym.strip().lower()
+    if s in _INDIAN_SYMBOLS:
+        return _INDIAN_SYMBOLS[s], sym.strip().upper()
+    raw = sym.strip().upper()
+    if raw.startswith("^") or "." in raw or "=" in raw:
+        return raw, raw
+    return f"{raw}.NS", raw
+
+
+def _ict_scan(symbol: str, interval: str = "15m") -> str:
+    try:
+        import yfinance as yf
+        import pandas as pd
+    except ImportError:
+        return "Market deps missing. Run: pip install yfinance pandas."
+
+    ysym, name = _resolve_symbol(symbol)
+    interval = interval if interval in {"5m", "15m", "30m", "60m", "1d"} else "15m"
+    period = {"5m": "5d", "15m": "1mo", "30m": "1mo", "60m": "3mo", "1d": "1y"}[interval]
+    try:
+        df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
+    except Exception as exc:
+        return f"Couldn't fetch {name} ({ysym}): {exc}"
+    if df is None or len(df) < 25:
+        return f"Not enough {interval} data for {name} ({ysym})."
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    highs, lows = df["High"].to_numpy(), df["Low"].to_numpy()
+    opens, closes = df["Open"].to_numpy(), df["Close"].to_numpy()
+    n = len(df)
+    last = float(closes[-1])
+
+    # Swing points (fractals, 2 bars each side)
+    w = 2
+    sh = [i for i in range(w, n - w) if highs[i] == max(highs[i - w:i + w + 1])]
+    sl = [i for i in range(w, n - w) if lows[i] == min(lows[i - w:i + w + 1])]
+
+    # Market structure from the last two swings
+    structure, bias = "ranging / unclear", "neutral"
+    if len(sh) >= 2 and len(sl) >= 2:
+        hh, hl = highs[sh[-1]] > highs[sh[-2]], lows[sl[-1]] > lows[sl[-2]]
+        lh, ll = highs[sh[-1]] < highs[sh[-2]], lows[sl[-1]] < lows[sl[-2]]
+        if hh and hl:
+            structure, bias = "higher highs & higher lows (uptrend)", "bullish"
+        elif lh and ll:
+            structure, bias = "lower highs & lower lows (downtrend)", "bearish"
+        else:
+            structure, bias = "mixed / ranging", "neutral"
+
+    last_sh = float(highs[sh[-1]]) if sh else float(max(highs))
+    last_sl = float(lows[sl[-1]]) if sl else float(min(lows))
+    bos = ""
+    if last > last_sh:
+        bos = f"bullish break of structure above {last_sh:.1f}"
+    elif last < last_sl:
+        bos = f"bearish break of structure below {last_sl:.1f}"
+
+    # Fair value gaps (3-candle imbalance), keep the few most recent & unfilled
+    fvgs = []
+    for i in range(2, n):
+        if highs[i - 2] < lows[i]:                      # bullish gap
+            if i + 1 >= n or lows[i + 1:].min() > highs[i - 2]:
+                fvgs.append(("bullish", float(highs[i - 2]), float(lows[i])))
+        elif lows[i - 2] > highs[i]:                    # bearish gap
+            if i + 1 >= n or highs[i + 1:].max() < lows[i - 2]:
+                fvgs.append(("bearish", float(highs[i]), float(lows[i - 2])))
+    recent_fvgs = fvgs[-3:]
+
+    # Order block: last opposite candle before the most recent decisive swing
+    ob = ""
+    if bias == "bullish" and sh:
+        for k in range(sh[-1] - 1, max(0, sh[-1] - 12), -1):
+            if closes[k] < opens[k]:
+                ob = f"bullish order block {lows[k]:.1f}-{highs[k]:.1f}"
+                break
+    elif bias == "bearish" and sl:
+        for k in range(sl[-1] - 1, max(0, sl[-1] - 12), -1):
+            if closes[k] > opens[k]:
+                ob = f"bearish order block {lows[k]:.1f}-{highs[k]:.1f}"
+                break
+
+    # Liquidity resting above (buy-side) and below (sell-side)
+    buyside = sorted({round(float(highs[i]), 1) for i in sh if highs[i] > last})[:3]
+    sellside = sorted({round(float(lows[i]), 1) for i in sl if lows[i] < last}, reverse=True)[:3]
+
+    if bias == "bullish":
+        read = "Momentum favors longs — best entries are a pullback into a bullish FVG or order block, targeting buy-side liquidity above."
+    elif bias == "bearish":
+        read = "Momentum favors shorts — look for a retrace into a bearish FVG or order block, targeting sell-side liquidity below."
+    else:
+        read = "No clean directional edge — wait for a liquidity sweep or a break of structure before committing."
+
+    out = [f"{name} on the {interval}: last {last:.1f}.",
+           f"Structure: {structure}; bias {bias}."]
+    if bos:
+        out.append(bos.capitalize() + ".")
+    if recent_fvgs:
+        out.append("Unfilled FVGs: " + "; ".join(f"{d} {a:.1f}-{b:.1f}" for d, a, b in recent_fvgs) + ".")
+    if ob:
+        out.append(ob.capitalize() + ".")
+    if buyside:
+        out.append("Buy-side liquidity: " + ", ".join(f"{x:.1f}" for x in buyside) + ".")
+    if sellside:
+        out.append("Sell-side liquidity: " + ", ".join(f"{x:.1f}" for x in sellside) + ".")
+    out.append(read)
+    out.append("Analysis only — not advice, and I won't place trades.")
+    return " ".join(out)
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
