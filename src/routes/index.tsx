@@ -59,6 +59,7 @@ type AgentStatus = {
   brain?: { primary_llm: string; local_model: string; reasoning?: string; max_agent_steps: number };
   conversation?: { turns: number };
   council?: { panel: string[]; chair: string };
+  voice?: { current: string; options: { id: string; label: string }[] };
   memory?: { available: boolean; count: number };
   tools?: ToolInfo[];
   tasks?: Task[];
@@ -160,6 +161,7 @@ function CommandDeck() {
   const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized]   = useState(false);
   const [council, setCouncil]       = useState<CouncilState>({ active: false, panel: [], proposals: [], verdict: "" });
+  const [voiceId, setVoiceId]       = useState("");
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
@@ -279,6 +281,7 @@ function CommandDeck() {
         if (d.type === "council_verdict") {
           setCouncil(c => ({ ...c, active: false, verdict: txt }));
         }
+        if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
         if (d.type === "agent_tool" && d.step) {
@@ -366,6 +369,8 @@ function CommandDeck() {
   const memCount  = agentStatus.memory?.count ?? 0;
   const memOk     = Boolean(agentStatus.memory?.available);
   const convoTurns = agentStatus.conversation?.turns ?? 0;
+  const voiceOptions = agentStatus.voice?.options ?? [];
+  const currentVoice = voiceId || agentStatus.voice?.current || "";
   const activeTsk = tasks.find(t => t.status === "active");
   const qTasks    = tasks.filter(t => t.status === "queued");
   const doneTasks = tasks.filter(t => t.status === "done").slice(-4).reverse();
@@ -594,6 +599,29 @@ function CommandDeck() {
               <IconBtn onClick={toggleListen} active={listening} title="Voice input">
                 {listening ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
               </IconBtn>
+              {voiceOptions.length > 0 && (
+                <select
+                  value={currentVoice}
+                  onChange={(e) => {
+                    setVoiceId(e.target.value);
+                    wsRef.current?.send(JSON.stringify({ action: "set_voice", voice: e.target.value }));
+                  }}
+                  title="JARVIS voice"
+                  style={{
+                    background: "transparent",
+                    color: "oklch(0.68 0.22 38)",
+                    border: "1px solid oklch(0.68 0.22 38 / 0.3)",
+                    borderRadius: 5, fontSize: 10, padding: "3px 4px",
+                    maxWidth: 120, fontFamily: "inherit", cursor: "pointer", outline: "none",
+                  }}
+                >
+                  {voiceOptions.map(v => (
+                    <option key={v.id} value={v.id} style={{ background: "#120a06", color: "#eee" }}>
+                      {v.label}
+                    </option>
+                  ))}
+                </select>
+              )}
             </motion.div>
 
             <AnimatePresence>
