@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import random
 import re
 import subprocess
 import threading
@@ -73,6 +74,23 @@ WAKE_WORDS = [w.strip().lower() for w in os.environ.get(
 WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
 STOP_WORDS = {"stop", "stop talking", "shut up", "be quiet", "quiet", "cancel",
               "enough", "shut up jarvis", "nevermind", "never mind"}
+RESET_PHRASES = {"new conversation", "start over", "start fresh", "reset",
+                 "forget that", "forget all that", "clear context", "let's start over"}
+
+# Voice tuning (Microsoft Edge neural TTS). Ryan = British male, JARVIS-like.
+# A slight rate bump reads more like natural speech than the plodding default.
+TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-GB-RyanNeural")
+TTS_RATE  = os.environ.get("JARVIS_TTS_RATE", "+8%")
+TTS_PITCH = os.environ.get("JARVIS_TTS_PITCH", "+0Hz")
+
+# Spoken filler so longer tasks don't sit in dead silence while JARVIS works.
+# Only fires for genuinely slow tools — fast ones (system info, tasks) answer
+# quickly enough that a filler would just talk over the reply.
+FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
+           "Give me a moment.", "Checking that."]
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command"}
+
+CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
@@ -111,6 +129,7 @@ _tts_playing = False          # frontend reports the exact playback window
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task   = None          # in-flight _speak task (for barge-in cancel)
+_history: list[dict] = []     # rolling conversation turns for multi-turn context
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
@@ -506,7 +525,13 @@ Roshan: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensic
 
 Personality: calm, sharp, dry wit. Never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
 
-Your replies are read aloud by text-to-speech. So: speak in plain spoken sentences. NEVER use markdown, headers, bullet points, asterisks, code fences, or LaTeX/math notation. Spell math out in words ("ninety minus sixty"). Keep answers to one or two sentences unless explicitly asked for detail or code. For code, keep prose minimal around it.
+You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
+- Use contractions and natural, flowing phrasing. Be warm but concise.
+- This is a back-and-forth. Follow the thread — refer to what was just said, and resolve references like "that", "the first one", "tomorrow" from context instead of asking the user to repeat themselves.
+- Don't echo the question back or narrate ("You asked about..."). Just respond like you're talking.
+- If a request is genuinely ambiguous, ask one short clarifying question instead of guessing.
+- One or two sentences for most things; go longer only when asked for detail or code.
+- NEVER use markdown, headers, bullets, asterisks, code fences, or math notation — spell math in words ("ninety minus sixty"). It all gets spoken.
 
 You have full system access: filesystem, shell, browser launch, screen capture, memory, web search. Use tools aggressively when the answer requires real data — never fake it."""
 
@@ -587,17 +612,38 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool):
     return full_text, tool_calls_raw
 
 
+def _record_turn(user: str, assistant: str) -> None:
+    """Keep a short rolling window of the conversation for multi-turn context."""
+    global _history
+    _history = (_history + [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": assistant},
+    ])[-CONV_TURNS:]
+
+
 async def _agent_groq(text: str) -> None:
+    global _history
+
+    # "new conversation" / "forget that" — wipe context.
+    if text.strip().lower().rstrip(".!") in RESET_PHRASES:
+        _history = []
+        await _emit_final("Done — clean slate. What's on your mind?")
+        return
+
     client = _openai_mod.AsyncOpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
     )
-    messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt()},
-        {"role": "user",   "content": text},
-    ]
+    # System prompt + recent conversation + this turn = multi-turn context.
+    messages: list[dict] = (
+        [{"role": "system", "content": _build_system_prompt()}]
+        + _history
+        + [{"role": "user", "content": text}]
+    )
 
     emitted = False
+    final_answer: str | None = None
+    filler_sent = False
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=True)
@@ -617,7 +663,8 @@ async def _agent_groq(text: str) -> None:
 
         if not tool_calls_raw:
             if full_text.strip():
-                await _emit_final(full_text.strip())
+                final_answer = full_text.strip()
+                await _emit_final(final_answer)
                 emitted = True
             elif not emitted:
                 # Empty answer, no tools — retry once without tools, then give up gracefully.
@@ -626,9 +673,16 @@ async def _agent_groq(text: str) -> None:
                 except _openai_mod.APIError:
                     retry_text = ""
                 if retry_text.strip():
-                    await _emit_final(retry_text.strip())
+                    final_answer = retry_text.strip()
+                    await _emit_final(final_answer)
                     emitted = True
             break
+
+        # A slow tool means a real wait — bridge the dead air with a quick spoken
+        # acknowledgment (once per turn). Fast tools answer too quickly to bother.
+        if not filler_sent and any(tc["name"] in SLOW_TOOLS for tc in tool_calls_raw.values()):
+            filler_sent = True
+            asyncio.create_task(_speak(random.choice(FILLERS)))
 
         messages.append({
             "role": "assistant",
@@ -653,6 +707,10 @@ async def _agent_groq(text: str) -> None:
     # Never leave the user staring at silence.
     if not emitted:
         await _emit_final("I didn't get a usable response that time — try rephrasing, or wait a moment if Groq is busy.")
+
+    # Remember this exchange so follow-ups ("what about tomorrow?") have context.
+    if final_answer:
+        _record_turn(text, final_answer)
 
 
 # ── Claude agent loop ───────────────────────────────────────────────────────────
@@ -824,7 +882,7 @@ async def _speak(text: str) -> None:
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
         audio_bytes = b""
-        communicate = edge_tts.Communicate(clean, "en-GB-RyanNeural")
+        communicate = edge_tts.Communicate(clean, TTS_VOICE, rate=TTS_RATE, pitch=TTS_PITCH)
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
