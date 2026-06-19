@@ -91,6 +91,15 @@ FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
 SLOW_TOOLS = {"capture_screen", "search_web", "run_command"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
+
+# Mixture-of-Agents: a panel of different models answers independently, then an
+# aggregator reconciles them into one decision. Triggered on demand (see TRIGGERS).
+MOA_PROPOSERS = [m.strip() for m in os.environ.get(
+    "JARVIS_MOA_PROPOSERS",
+    "llama-3.3-70b-versatile,qwen/qwen3-32b,meta-llama/llama-4-scout-17b-16e-instruct",
+).split(",") if m.strip()]
+MOA_AGGREGATOR = os.environ.get("JARVIS_MOA_AGGREGATOR", "openai/gpt-oss-120b")
+MOA_TRIGGERS = ("deliberate", "council", "debate", "think hard about", "convene", "panel")
 USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
@@ -840,6 +849,83 @@ async def dispatch_command(text: str) -> None:
     _current_task = asyncio.create_task(handle_command(text))
 
 
+# ── Mixture-of-Agents (multi-agent deliberation) ────────────────────────────────
+def _short_model(m: str) -> str:
+    return m.split("/")[-1].replace("-instruct", "").replace("-versatile", "")
+
+
+async def _deliberate(question: str) -> None:
+    """A panel of different models each give their take, then an aggregator
+    reconciles them into one decision. Streams each voice to the UI."""
+    if not (USE_GROQ and _HAS_GROQ):
+        await _emit_final("Multi-agent deliberation needs the Groq backend.")
+        return
+
+    client = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    await broadcast({"type": "council_start", "question": question,
+                     "panel": [_short_model(m) for m in MOA_PROPOSERS]})
+    await broadcast({"type": "state", "status": "thinking", "text": "Convening the panel..."})
+
+    advisor_sys = ("You are one advisor on a panel weighing a question. Give YOUR own "
+                   "honest, reasoned take — your analysis and a clear recommendation in "
+                   "2-4 sentences. Don't hedge; the chair will reconcile disagreements.")
+
+    async def ask(model: str):
+        try:
+            r = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": advisor_sys},
+                          {"role": "user", "content": question}],
+                max_tokens=600,
+            )
+            text = (r.choices[0].message.content or "").strip()
+            # Some models (qwen3) emit <think>…</think> chain-of-thought — drop it.
+            if "</think>" in text:
+                text = text.split("</think>")[-1].strip()
+            text = re.sub(r"</?think>", "", text).strip()
+        except Exception as exc:
+            text = f"(stood down — {exc})"
+        await broadcast({"type": "council_proposal", "model": _short_model(model), "text": text})
+        return model, text
+
+    proposals = await asyncio.gather(*[ask(m) for m in MOA_PROPOSERS])
+
+    panel = "\n\n".join(
+        f"Advisor {i + 1} ({_short_model(m)}):\n{t}" for i, (m, t) in enumerate(proposals)
+    )
+    try:
+        agg_kwargs = dict(
+            model=MOA_AGGREGATOR,
+            messages=[
+                {"role": "system", "content":
+                    "You chair an advisory panel. Given the question and each advisor's "
+                    "take, weigh them, resolve disagreements, and deliver ONE clear final "
+                    "decision with a one-line rationale. Plain spoken sentences — it's read aloud."},
+                {"role": "user", "content": f"Question: {question}\n\n{panel}\n\nThe panel's final decision:"},
+            ],
+            max_tokens=800,
+        )
+        if "gpt-oss" in MOA_AGGREGATOR:
+            agg_kwargs["reasoning_effort"] = "medium"
+        agg = await client.chat.completions.create(**agg_kwargs)
+        verdict = (agg.choices[0].message.content or "").strip()
+    except Exception as exc:
+        verdict = f"The panel couldn't reach a verdict: {exc}"
+
+    await broadcast({"type": "council_verdict", "text": verdict})
+    await _emit_final(verdict)
+    _record_turn(f"[panel] {question}", verdict)
+
+
+def _deliberation_target(text: str):
+    """If text invokes the panel, return the question to deliberate, else None."""
+    low = text.strip().lower()
+    for trig in MOA_TRIGGERS:
+        if low.startswith(trig):
+            return text.strip()[len(trig):].lstrip(" :,-")
+    return None
+
+
 # ── Agent dispatch ──────────────────────────────────────────────────────────────
 async def handle_command(text: str) -> None:
     global agent_trace
@@ -850,7 +936,10 @@ async def handle_command(text: str) -> None:
     await broadcast({"type": "state", "status": "thinking", "text": "Processing directive..."})
 
     try:
-        if USE_GROQ and _HAS_GROQ:
+        question = _deliberation_target(text)
+        if question and USE_GROQ and _HAS_GROQ:
+            await _deliberate(question)
+        elif USE_GROQ and _HAS_GROQ:
             await _agent_groq(text)
         elif USE_CLAUDE and _HAS_ANTHROPIC:
             await _agent_claude(text)
@@ -1086,8 +1175,16 @@ async def agent_status() -> dict:
         "brain": {
             "primary_llm":          _active_model(),
             "local_model":          OLLAMA_MODEL,
+            "reasoning":            GROQ_REASONING if "gpt-oss" in GROQ_MODEL else "—",
             "max_agent_steps":      8,
             "use_llm_intent_router": False,
+        },
+        "conversation": {
+            "turns": len(_history) // 2,
+        },
+        "council": {
+            "panel": [_short_model(m) for m in MOA_PROPOSERS],
+            "chair": _short_model(MOA_AGGREGATOR),
         },
         "memory": {
             "available": True,

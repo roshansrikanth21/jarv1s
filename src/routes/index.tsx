@@ -17,7 +17,6 @@ import {
   Minus,
   Radio,
   Send,
-  ShieldCheck,
   Terminal,
   Trash2,
   Volume2,
@@ -57,12 +56,18 @@ type Task = { id: number; t: string; eta?: string; status: "queued" | "active" |
 type ToolInfo = { name: string; description: string };
 type AgentTrace = { step: number; action: string; args: Record<string, unknown>; observation: string };
 type AgentStatus = {
-  brain?: { primary_llm: string; local_model: string; max_agent_steps: number };
+  brain?: { primary_llm: string; local_model: string; reasoning?: string; max_agent_steps: number };
+  conversation?: { turns: number };
+  council?: { panel: string[]; chair: string };
   memory?: { available: boolean; count: number };
   tools?: ToolInfo[];
   tasks?: Task[];
   trace?: AgentTrace[];
 };
+type CouncilState = { active: boolean; panel: string[]; proposals: { model: string; text: string }[]; verdict: string };
+
+// "openai/gpt-oss-120b" -> "gpt-oss-120b"
+const shortModel = (m: string) => (m || "").split("/").pop()!.replace("-instruct", "");
 
 declare global {
   interface Window {
@@ -154,6 +159,7 @@ function CommandDeck() {
   const [reactorFlash, setReactorFlash] = useState(false);
   const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized]   = useState(false);
+  const [council, setCouncil]       = useState<CouncilState>({ active: false, panel: [], proposals: [], verdict: "" });
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
@@ -262,6 +268,17 @@ function CommandDeck() {
           setSpeaking(false);
           wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
         }
+        if (d.type === "council_start") {
+          setCouncil({ active: true, panel: (d.panel as string[]) ?? [], proposals: [], verdict: "" });
+          addLineRef.current("system", `Convening panel: ${((d.panel as string[]) ?? []).join(", ")}`);
+        }
+        if (d.type === "council_proposal") {
+          setCouncil(c => ({ ...c, proposals: [...c.proposals, { model: String(d.model), text: txt }] }));
+          addLineRef.current("tool", `[${d.model}] ${txt}`);
+        }
+        if (d.type === "council_verdict") {
+          setCouncil(c => ({ ...c, active: false, verdict: txt }));
+        }
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
         if (d.type === "agent_tool" && d.step) {
@@ -348,6 +365,7 @@ function CommandDeck() {
   const trace     = agentStatus.trace  ?? [];
   const memCount  = agentStatus.memory?.count ?? 0;
   const memOk     = Boolean(agentStatus.memory?.available);
+  const convoTurns = agentStatus.conversation?.turns ?? 0;
   const activeTsk = tasks.find(t => t.status === "active");
   const qTasks    = tasks.filter(t => t.status === "queued");
   const doneTasks = tasks.filter(t => t.status === "done").slice(-4).reverse();
@@ -387,7 +405,7 @@ function CommandDeck() {
             {Array.from({ length: 2 }, (_, rep) =>
               [
                 `status: ${connLabel}`,
-                `model: ${agentStatus.brain?.local_model ?? "llama3.1:8b"}`,
+                `model: ${agentStatus.brain?.primary_llm ?? agentStatus.brain?.local_model ?? "offline"}`,
                 `memory: ${memOk ? `${memCount} items` : "offline"}`,
                 `tools: ${tools.length} active`,
                 `safety: bounded / 8 steps`,
@@ -454,22 +472,17 @@ function CommandDeck() {
           <motion.div className={`hud-card ${connected ? "hud-card--active" : ""}`} variants={ITEM_VARIANTS}>
             <CardHeader title="Agent Core" active={connected} />
             <div className="hud-agent-rows">
-              <AgentRow icon={Brain}    label="Brain"   val={agentStatus.brain?.local_model ?? "claude-sonnet-4-6"} />
+              <AgentRow icon={Brain}    label="Brain"   val={shortModel(agentStatus.brain?.primary_llm ?? agentStatus.brain?.local_model ?? "offline")} />
               <AgentRow icon={Database} label="Memory"  val={memOk ? `${memCount} records` : "offline"} />
               <AgentRow icon={Wrench}   label="Tools"   val={`${tools.length} registered`} />
-              <AgentRow icon={Lock}     label="Safety"  val={`max ${agentStatus.brain?.max_agent_steps ?? 8} steps`} />
+              <AgentRow icon={Boxes}    label="Context" val={`${convoTurns} turns held`} />
             </div>
           </motion.div>
 
-          {/* Safety badges */}
-          <motion.div className="hud-card" variants={ITEM_VARIANTS}>
-            <CardHeader title="Safety Kernel" />
-            <div className="hud-safety-grid">
-              <SafeBadge icon={ShieldCheck}  label="Bounded"    on />
-              <SafeBadge icon={Lock}         label="No AutoPwr" on />
-              <SafeBadge icon={CheckCircle2} label="JSON Tools" on />
-              <SafeBadge icon={Eye}          label="Traceable"  on={trace.length > 0} />
-            </div>
+          {/* Council — Mixture-of-Agents deliberation */}
+          <motion.div className={`hud-card ${council.active ? "hud-card--active" : ""}`} variants={ITEM_VARIANTS}>
+            <CardHeader title="Council" active={council.active} />
+            <Council council={council} idlePanel={agentStatus.council?.panel ?? []} />
           </motion.div>
         </motion.aside>
 
@@ -806,16 +819,50 @@ function AgentRow({ icon: Icon, label, val }: { icon: React.ElementType; label: 
   );
 }
 
-function SafeBadge({ icon: Icon, label, on }: { icon: React.ElementType; label: string; on: boolean }) {
+function Council({ council, idlePanel }: { council: CouncilState; idlePanel: string[] }) {
+  const AMBER = "oklch(0.68 0.22 38)";
+  const panel = council.panel.length ? council.panel : idlePanel;
+  const propOf = (m: string) => council.proposals.find(p => p.model === m);
+
+  if (!panel.length && !council.verdict) {
+    return (
+      <p style={{ fontSize: 11, opacity: 0.55, lineHeight: 1.5 }}>
+        Idle. Say <span style={{ color: AMBER }}>“deliberate …”</span> to convene a panel of
+        models that debate and return one decision.
+      </p>
+    );
+  }
+
   return (
-    <motion.div
-      className={`hud-safe-badge ${on ? "hud-safe-badge--on" : ""}`}
-      animate={{ opacity: on ? 1 : 0.45 }}
-      whileHover={{ scale: 1.04 }}
-    >
-      <Icon className="w-3.5 h-3.5" />
-      <span>{label}</span>
-    </motion.div>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {panel.map((m) => {
+        const answered = Boolean(propOf(m));
+        return (
+          <div key={m} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <motion.span
+              style={{
+                width: 6, height: 6, borderRadius: "50%", flexShrink: 0,
+                background: answered ? AMBER : "transparent", border: `1px solid ${AMBER}`,
+              }}
+              animate={{ opacity: council.active && !answered ? [0.3, 1, 0.3] : 1 }}
+              transition={{ duration: 1.1, repeat: council.active && !answered ? Infinity : 0 }}
+            />
+            <span style={{ fontSize: 10.5, opacity: answered ? 0.9 : 0.6,
+              whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{m}</span>
+          </div>
+        );
+      })}
+      {council.active && !council.verdict && (
+        <p style={{ fontSize: 10, opacity: 0.5, marginTop: 2 }}>Deliberating…</p>
+      )}
+      {council.verdict && (
+        <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${AMBER}22` }}>
+          <p style={{ fontSize: 9, letterSpacing: "0.12em", textTransform: "uppercase",
+            color: AMBER, opacity: 0.7, marginBottom: 3 }}>Verdict</p>
+          <p style={{ fontSize: 11, lineHeight: 1.45, opacity: 0.9 }}>{council.verdict}</p>
+        </div>
+      )}
+    </div>
   );
 }
 
