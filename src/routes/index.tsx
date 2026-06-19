@@ -256,6 +256,12 @@ function CommandDeck() {
             .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
             .catch(() => ttsEnd());
         }
+        if (d.type === "tts_stop") {
+          // Barge-in: backend says stop talking right now.
+          if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+          setSpeaking(false);
+          wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+        }
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
         if (d.type === "agent_tool" && d.step) {
