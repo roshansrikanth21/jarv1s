@@ -25,6 +25,10 @@ psutil
 mss
 Pillow
 
+# Market data for the ICT scanner (Indian markets: Nifty, Sensex, NSE stocks)
+yfinance
+pandas
+
 # Optional fallback brains (only if you set the keys / run Ollama locally)
 anthropic
 ollama
