@@ -3,6 +3,7 @@ import { motion, AnimatePresence, useReducedMotion } from "framer-motion";
 import {
   Activity,
   Brain,
+  CandlestickChart,
   CheckCircle2,
   ChevronRight,
   Clock,
@@ -60,12 +61,21 @@ type AgentStatus = {
   conversation?: { turns: number };
   council?: { panel: string[]; chair: string };
   voice?: { current: string; options: { id: string; label: string }[] };
+  watch?: { watching: boolean; watchlist: string[]; interval_min: number; tf: string };
   memory?: { available: boolean; count: number };
   tools?: ToolInfo[];
   tasks?: Task[];
   trace?: AgentTrace[];
 };
 type CouncilState = { active: boolean; panel: string[]; proposals: { model: string; text: string }[]; verdict: string };
+type IctRead = {
+  ok: boolean; error?: string;
+  symbol?: string; tv?: string; interval?: string; last?: number;
+  bias?: "bullish" | "bearish" | "neutral"; structure?: string;
+  bos?: string; sweep?: string; order_block?: string; read?: string;
+  fvgs?: { dir: string; lo: number; hi: number }[];
+  buyside?: number[]; sellside?: number[];
+};
 
 // "openai/gpt-oss-120b" -> "gpt-oss-120b"
 const shortModel = (m: string) => (m || "").split("/").pop()!.replace("-instruct", "");
@@ -156,12 +166,17 @@ function CommandDeck() {
   const [sysStats, setSysStats]     = useState({ cpu: 0, ram: 0, disk: 0 });
   const [cmdHistory, setCmdHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx]       = useState(-1);
-  const [rightTab, setRightTab]     = useState<"tasks" | "trace" | "tools">("tasks");
+  const [rightTab, setRightTab]     = useState<"tasks" | "trace" | "tools" | "markets">("tasks");
   const [reactorFlash, setReactorFlash] = useState(false);
   const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized]   = useState(false);
   const [council, setCouncil]       = useState<CouncilState>({ active: false, panel: [], proposals: [], verdict: "" });
   const [voiceId, setVoiceId]       = useState("");
+  const [mktSymbol, setMktSymbol]   = useState("nifty");
+  const [mktData, setMktData]       = useState<IctRead | null>(null);
+  const [mktLoading, setMktLoading] = useState(false);
+  const [watching, setWatching]     = useState(false);
+  const [alerts, setAlerts]         = useState<{ symbol: string; text: string; at: string }[]>([]);
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
@@ -282,6 +297,12 @@ function CommandDeck() {
           setCouncil(c => ({ ...c, active: false, verdict: txt }));
         }
         if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
+        if (d.type === "watch_state") setWatching(Boolean(d.watching));
+        if (d.type === "ict_alert") {
+          const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+          setAlerts(a => [{ symbol: String(d.symbol), text: txt, at }, ...a].slice(0, 8));
+          flashReactorRef.current();
+        }
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
         if (d.type === "agent_tool" && d.step) {
@@ -319,6 +340,27 @@ function CommandDeck() {
     const off = window?.electronAPI?.onMaximizeChange?.((isMax) => setMaximized(isMax));
     return () => { if (typeof off === "function") off(); };
   }, []);
+
+  // Fetch the ICT read whenever the Markets tab is open or the symbol changes;
+  // refresh every 60s while it's visible.
+  const fetchMarket = useCallback(async (sym: string) => {
+    setMktLoading(true);
+    try {
+      const r = await fetch(`/api/ict?symbol=${encodeURIComponent(sym)}&interval=15m`);
+      setMktData(await r.json());
+    } catch { setMktData({ ok: false, error: "Couldn't reach the market service." }); }
+    finally { setMktLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (rightTab !== "markets") return;
+    fetchMarket(mktSymbol);
+    const id = setInterval(() => fetchMarket(mktSymbol), 60000);
+    return () => clearInterval(id);
+  }, [rightTab, mktSymbol, fetchMarket]);
+
+  // Sync watcher state from periodic status refreshes.
+  useEffect(() => { setWatching(Boolean(agentStatus.watch?.watching)); }, [agentStatus.watch?.watching]);
 
   const sendCommand = useCallback(async (cmd = input) => {
     const text = cmd.trim();
@@ -646,9 +688,10 @@ function CommandDeck() {
           <div className="hud-tabs">
             {(
               [
-                { id: "tasks", icon: ListTodo,  label: "Tasks",  badge: qTasks.length > 0 ? String(qTasks.length) : undefined },
-                { id: "trace", icon: GitBranch, label: "Trace",  badge: trace.length > 0  ? String(trace.length)  : undefined },
-                { id: "tools", icon: Boxes,     label: "Tools",  badge: tools.length > 0  ? String(tools.length)  : undefined },
+                { id: "tasks",   icon: ListTodo,   label: "Tasks",   badge: qTasks.length > 0 ? String(qTasks.length) : undefined },
+                { id: "trace",   icon: GitBranch,  label: "Trace",   badge: trace.length > 0  ? String(trace.length)  : undefined },
+                { id: "tools",   icon: Boxes,      label: "Tools",   badge: tools.length > 0  ? String(tools.length)  : undefined },
+                { id: "markets", icon: CandlestickChart, label: "Markets", badge: alerts.length > 0 ? String(alerts.length) : undefined },
               ] as const
             ).map((tab) => (
               <button
@@ -759,6 +802,33 @@ function CommandDeck() {
                       </motion.div>
                     ))
                   }
+                </motion.div>
+              )}
+
+              {rightTab === "markets" && (
+                <motion.div
+                  key="markets"
+                  className="hud-tab-panel"
+                  initial={{ opacity: 0, x: 12 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -12 }}
+                  transition={{ duration: 0.2 }}
+                >
+                  <MarketsPanel
+                    symbol={mktSymbol}
+                    setSymbol={setMktSymbol}
+                    data={mktData}
+                    loading={mktLoading}
+                    watching={watching}
+                    watchlist={agentStatus.watch?.watchlist ?? []}
+                    intervalMin={agentStatus.watch?.interval_min ?? 5}
+                    alerts={alerts}
+                    onRefresh={() => fetchMarket(mktSymbol)}
+                    onToggleWatch={() =>
+                      wsRef.current?.send(JSON.stringify({ action: watching ? "stop_watch" : "start_watch" }))
+                    }
+                    onDeliberate={(q) => sendCommand(`deliberate: ${q}`)}
+                  />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -891,6 +961,128 @@ function Council({ council, idlePanel }: { council: CouncilState; idlePanel: str
         </div>
       )}
     </div>
+  );
+}
+
+function TradingViewChart({ tv }: { tv: string }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !tv) return;
+    el.innerHTML = '<div class="tradingview-widget-container__widget" style="height:200px;width:100%"></div>';
+    const script = document.createElement("script");
+    script.src = "https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js";
+    script.async = true;
+    script.innerHTML = JSON.stringify({
+      symbol: tv, interval: "15", timezone: "Asia/Kolkata", theme: "dark", style: "1",
+      locale: "en", hide_top_toolbar: true, hide_legend: true, allow_symbol_change: false,
+      save_image: false, width: "100%", height: 200,
+    });
+    el.appendChild(script);
+    return () => { el.innerHTML = ""; };
+  }, [tv]);
+  return <div ref={ref} style={{ height: 200, width: "100%", borderRadius: 6, overflow: "hidden" }} />;
+}
+
+function MarketsPanel(p: {
+  symbol: string; setSymbol: (s: string) => void; data: IctRead | null; loading: boolean;
+  watching: boolean; watchlist: string[]; intervalMin: number;
+  alerts: { symbol: string; text: string; at: string }[];
+  onRefresh: () => void; onToggleWatch: () => void; onDeliberate: (q: string) => void;
+}) {
+  const AMBER = "oklch(0.68 0.22 38)";
+  const GREEN = "oklch(0.74 0.18 150)";
+  const RED   = "oklch(0.64 0.21 25)";
+  const [custom, setCustom] = useState("");
+  const d = p.data;
+  const biasColor = d?.bias === "bullish" ? GREEN : d?.bias === "bearish" ? RED : AMBER;
+  const chip = (active: boolean) => ({
+    fontSize: 9.5, padding: "3px 7px", borderRadius: 5, cursor: "pointer",
+    border: `1px solid ${AMBER}${active ? "" : "33"}`,
+    background: active ? `${AMBER}22` : "transparent",
+    color: active ? AMBER : "inherit", opacity: active ? 1 : 0.7,
+  } as const);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 4, flexWrap: "wrap", alignItems: "center" }}>
+        {["nifty", "sensex", "banknifty"].map(s => (
+          <button key={s} style={chip(p.symbol.toLowerCase() === s)} onClick={() => p.setSymbol(s)}>
+            {s.toUpperCase()}
+          </button>
+        ))}
+        <input
+          value={custom} onChange={e => setCustom(e.target.value.toUpperCase())}
+          onKeyDown={e => { if (e.key === "Enter" && custom.trim()) { p.setSymbol(custom.trim()); setCustom(""); } }}
+          placeholder="NSE…" spellCheck={false}
+          style={{ flex: 1, minWidth: 48, background: "transparent", color: AMBER, fontSize: 9.5,
+            border: `1px solid ${AMBER}33`, borderRadius: 5, padding: "3px 5px", outline: "none", fontFamily: "inherit" }}
+        />
+      </div>
+
+      {d?.ok && d.tv && <TradingViewChart tv={d.tv} />}
+
+      {p.loading && !d && <p style={{ fontSize: 11, opacity: 0.5 }}>Reading the tape…</p>}
+      {d && !d.ok && <p style={{ fontSize: 11, color: RED, opacity: 0.9 }}>{d.error}</p>}
+
+      {d?.ok && (
+        <>
+          <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>{d.symbol} · {d.last}</span>
+            <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.1em",
+              textTransform: "uppercase", color: biasColor }}>{d.bias}</span>
+          </div>
+          <p style={{ fontSize: 10.5, opacity: 0.7, lineHeight: 1.4 }}>{d.structure}</p>
+          {d.bos && <Tag color={biasColor} label={d.bos} />}
+          {d.sweep && <Tag color={AMBER} label={"sweep: " + d.sweep} />}
+          {d.order_block && <Tag color={biasColor} label={d.order_block} />}
+          {d.fvgs && d.fvgs.length > 0 && (
+            <p style={{ fontSize: 10, opacity: 0.8 }}>
+              FVGs: {d.fvgs.map(f => `${f.dir[0].toUpperCase()} ${f.lo}-${f.hi}`).join(" · ")}
+            </p>
+          )}
+          {d.buyside && d.buyside.length > 0 && (
+            <p style={{ fontSize: 10, opacity: 0.8 }}>↑ liq: {d.buyside.join(", ")}</p>
+          )}
+          {d.sellside && d.sellside.length > 0 && (
+            <p style={{ fontSize: 10, opacity: 0.8 }}>↓ liq: {d.sellside.join(", ")}</p>
+          )}
+          <p style={{ fontSize: 10.5, opacity: 0.85, lineHeight: 1.45,
+            borderTop: `1px solid ${AMBER}22`, paddingTop: 6 }}>{d.read}</p>
+          <button onClick={() => p.onDeliberate(`${d.symbol} ${d.bias}, ${d.read}. Should I take it?`)}
+            style={{ ...chip(false), alignSelf: "flex-start", padding: "4px 8px" }}>
+            Ask the council ⚖
+          </button>
+        </>
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 6, borderTop: `1px solid ${AMBER}22`, paddingTop: 8 }}>
+        <button onClick={p.onToggleWatch}
+          style={{ ...chip(p.watching), padding: "4px 8px" }}>
+          {p.watching ? "◉ Watching" : "○ Start watcher"}
+        </button>
+        <span style={{ fontSize: 9, opacity: 0.55 }}>
+          {p.watchlist.join(", ") || "—"} · {p.intervalMin}m
+        </span>
+      </div>
+
+      {p.alerts.length > 0 && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {p.alerts.map((a, i) => (
+            <div key={i} style={{ fontSize: 10, lineHeight: 1.35 }}>
+              <span style={{ color: AMBER, opacity: 0.6 }}>{a.at}</span>{" "}{a.text}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Tag({ color, label }: { color: string; label: string }) {
+  return (
+    <span style={{ fontSize: 9.5, padding: "2px 6px", borderRadius: 4, alignSelf: "flex-start",
+      border: `1px solid ${color}55`, color, background: `${color}14` }}>{label}</span>
   );
 }
 

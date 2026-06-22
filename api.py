@@ -113,6 +113,12 @@ MOA_PROPOSERS = [m.strip() for m in os.environ.get(
 ).split(",") if m.strip()]
 MOA_AGGREGATOR = os.environ.get("JARVIS_MOA_AGGREGATOR", "openai/gpt-oss-120b")
 MOA_TRIGGERS = ("deliberate", "council", "debate", "think hard about", "convene", "panel")
+
+# ICT watcher: scan a watchlist on a timer and alert on fresh BOS / liquidity sweeps.
+WATCHLIST = [s.strip() for s in os.environ.get("JARVIS_WATCHLIST", "nifty,sensex").split(",") if s.strip()]
+WATCH_INTERVAL_MIN = int(os.environ.get("JARVIS_WATCH_INTERVAL_MIN", "5"))
+WATCH_TF = os.environ.get("JARVIS_WATCH_TF", "15m")
+WATCH_SPEAK = os.environ.get("JARVIS_WATCH_SPEAK", "1") != "0"
 USE_GROQ        = bool(GROQ_API_KEY)
 
 try:
@@ -153,6 +159,9 @@ _current_task = None          # in-flight handle_command task (for barge-in canc
 _speak_task   = None          # in-flight _speak task (for barge-in cancel)
 _history: list[dict] = []     # rolling conversation turns for multi-turn context
 _tts_voice = TTS_VOICE        # runtime-selectable voice (changed via set_voice)
+_watch_task = None            # background ICT watcher task
+_watching = False
+_watch_state: dict = {}       # symbol -> last {bos, sweep, bias} signature
 
 
 # ── Memory ─────────────────────────────────────────────────────────────────────
@@ -231,6 +240,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     _tts_voice = vid
                     await broadcast({"type": "voice_changed", "voice": vid})
                     asyncio.create_task(_speak("Voice updated. This is how I sound now."))
+            elif action == "start_watch":
+                asyncio.create_task(_start_watch())
+            elif action == "stop_watch":
+                asyncio.create_task(_stop_watch())
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -590,12 +603,27 @@ def _resolve_symbol(sym: str) -> tuple[str, str]:
     return f"{raw}.NS", raw
 
 
-def _ict_scan(symbol: str, interval: str = "15m") -> str:
+def _tv_symbol(ysym: str, name: str) -> str:
+    """TradingView symbol for the chart widget."""
+    table = {"^NSEI": "NSE:NIFTY", "^BSESN": "BSE:SENSEX", "^NSEBANK": "NSE:BANKNIFTY",
+             "NIFTY_FIN_SERVICE.NS": "NSE:CNXFINANCE"}
+    if ysym in table:
+        return table[ysym]
+    if ysym.endswith(".NS"):
+        return f"NSE:{ysym[:-3]}"
+    if ysym.endswith(".BO"):
+        return f"BSE:{ysym[:-3]}"
+    return f"NSE:{name}"
+
+
+def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
+    """Structured ICT read. Returns a dict (ok/error + signals) used by both the
+    voice tool and the Markets panel / watcher."""
     try:
         import yfinance as yf
         import pandas as pd
     except ImportError:
-        return "Market deps missing. Run: pip install yfinance pandas."
+        return {"ok": False, "error": "Market deps missing (pip install yfinance pandas)."}
 
     ysym, name = _resolve_symbol(symbol)
     interval = interval if interval in {"5m", "15m", "30m", "60m", "1d"} else "15m"
@@ -603,9 +631,9 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     try:
         df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
     except Exception as exc:
-        return f"Couldn't fetch {name} ({ysym}): {exc}"
+        return {"ok": False, "error": f"Couldn't fetch {name} ({ysym}): {exc}"}
     if df is None or len(df) < 25:
-        return f"Not enough {interval} data for {name} ({ysym})."
+        return {"ok": False, "error": f"Not enough {interval} data for {name} ({ysym})."}
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -615,12 +643,10 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     n = len(df)
     last = float(closes[-1])
 
-    # Swing points (fractals, 2 bars each side)
     w = 2
     sh = [i for i in range(w, n - w) if highs[i] == max(highs[i - w:i + w + 1])]
     sl = [i for i in range(w, n - w) if lows[i] == min(lows[i - w:i + w + 1])]
 
-    # Market structure from the last two swings
     structure, bias = "ranging / unclear", "neutral"
     if len(sh) >= 2 and len(sl) >= 2:
         hh, hl = highs[sh[-1]] > highs[sh[-2]], lows[sl[-1]] > lows[sl[-2]]
@@ -636,35 +662,42 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     last_sl = float(lows[sl[-1]]) if sl else float(min(lows))
     bos = ""
     if last > last_sh:
-        bos = f"bullish break of structure above {last_sh:.1f}"
+        bos = f"bullish BOS above {last_sh:.1f}"
     elif last < last_sl:
-        bos = f"bearish break of structure below {last_sl:.1f}"
+        bos = f"bearish BOS below {last_sl:.1f}"
 
-    # Fair value gaps (3-candle imbalance), keep the few most recent & unfilled
+    # Liquidity sweep: last 3 candles wick beyond a prior swing then close back inside.
+    sweep = ""
+    for i in range(max(2, n - 3), n):
+        for j in sl[:-1]:
+            if lows[i] < lows[j] and closes[i] > lows[j]:
+                sweep = f"sell-side sweep of {lows[j]:.1f} (bullish reversal cue)"
+        for j in sh[:-1]:
+            if highs[i] > highs[j] and closes[i] < highs[j]:
+                sweep = f"buy-side sweep of {highs[j]:.1f} (bearish reversal cue)"
+
     fvgs = []
     for i in range(2, n):
-        if highs[i - 2] < lows[i]:                      # bullish gap
+        if highs[i - 2] < lows[i]:
             if i + 1 >= n or lows[i + 1:].min() > highs[i - 2]:
-                fvgs.append(("bullish", float(highs[i - 2]), float(lows[i])))
-        elif lows[i - 2] > highs[i]:                    # bearish gap
+                fvgs.append({"dir": "bullish", "lo": float(highs[i - 2]), "hi": float(lows[i])})
+        elif lows[i - 2] > highs[i]:
             if i + 1 >= n or highs[i + 1:].max() < lows[i - 2]:
-                fvgs.append(("bearish", float(highs[i]), float(lows[i - 2])))
+                fvgs.append({"dir": "bearish", "lo": float(highs[i]), "hi": float(lows[i - 2])})
     recent_fvgs = fvgs[-3:]
 
-    # Order block: last opposite candle before the most recent decisive swing
     ob = ""
     if bias == "bullish" and sh:
         for k in range(sh[-1] - 1, max(0, sh[-1] - 12), -1):
             if closes[k] < opens[k]:
-                ob = f"bullish order block {lows[k]:.1f}-{highs[k]:.1f}"
+                ob = f"bullish OB {lows[k]:.1f}-{highs[k]:.1f}"
                 break
     elif bias == "bearish" and sl:
         for k in range(sl[-1] - 1, max(0, sl[-1] - 12), -1):
             if closes[k] > opens[k]:
-                ob = f"bearish order block {lows[k]:.1f}-{highs[k]:.1f}"
+                ob = f"bearish OB {lows[k]:.1f}-{highs[k]:.1f}"
                 break
 
-    # Liquidity resting above (buy-side) and below (sell-side)
     buyside = sorted({round(float(highs[i]), 1) for i in sh if highs[i] > last})[:3]
     sellside = sorted({round(float(lows[i]), 1) for i in sl if lows[i] < last}, reverse=True)[:3]
 
@@ -675,21 +708,92 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     else:
         read = "No clean directional edge — wait for a liquidity sweep or a break of structure before committing."
 
-    out = [f"{name} on the {interval}: last {last:.1f}.",
-           f"Structure: {structure}; bias {bias}."]
-    if bos:
-        out.append(bos.capitalize() + ".")
-    if recent_fvgs:
-        out.append("Unfilled FVGs: " + "; ".join(f"{d} {a:.1f}-{b:.1f}" for d, a, b in recent_fvgs) + ".")
-    if ob:
-        out.append(ob.capitalize() + ".")
-    if buyside:
-        out.append("Buy-side liquidity: " + ", ".join(f"{x:.1f}" for x in buyside) + ".")
-    if sellside:
-        out.append("Sell-side liquidity: " + ", ".join(f"{x:.1f}" for x in sellside) + ".")
-    out.append(read)
+    return {
+        "ok": True, "symbol": name, "yahoo": ysym, "tv": _tv_symbol(ysym, name),
+        "interval": interval, "last": round(last, 1), "bias": bias, "structure": structure,
+        "bos": bos, "sweep": sweep, "fvgs": recent_fvgs, "order_block": ob,
+        "buyside": buyside, "sellside": sellside, "read": read,
+    }
+
+
+def _ict_scan(symbol: str, interval: str = "15m") -> str:
+    """Text formatting of the structured read, for the voice agent."""
+    a = _ict_analyze(symbol, interval)
+    if not a.get("ok"):
+        return a.get("error", "Scan failed.")
+    out = [f"{a['symbol']} on the {a['interval']}: last {a['last']}.",
+           f"Structure: {a['structure']}; bias {a['bias']}."]
+    if a["bos"]:
+        out.append(a["bos"].capitalize() + ".")
+    if a["sweep"]:
+        out.append("Liquidity " + a["sweep"] + ".")
+    if a["fvgs"]:
+        out.append("Unfilled FVGs: " + "; ".join(f"{f['dir']} {f['lo']:.1f}-{f['hi']:.1f}" for f in a["fvgs"]) + ".")
+    if a["order_block"]:
+        out.append(a["order_block"].capitalize() + ".")
+    if a["buyside"]:
+        out.append("Buy-side liquidity: " + ", ".join(f"{x:.1f}" for x in a["buyside"]) + ".")
+    if a["sellside"]:
+        out.append("Sell-side liquidity: " + ", ".join(f"{x:.1f}" for x in a["sellside"]) + ".")
+    out.append(a["read"])
     out.append("Analysis only — not advice, and I won't place trades.")
     return " ".join(out)
+
+
+# ── ICT watcher (scheduled scans + fresh-signal alerts) ────────────────────────
+async def _watch_loop() -> None:
+    while _watching:
+        for sym in WATCHLIST:
+            if not _watching:
+                break
+            a = await asyncio.to_thread(_ict_analyze, sym, WATCH_TF)
+            if not a.get("ok"):
+                continue
+            name = a["symbol"]
+            prev = _watch_state.get(name)
+            alerts = []
+            if not prev:                       # first scan — seed baseline, don't alert
+                pass
+            else:
+                if a["bos"] and a["bos"] != prev.get("bos"):
+                    alerts.append(a["bos"])
+                if a["sweep"] and a["sweep"] != prev.get("sweep"):
+                    alerts.append(a["sweep"])
+            _watch_state[name] = {"bos": a["bos"], "sweep": a["sweep"], "bias": a["bias"]}
+
+            if alerts:
+                msg = f"{name} ({a['interval']}): " + "; ".join(alerts)
+                await broadcast({"type": "ict_alert", "symbol": name, "text": msg, "data": a})
+                broadcast_log = {"type": "system", "text": f"⚑ {msg}"}
+                await broadcast(broadcast_log)
+                quiet = _tts_playing or (_current_task and not _current_task.done())
+                if WATCH_SPEAK and not quiet:
+                    asyncio.create_task(_speak(f"Heads up — {name}, {alerts[0]}."))
+        # sleep in short slices so stop is responsive
+        for _ in range(max(1, WATCH_INTERVAL_MIN) * 6):
+            if not _watching:
+                break
+            await asyncio.sleep(10)
+
+
+async def _start_watch() -> None:
+    global _watch_task, _watching, _watch_state
+    if _watching:
+        return
+    _watching = True
+    _watch_state = {}
+    await broadcast({"type": "watch_state", "watching": True,
+                     "watchlist": WATCHLIST, "interval_min": WATCH_INTERVAL_MIN, "tf": WATCH_TF})
+    await broadcast({"type": "system", "text": f"ICT watcher on — {', '.join(WATCHLIST)} every {WATCH_INTERVAL_MIN}m ({WATCH_TF})."})
+    _watch_task = asyncio.create_task(_watch_loop())
+
+
+async def _stop_watch() -> None:
+    global _watching
+    _watching = False
+    await broadcast({"type": "watch_state", "watching": False,
+                     "watchlist": WATCHLIST, "interval_min": WATCH_INTERVAL_MIN, "tf": WATCH_TF})
+    await broadcast({"type": "system", "text": "ICT watcher off."})
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -1355,6 +1459,12 @@ async def agent_status() -> dict:
             "current": _tts_voice,
             "options": VOICE_OPTIONS,
         },
+        "watch": {
+            "watching":     _watching,
+            "watchlist":    WATCHLIST,
+            "interval_min": WATCH_INTERVAL_MIN,
+            "tf":           WATCH_TF,
+        },
         "memory": {
             "available": True,
             "count":     len(memories),
@@ -1380,6 +1490,12 @@ async def command_endpoint(body: dict) -> dict:
         return JSONResponse({"error": "empty command"}, status_code=400)
     asyncio.create_task(handle_command(text))
     return {"status": "processing"}
+
+
+@app.get("/api/ict")
+async def ict_endpoint(symbol: str = "nifty", interval: str = "15m") -> dict:
+    """Structured ICT read for the Markets panel."""
+    return await asyncio.to_thread(_ict_analyze, symbol, interval)
 
 
 @app.get("/health")
