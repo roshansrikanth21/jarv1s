@@ -399,19 +399,21 @@ html, body {
 
 /* Tabs */
 .hud-tabs {
-  flex-shrink: 0; display: flex; border-bottom: 1px solid var(--c-line);
+  flex-shrink: 0; display: grid; grid-template-columns: repeat(3, 1fr);
+  border-bottom: 1px solid var(--c-line);
   background: oklch(0.10 0.014 28 / 60%);
 }
 .hud-tab {
-  position: relative; flex: 1; display: flex; align-items: center; justify-content: center;
-  gap: 5px; height: 38px; border-right: 1px solid var(--c-line);
-  font-size: 8.5px; letter-spacing: 0.18em; text-transform: uppercase;
+  position: relative; display: flex; align-items: center; justify-content: center;
+  gap: 5px; height: 34px; border-right: 1px solid var(--c-line); border-bottom: 1px solid var(--c-line);
+  font-size: 8.5px; letter-spacing: 0.1em; text-transform: uppercase;
   color: var(--c-muted); cursor: pointer;
   transition: color 150ms, background 150ms;
 }
-.hud-tab:last-child { border-right: none; }
-.hud-tab:hover { color: var(--c-fg); background: oklch(0.68 0.22 38 / 0.04); }
-.hud-tab--active { color: var(--c-amber); }
+.hud-tab:nth-child(3n) { border-right: none; }
+.hud-tab:nth-last-child(-n+3) { border-bottom: none; }
+.hud-tab:hover { color: var(--c-fg); background: oklch(0.68 0.22 38 / 0.05); }
+.hud-tab--active { color: var(--c-amber); background: oklch(0.68 0.22 38 / 0.10); box-shadow: inset 0 -2px 0 var(--c-amber); }
 .hud-tab-indicator {
   position: absolute; bottom: 0; left: 0; right: 0; height: 1.5px;
   background: var(--c-amber);
@@ -547,3 +549,103 @@ html, body {
 .font-mono          { font-family: var(--font-mono); }
 .bg-background      { background: var(--c-bg); }
 .text-foreground    { color: var(--c-fg); }
+
+/* ── Modal (settings / onboarding) ───────────────────────── */
+.hud-modal-overlay {
+  position: fixed; inset: 0; z-index: 100;
+  display: grid; place-items: center; padding: 16px;
+  background: oklch(0.05 0.01 28 / 0.72);
+  backdrop-filter: blur(4px);
+}
+.hud-modal {
+  width: min(420px, 100%);
+  border: 1px solid var(--c-line-hi);
+  background: oklch(0.11 0.015 28 / 98%);
+  box-shadow: 0 20px 70px oklch(0 0 0 / 0.6), 0 0 40px oklch(0.68 0.22 38 / 0.08);
+}
+.hud-modal-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px; border-bottom: 1px solid var(--c-line);
+  font-size: 10px; letter-spacing: 0.25em; text-transform: uppercase; color: var(--c-amber);
+}
+.hud-modal-body { padding: 16px 14px; display: flex; flex-direction: column; max-height: 68vh; overflow-y: auto; }
+.hud-modal-intro { font-size: 11.5px; line-height: 1.5; color: var(--c-muted); margin-bottom: 14px; }
+.hud-modal-intro code { color: var(--c-amber); font-size: 11px; }
+.hud-modal-divider { height: 1px; background: var(--c-line); margin: 16px 0 12px; }
+.hud-modal-warn { font-size: 9.5px; color: var(--c-warn); margin-top: 6px; line-height: 1.4; }
+.hud-key-row { margin-top: 8px; }
+.hud-key-head {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px;
+  font-size: 10px; color: var(--c-fg);
+}
+.hud-key-set { color: var(--c-green); letter-spacing: 0.1em; }
+.hud-key-link {
+  background: transparent; border: none; cursor: pointer; font-family: var(--font-mono);
+  font-size: 9px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--c-amber);
+}
+.hud-key-link:hover { text-decoration: underline; }
+.hud-field-label {
+  font-size: 8.5px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--c-muted); margin-bottom: 5px;
+}
+.hud-modal-input {
+  width: 100%; background: oklch(0.08 0.012 28 / 90%);
+  border: 1px solid var(--c-line-hi); color: var(--c-fg);
+  font-family: var(--font-mono); font-size: 13px; padding: 9px 10px; outline: none;
+  transition: border-color 150ms, box-shadow 150ms;
+}
+.hud-modal-input:focus {
+  border-color: oklch(0.68 0.22 38 / 55%);
+  box-shadow: 0 0 0 1px oklch(0.68 0.22 38 / 0.12) inset;
+}
+.hud-modal-footer {
+  display: flex; justify-content: flex-end; gap: 8px;
+  padding: 12px 14px; border-top: 1px solid var(--c-line);
+}
+.hud-modal-btn {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+  padding: 8px 16px; border: 1px solid var(--c-line-hi); cursor: pointer;
+  background: transparent; color: var(--c-muted); transition: all 150ms;
+}
+.hud-modal-btn--ghost:hover { color: var(--c-fg); border-color: var(--c-amber); }
+.hud-modal-btn--primary {
+  color: var(--c-amber); border-color: oklch(0.68 0.22 38 / 55%);
+  background: oklch(0.68 0.22 38 / 0.12);
+}
+.hud-modal-btn--primary:hover:not(:disabled) {
+  background: oklch(0.68 0.22 38 / 0.2); box-shadow: var(--glow-amber);
+}
+.hud-modal-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Header status bar (plain-language, replaces the jargon ticker) ──────────── */
+.hud-statusbar {
+  flex: 1; display: flex; align-items: center; gap: 10px; padding: 0 16px;
+  min-width: 0; height: 100%; border-right: 1px solid var(--c-line);
+}
+.hud-statusbar-main {
+  font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--c-muted); white-space: nowrap;
+}
+.hud-statusbar-nudge {
+  font-size: 9.5px; letter-spacing: 0.04em; color: var(--c-amber); background: transparent;
+  border: 1px solid oklch(0.68 0.22 38 / 0.35); border-radius: 5px; padding: 3px 9px;
+  cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background 150ms;
+}
+.hud-statusbar-nudge:hover { background: oklch(0.68 0.22 38 / 0.12); }
+
+/* ── Panel intro — one-line explainer at the top of each dashboard panel ─────── */
+.hud-panel-intro {
+  font-size: 9.5px; line-height: 1.45; color: var(--c-muted); opacity: 0.85;
+  padding: 0 2px 8px; margin-bottom: 2px; border-bottom: 1px solid var(--c-line);
+}
+
+/* ── Help guide modal ────────────────────────────────────────────────────────── */
+.hud-modal--wide { width: min(560px, 100%); }
+.hud-help-grid { display: flex; flex-direction: column; gap: 7px; margin-top: 2px; }
+.hud-help-row { display: flex; gap: 10px; align-items: baseline; }
+.hud-help-label {
+  flex-shrink: 0; width: 62px; font-size: 9px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--c-amber);
+}
+.hud-help-text { font-size: 11px; line-height: 1.4; color: var(--c-fg); opacity: 0.85; }

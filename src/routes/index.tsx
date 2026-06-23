@@ -8,9 +8,12 @@ import {
   ChevronRight,
   Clock,
   CopyCheck,
+  Cpu,
   Database,
   Eye,
+  HelpCircle,
   Lock,
+  LineChart,
   Maximize2,
   Mic,
   MicOff,
@@ -18,8 +21,11 @@ import {
   Minus,
   Radio,
   Send,
+  Server,
+  Settings,
   Terminal,
   Trash2,
+  UserRound,
   Volume2,
   Wrench,
   X,
@@ -61,13 +67,19 @@ type AgentStatus = {
   conversation?: { turns: number };
   council?: { panel: string[]; chair: string };
   voice?: { current: string; options: { id: string; label: string }[] };
+  user?: { name: string; onboarded: boolean };
   watch?: { watching: boolean; watchlist: string[]; interval_min: number; tf: string };
   memory?: { available: boolean; count: number };
+  governor?: { mode: string; available: string[]; metrics: { distribution: Record<string, number>; avg_latency_s: number | null; decisions: number } };
+  homeostasis?: Homeostasis | null;
+  device_tier?: string;
+  local?: { enabled: boolean; fast: string; deep: string };
   tools?: ToolInfo[];
   tasks?: Task[];
   trace?: AgentTrace[];
 };
 type CouncilState = { active: boolean; panel: string[]; proposals: { model: string; text: string }[]; verdict: string };
+type TradePlan = { side: string; entry?: number; sl?: number; tp?: number; rr?: number; text: string };
 type IctRead = {
   ok: boolean; error?: string;
   symbol?: string; tv?: string; interval?: string; last?: number;
@@ -75,10 +87,36 @@ type IctRead = {
   bos?: string; sweep?: string; order_block?: string; read?: string;
   fvgs?: { dir: string; lo: number; hi: number }[];
   buyside?: number[]; sellside?: number[];
+  equilibrium?: number; zone?: "premium" | "discount"; score?: number;
+  htf_bias?: "bullish" | "bearish" | "neutral"; confluence?: string;
+  plan?: TradePlan; session?: { open: boolean; note: string; ist: string };
 };
+type GovDecision = {
+  id: string; rung: string; label: string; kind: string; difficulty: number;
+  factors?: Record<string, number>; lambda_eff: number; rationale: string;
+  candidates?: { id: string; util: number }[];
+};
+type Homeostasis = { energy: number; mood: string; label: string; on_ac: boolean; tts_rate?: string };
+type DeviceBrief = {
+  tier?: string; power_state?: string; battery?: { percent: number; plugged: boolean } | null;
+  headroom?: number; ram_available_gb?: number; cpu_percent?: number;
+};
+type Rung = { id: string; label: string; kind: string; tier: number; quality: number; energy: number; latency: number; available: boolean };
+type InstalledModel = { name: string; gb: number | null; params?: string; quant?: string; tools?: boolean };
+type ModelRec = { tag: string; params: string; gb: number; note: string; installed: boolean };
+type ModelsData = {
+  ollama: boolean; version?: string; tier?: string;
+  installed?: InstalledModel[];
+  running?: { name: string; gb: number | null; on_gpu: boolean }[];
+  recommended?: ModelRec[]; active?: { fast: string; deep: string; enabled: boolean };
+};
+type MemItem = { id: number; content: string; category: string; importance: number; source: string };
 
 // "openai/gpt-oss-120b" -> "gpt-oss-120b"
 const shortModel = (m: string) => (m || "").split("/").pop()!.replace("-instruct", "");
+const MODE_LABEL: Record<string, string> = { auto: "Auto", eco: "Eco", local: "Local", cloud: "Cloud" };
+
+type ApiKeyStatus = { secure: boolean; groq: boolean; anthropic: boolean };
 
 declare global {
   interface Window {
@@ -87,17 +125,21 @@ declare global {
       toggleMaximize?: () => void;
       closeWindow?: () => void;
       restartBackend?: () => Promise<void>;
+      openTrading?: () => Promise<{ ok: boolean; error?: string }>;
       onMaximizeChange?: (cb: (isMax: boolean) => void) => (() => void) | void;
+      getApiKeyStatus?: () => Promise<ApiKeyStatus>;
+      setApiKeys?: (keys: Record<string, string>) => Promise<ApiKeyStatus>;
+      openExternal?: (url: string) => void;
     };
   }
 }
 
 // ── Constants ─────────────────────────────────────────────
 const QUICK = [
-  { label: "Scan Screen", cmd: "what is on my screen right now",                  icon: Eye       },
-  { label: "Fix It",      cmd: "look at my screen and tell me what to fix",       icon: CopyCheck },
-  { label: "CVE News",    cmd: "get me the latest cybersecurity news",             icon: Radio     },
-  { label: "Recall",      cmd: "what do you remember about me",                   icon: Database  },
+  { label: "What's on screen", cmd: "what is on my screen right now",             icon: Eye       },
+  { label: "Fix my screen",    cmd: "look at my screen and tell me what to fix",  icon: CopyCheck },
+  { label: "Latest news",      cmd: "get me the latest tech and security news",   icon: Radio     },
+  { label: "What you know",    cmd: "what do you remember about me",              icon: Database  },
 ];
 
 const ROLE_META: Record<LineRole, { color: string; label: string }> = {
@@ -166,23 +208,37 @@ function CommandDeck() {
   const [sysStats, setSysStats]     = useState({ cpu: 0, ram: 0, disk: 0 });
   const [cmdHistory, setCmdHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx]       = useState(-1);
-  const [rightTab, setRightTab]     = useState<"tasks" | "trace" | "tools" | "markets">("tasks");
+  const [rightTab, setRightTab]     = useState<"governor" | "rig" | "memory" | "tasks" | "trace" | "markets">("governor");
   const [reactorFlash, setReactorFlash] = useState(false);
   const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized]   = useState(false);
   const [council, setCouncil]       = useState<CouncilState>({ active: false, panel: [], proposals: [], verdict: "" });
   const [voiceId, setVoiceId]       = useState("");
+  const [settingsOpen, setSettingsOpen]         = useState(false);
+  const [helpOpen, setHelpOpen]                 = useState(false);
+  const [onboardDismissed, setOnboardDismissed] = useState(false);
   const [mktSymbol, setMktSymbol]   = useState("nifty");
   const [mktData, setMktData]       = useState<IctRead | null>(null);
   const [mktLoading, setMktLoading] = useState(false);
   const [watching, setWatching]     = useState(false);
   const [alerts, setAlerts]         = useState<{ symbol: string; text: string; at: string }[]>([]);
+  const [govDecision, setGovDecision] = useState<GovDecision | null>(null);
+  const [homeostasis, setHomeostasis] = useState<Homeostasis | null>(null);
+  const [deviceBrief, setDeviceBrief] = useState<DeviceBrief | null>(null);
+  const [govMode, setGovMode]         = useState("auto");
+  const [rungs, setRungs]             = useState<Rung[]>([]);
+  const [models, setModels]           = useState<ModelsData | null>(null);
+  const [memItems, setMemItems]       = useState<MemItem[]>([]);
+  const [pulls, setPulls]             = useState<Record<string, { status: string; pct: number }>>({});
+  const [bench, setBench]             = useState<Record<string, { tok?: number; status: string }>>({});
+  const [sleepMsg, setSleepMsg]       = useState<string | null>(null);
 
   const wsRef       = useRef<WebSocket | null>(null);
   const speakTmr    = useRef<number | null>(null);
   const audioRef    = useRef<HTMLAudioElement | null>(null);
   const scrollRef   = useRef<HTMLDivElement | null>(null);
   const inputRef    = useRef<HTMLInputElement | null>(null);
+  const fetchMemRef = useRef<() => void>(null!);
 
   // Stable refs so callbacks never recreate (avoids useEffect re-run loop)
   const addLineRef      = useRef<(role: LineRole, text: string) => void>(null!);
@@ -297,12 +353,34 @@ function CommandDeck() {
           setCouncil(c => ({ ...c, active: false, verdict: txt }));
         }
         if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
+        if (d.type === "open_trading") {
+          addLineRef.current("system", "Opening trading terminal…");
+          window?.electronAPI?.openTrading?.();
+        }
+        if (d.type === "name_changed" && d.name) {
+          setAgentStatus(prev => ({ ...prev, user: { name: String(d.name), onboarded: true } }));
+          addLineRef.current("system", `Operator set to ${d.name}.`);
+        }
         if (d.type === "watch_state") setWatching(Boolean(d.watching));
         if (d.type === "ict_alert") {
           const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
           setAlerts(a => [{ symbol: String(d.symbol), text: txt, at }, ...a].slice(0, 8));
           flashReactorRef.current();
         }
+        if (d.type === "governor_decision") {
+          if (d.decision) setGovDecision(d.decision as GovDecision);
+          if (d.homeostasis) setHomeostasis(d.homeostasis as Homeostasis);
+          if (d.device) setDeviceBrief(d.device as DeviceBrief);
+          flashReactorRef.current();
+        }
+        if (d.type === "governor_mode" && d.mode) setGovMode(String(d.mode));
+        if (d.type === "model_pull") setPulls(p => ({ ...p, [String(d.model)]: { status: String(d.status ?? ""), pct: Number(d.pct) || 0 } }));
+        if (d.type === "model_bench") setBench(b => ({ ...b, [String(d.model)]: { tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined, status: String(d.status ?? "") } }));
+        if (d.type === "sleep") {
+          setSleepMsg(d.state === "start" ? "Consolidating memory…" : (txt || "rested"));
+          if (d.state === "done") { fetchMemRef.current?.(); window.setTimeout(() => setSleepMsg(null), 6000); }
+        }
+        if (d.type === "memory_update") fetchMemRef.current?.();
         if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
         if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
         if (d.type === "agent_tool" && d.step) {
@@ -362,6 +440,50 @@ function CommandDeck() {
   // Sync watcher state from periodic status refreshes.
   useEffect(() => { setWatching(Boolean(agentStatus.watch?.watching)); }, [agentStatus.watch?.watching]);
 
+  // First run: if the backend has no operator name yet, open onboarding (once).
+  useEffect(() => {
+    if (agentStatus.user && !agentStatus.user.onboarded && !onboardDismissed) setSettingsOpen(true);
+  }, [agentStatus.user, onboardDismissed]);
+
+  // Governor / Model Advisor / Memory data.
+  const fetchModels = useCallback(async () => {
+    try { const r = await fetch("/api/models"); setModels(await r.json()); } catch { /* silent */ }
+  }, []);
+  const fetchMemory = useCallback(async () => {
+    try { const r = await fetch("/api/memory"); const d = await r.json(); setMemItems(d.memories ?? []); } catch { /* silent */ }
+  }, []);
+  const fetchGovernor = useCallback(async () => {
+    try {
+      const r = await fetch("/api/governor"); const d = await r.json();
+      if (Array.isArray(d.rungs)) setRungs(d.rungs);
+      if (d.mode) setGovMode(d.mode);
+      if (d.homeostasis) setHomeostasis(d.homeostasis);
+    } catch { /* silent */ }
+  }, []);
+  fetchMemRef.current = fetchMemory;
+
+  useEffect(() => { fetchGovernor(); }, [fetchGovernor]);
+  useEffect(() => { if (rightTab === "governor") fetchGovernor(); }, [rightTab, fetchGovernor]);
+  useEffect(() => {
+    if (rightTab !== "rig") return;
+    fetchModels(); const id = setInterval(fetchModels, 8000); return () => clearInterval(id);
+  }, [rightTab, fetchModels]);
+  useEffect(() => { if (rightTab === "memory") fetchMemory(); }, [rightTab, fetchMemory]);
+  useEffect(() => { if (agentStatus.governor?.mode) setGovMode(agentStatus.governor.mode); }, [agentStatus.governor?.mode]);
+  useEffect(() => { if (agentStatus.homeostasis) setHomeostasis(agentStatus.homeostasis); }, [agentStatus.homeostasis]);
+
+  const setMode = useCallback((m: string) => {
+    setGovMode(m);
+    wsRef.current?.send(JSON.stringify({ action: "set_mode", mode: m }));
+  }, []);
+  const onPull  = useCallback((tag: string)  => { wsRef.current?.send(JSON.stringify({ action: "pull_model", model: tag })); }, []);
+  const onBench = useCallback((name: string) => { wsRef.current?.send(JSON.stringify({ action: "benchmark_model", model: name })); }, []);
+  const onForget = useCallback((id: number) => {
+    wsRef.current?.send(JSON.stringify({ action: "forget_memory", id }));
+    setMemItems(prev => prev.filter(m => m.id !== id));
+  }, []);
+  const onSleep = useCallback(() => { wsRef.current?.send(JSON.stringify({ action: "trigger_sleep" })); }, []);
+
   const sendCommand = useCallback(async (cmd = input) => {
     const text = cmd.trim();
     if (!text) return;
@@ -379,9 +501,11 @@ function CommandDeck() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ command: text }),
       });
-      const d = await r.json();
-      addLine("agent", d.response ?? "Done.");
-      refreshRef.current();
+      if (!r.ok) throw new Error();
+      // /api/command only acknowledges — the reply streams back over the WebSocket,
+      // which is down if we're on this path. Bring the uplink back to receive it.
+      addLine("system", "Sent — restoring the live uplink for the reply…");
+      connectWsRef.current?.();
     } catch { setError("No backend connection."); }
   }, [addLine, input]);
 
@@ -413,6 +537,8 @@ function CommandDeck() {
   const convoTurns = agentStatus.conversation?.turns ?? 0;
   const voiceOptions = agentStatus.voice?.options ?? [];
   const currentVoice = voiceId || agentStatus.voice?.current || "";
+  const userName     = agentStatus.user?.name ?? "";
+  const needsOnboard = Boolean(agentStatus.user) && !agentStatus.user?.onboarded;
   const activeTsk = tasks.find(t => t.status === "active");
   const qTasks    = tasks.filter(t => t.status === "queued");
   const doneTasks = tasks.filter(t => t.status === "done").slice(-4).reverse();
@@ -421,6 +547,11 @@ function CommandDeck() {
   const connLabel = connected
     ? listening ? "listening" : "online"
     : connecting ? "linking…" : "offline";
+
+  const cloudOn = (agentStatus.governor?.available ?? []).some(r => r === "cloud_fast" || r === "cloud_deep" || r === "council");
+  const localOn = Boolean(agentStatus.local?.enabled);
+  const brainSummary = !connected ? (connecting ? "connecting…" : "offline")
+    : cloudOn ? "cloud + local AI" : localOn ? `local AI · ${shortModel(agentStatus.local?.fast ?? "model")}` : "no AI configured yet";
 
   return (
     <div className="hud-root">
@@ -443,29 +574,25 @@ function CommandDeck() {
           </div>
           <div>
             <p className="hud-logo-name">JARVIS</p>
-            <p className="hud-logo-sub">command deck · mk lxxxv</p>
+            <p className="hud-logo-sub">personal AI</p>
           </div>
         </div>
 
-        <div className="hud-ticker-wrap">
-          <div className="hud-ticker">
-            {Array.from({ length: 2 }, (_, rep) =>
-              [
-                `status: ${connLabel}`,
-                `model: ${agentStatus.brain?.primary_llm ?? agentStatus.brain?.local_model ?? "offline"}`,
-                `memory: ${memOk ? `${memCount} items` : "offline"}`,
-                `tools: ${tools.length} active`,
-                `safety: bounded / 8 steps`,
-                `backend: ${connected ? "ws open" : "standby"}`,
-                `trace: ${trace.length} steps`,
-              ].map((s, i) => <span key={`${rep}-${i}`}>{s}</span>)
-            )}
-          </div>
+        <div className="hud-statusbar no-drag">
+          <StatusDot tone={connTone} pulse />
+          <span className="hud-statusbar-main">{brainSummary}</span>
+          {connected && !cloudOn && (
+            <button className="hud-statusbar-nudge" onClick={() => setSettingsOpen(true)}>
+              add a free API key for faster, smarter answers →
+            </button>
+          )}
         </div>
 
         <div className="hud-header-controls no-drag">
-          <StatusPill tone={connTone} label={connLabel} />
+          <IconBtn onClick={() => setHelpOpen(true)} title="What is this? — quick guide"><HelpCircle className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={refreshStatus} title="Refresh"><Activity className="w-3.5 h-3.5" /></IconBtn>
+          <IconBtn onClick={() => setSettingsOpen(true)} title="Settings"><Settings className="w-3.5 h-3.5" /></IconBtn>
+          <IconBtn onClick={() => window?.electronAPI?.openTrading?.()} title="Open trading terminal"><LineChart className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => window?.electronAPI?.restartBackend?.()} title="Restart backend"><Zap className="w-3.5 h-3.5" /></IconBtn>
           <div className="hud-sep" />
           <IconBtn onClick={() => window?.electronAPI?.minimizeWindow?.()} title="Minimize"><Minus className="w-3.5 h-3.5" /></IconBtn>
@@ -492,7 +619,7 @@ function CommandDeck() {
               animate={reactorFlash ? { opacity: [1, 0.3, 1] } : {}}
               transition={{ duration: 0.4 }}
             >
-              <ArcReactor active={connected} speaking={speaking || listening} size="sm" />
+              <ArcReactor active={connected} speaking={speaking || listening} energy={homeostasis?.energy ?? 1} size="sm" />
             </motion.div>
             <div className="hud-reactor-label">
               <StatusDot tone={connTone} pulse />
@@ -503,6 +630,12 @@ function CommandDeck() {
               jarvisActive={speaking}
               level={audioLevel}
             />
+          </motion.div>
+
+          {/* Energy — homeostasis (scales with battery/heat/load) */}
+          <motion.div className="hud-card" variants={ITEM_VARIANTS}>
+            <CardHeader title="Energy" active={Boolean(homeostasis)} />
+            <BodyCard h={homeostasis} dev={deviceBrief} />
           </motion.div>
 
           {/* System vitals */}
@@ -517,20 +650,23 @@ function CommandDeck() {
 
           {/* Agent core */}
           <motion.div className={`hud-card ${connected ? "hud-card--active" : ""}`} variants={ITEM_VARIANTS}>
-            <CardHeader title="Agent Core" active={connected} />
+            <CardHeader title="Status" active={connected} />
             <div className="hud-agent-rows">
-              <AgentRow icon={Brain}    label="Brain"   val={shortModel(agentStatus.brain?.primary_llm ?? agentStatus.brain?.local_model ?? "offline")} />
+              <AgentRow icon={UserRound} label="Operator" val={userName || "unset — open settings"} />
+              <AgentRow icon={Brain}    label="Routing" val={`${MODE_LABEL[govMode] ?? govMode}${govDecision ? " · " + govDecision.label : ""}`} />
               <AgentRow icon={Database} label="Memory"  val={memOk ? `${memCount} records` : "offline"} />
               <AgentRow icon={Wrench}   label="Tools"   val={`${tools.length} registered`} />
               <AgentRow icon={Boxes}    label="Context" val={`${convoTurns} turns held`} />
             </div>
           </motion.div>
 
-          {/* Council — Mixture-of-Agents deliberation */}
-          <motion.div className={`hud-card ${council.active ? "hud-card--active" : ""}`} variants={ITEM_VARIANTS}>
-            <CardHeader title="Council" active={council.active} />
-            <Council council={council} idlePanel={agentStatus.council?.panel ?? []} />
-          </motion.div>
+          {/* Council — only appears when you actually convene a panel ("deliberate …") */}
+          {(council.active || council.verdict) && (
+            <motion.div className={`hud-card ${council.active ? "hud-card--active" : ""}`} variants={ITEM_VARIANTS}>
+              <CardHeader title="Council" active={council.active} />
+              <Council council={council} idlePanel={agentStatus.council?.panel ?? []} />
+            </motion.div>
+          )}
         </motion.aside>
 
         {/* ── CENTER: TERMINAL ── */}
@@ -540,7 +676,7 @@ function CommandDeck() {
           <div className="hud-stream-header">
             <div className="flex items-center gap-2">
               <span className="text-amber text-[10px]">›</span>
-              <span className="hud-label">Neural Stream</span>
+              <span className="hud-label">Conversation</span>
               <span className="hud-badge">{lines.length}</span>
             </div>
             <div className="flex items-center gap-2">
@@ -641,29 +777,6 @@ function CommandDeck() {
               <IconBtn onClick={toggleListen} active={listening} title="Voice input">
                 {listening ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
               </IconBtn>
-              {voiceOptions.length > 0 && (
-                <select
-                  value={currentVoice}
-                  onChange={(e) => {
-                    setVoiceId(e.target.value);
-                    wsRef.current?.send(JSON.stringify({ action: "set_voice", voice: e.target.value }));
-                  }}
-                  title="JARVIS voice"
-                  style={{
-                    background: "transparent",
-                    color: "oklch(0.68 0.22 38)",
-                    border: "1px solid oklch(0.68 0.22 38 / 0.3)",
-                    borderRadius: 5, fontSize: 10, padding: "3px 4px",
-                    maxWidth: 120, fontFamily: "inherit", cursor: "pointer", outline: "none",
-                  }}
-                >
-                  {voiceOptions.map(v => (
-                    <option key={v.id} value={v.id} style={{ background: "#120a06", color: "#eee" }}>
-                      {v.label}
-                    </option>
-                  ))}
-                </select>
-              )}
             </motion.div>
 
             <AnimatePresence>
@@ -688,23 +801,23 @@ function CommandDeck() {
           <div className="hud-tabs">
             {(
               [
-                { id: "tasks",   icon: ListTodo,   label: "Tasks",   badge: qTasks.length > 0 ? String(qTasks.length) : undefined },
-                { id: "trace",   icon: GitBranch,  label: "Trace",   badge: trace.length > 0  ? String(trace.length)  : undefined },
-                { id: "tools",   icon: Boxes,      label: "Tools",   badge: tools.length > 0  ? String(tools.length)  : undefined },
-                { id: "markets", icon: CandlestickChart, label: "Markets", badge: alerts.length > 0 ? String(alerts.length) : undefined },
+                { id: "governor", icon: Cpu,             label: "Brain",    badge: undefined },
+                { id: "rig",      icon: Server,           label: "Models",   badge: undefined },
+                { id: "memory",   icon: Database,         label: "Memory",   badge: memCount > 0 ? String(memCount) : undefined },
+                { id: "tasks",    icon: ListTodo,         label: "Tasks",    badge: qTasks.length > 0 ? String(qTasks.length) : undefined },
+                { id: "trace",    icon: GitBranch,        label: "Activity", badge: trace.length > 0  ? String(trace.length)  : undefined },
+                { id: "markets",  icon: CandlestickChart, label: "Markets",  badge: alerts.length > 0 ? String(alerts.length) : undefined },
               ] as const
             ).map((tab) => (
               <button
                 key={tab.id}
                 className={`hud-tab ${rightTab === tab.id ? "hud-tab--active" : ""}`}
                 onClick={() => setRightTab(tab.id)}
+                title={tab.label}
               >
-                <tab.icon className="w-3.5 h-3.5" />
+                <tab.icon className="w-3 h-3 shrink-0" />
                 <span>{tab.label}</span>
                 {tab.badge && <span className="hud-tab-badge">{tab.badge}</span>}
-                {rightTab === tab.id && (
-                  <motion.div className="hud-tab-indicator" layoutId="tab-indicator" />
-                )}
               </button>
             ))}
           </div>
@@ -721,6 +834,7 @@ function CommandDeck() {
                   exit={{ opacity: 0, x: -12 }}
                   transition={{ duration: 0.2 }}
                 >
+                  <PanelIntro text="Things you've asked JARVIS to track." />
                   {activeTsk && (
                     <div className="hud-task hud-task--active">
                       <div className="hud-task-indicator" />
@@ -754,8 +868,9 @@ function CommandDeck() {
                   exit={{ opacity: 0, x: -12 }}
                   transition={{ duration: 0.2 }}
                 >
+                  <PanelIntro text="The tools JARVIS just used, step by step." />
                   {trace.length === 0
-                    ? <EmptyPane text="Tool calls appear here." />
+                    ? <EmptyPane text="Nothing yet — tools JARVIS uses will show here." />
                     : [...trace].reverse().map((s, i) => (
                       <motion.div
                         key={`${s.step}-${i}`}
@@ -775,33 +890,26 @@ function CommandDeck() {
                 </motion.div>
               )}
 
-              {rightTab === "tools" && (
-                <motion.div
-                  key="tools"
-                  className="hud-tab-panel"
-                  initial={{ opacity: 0, x: 12 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  exit={{ opacity: 0, x: -12 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  {tools.length === 0
-                    ? <EmptyPane text="Connect to backend to load tools." />
-                    : tools.map((t, i) => (
-                      <motion.div
-                        key={t.name}
-                        className="hud-tool-row"
-                        initial={{ opacity: 0, y: 8 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: i * 0.04 }}
-                      >
-                        <div className="hud-tool-icon"><Wrench className="w-3 h-3" /></div>
-                        <div className="min-w-0">
-                          <p className="hud-tool-name">{t.name}</p>
-                          <p className="hud-tool-desc">{t.description}</p>
-                        </div>
-                      </motion.div>
-                    ))
-                  }
+              {rightTab === "governor" && (
+                <motion.div key="governor" className="hud-tab-panel"
+                  initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.2 }}>
+                  <GovernorPanel mode={govMode} setMode={setMode} decision={govDecision}
+                    rungs={rungs} metrics={agentStatus.governor?.metrics} />
+                </motion.div>
+              )}
+
+              {rightTab === "rig" && (
+                <motion.div key="rig" className="hud-tab-panel"
+                  initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.2 }}>
+                  <RigPanel models={models} pulls={pulls} bench={bench} onPull={onPull} onBench={onBench} />
+                </motion.div>
+              )}
+
+              {rightTab === "memory" && (
+                <motion.div key="memory" className="hud-tab-panel"
+                  initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.2 }}>
+                  <MemoryPanel items={memItems} onForget={onForget} onSleep={onSleep}
+                    sleepMsg={sleepMsg} count={agentStatus.memory?.count ?? memItems.length} />
                 </motion.div>
               )}
 
@@ -814,6 +922,7 @@ function CommandDeck() {
                   exit={{ opacity: 0, x: -12 }}
                   transition={{ duration: 0.2 }}
                 >
+                  <PanelIntro text="Smart-money read on Indian indices. Analysis only — never places trades." />
                   <MarketsPanel
                     symbol={mktSymbol}
                     setSymbol={setMktSymbol}
@@ -835,6 +944,24 @@ function CommandDeck() {
           </div>
         </aside>
       </div>
+
+      <SettingsModal
+        open={settingsOpen}
+        onboarding={needsOnboard}
+        name={userName}
+        voiceOptions={voiceOptions}
+        currentVoice={currentVoice}
+        onClose={() => { setSettingsOpen(false); setOnboardDismissed(true); }}
+        onSave={(nm, voice) => {
+          if (nm && nm !== userName) wsRef.current?.send(JSON.stringify({ action: "set_name", name: nm }));
+          if (voice && voice !== currentVoice) {
+            setVoiceId(voice);
+            wsRef.current?.send(JSON.stringify({ action: "set_voice", voice }));
+          }
+          setSettingsOpen(false); setOnboardDismissed(true);
+        }}
+      />
+      <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} onOpenSettings={() => setSettingsOpen(true)} />
     </div>
   );
 }
@@ -1023,7 +1150,10 @@ function MarketsPanel(p: {
       {d?.ok && d.tv && <TradingViewChart tv={d.tv} />}
 
       {p.loading && !d && <p style={{ fontSize: 11, opacity: 0.5 }}>Reading the tape…</p>}
-      {d && !d.ok && <p style={{ fontSize: 11, color: RED, opacity: 0.9 }}>{d.error}</p>}
+      {d && !d.ok && <p style={{ fontSize: 10.5, opacity: 0.55, lineHeight: 1.4 }}>
+        Market data unavailable right now — the market may be closed or offline.
+        Live reads work during NSE hours (9:15–15:30 IST).
+      </p>}
 
       {d?.ok && (
         <>
@@ -1033,6 +1163,36 @@ function MarketsPanel(p: {
               textTransform: "uppercase", color: biasColor }}>{d.bias}</span>
           </div>
           <p style={{ fontSize: 10.5, opacity: 0.7, lineHeight: 1.4 }}>{d.structure}</p>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 9.5, opacity: 0.75 }}>
+              Daily: <span style={{ color: d.htf_bias === "bullish" ? GREEN : d.htf_bias === "bearish" ? RED : AMBER }}>{d.htf_bias}</span>
+            </span>
+            {d.confluence && (
+              <Tag color={d.confluence === "aligned" ? GREEN : d.confluence === "conflicting" ? RED : AMBER}
+                   label={d.confluence === "aligned" ? "✓ HTF aligned" : d.confluence === "conflicting" ? "⚠ HTF conflict" : "HTF neutral"} />
+            )}
+          </div>
+          {d.session && (
+            <p style={{ fontSize: 9.5, opacity: 0.6 }}>
+              <span style={{ color: d.session.open ? GREEN : AMBER }}>●</span> Market {d.session.note} · {d.session.ist}
+            </p>
+          )}
+          {typeof d.score === "number" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9.5, opacity: 0.75 }}>
+                <span>CONFLUENCE {d.score}/100</span>
+                {d.zone && (
+                  <span style={{ color: d.zone === "discount" ? GREEN : RED, textTransform: "uppercase" }}>
+                    {d.zone}{typeof d.equilibrium === "number" ? ` · eq ${d.equilibrium}` : ""}
+                  </span>
+                )}
+              </div>
+              <div style={{ height: 3, background: `${AMBER}22`, borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ height: "100%", width: `${d.score}%`,
+                  background: d.score >= 70 ? GREEN : d.score >= 40 ? AMBER : RED }} />
+              </div>
+            </div>
+          )}
           {d.bos && <Tag color={biasColor} label={d.bos} />}
           {d.sweep && <Tag color={AMBER} label={"sweep: " + d.sweep} />}
           {d.order_block && <Tag color={biasColor} label={d.order_block} />}
@@ -1049,6 +1209,25 @@ function MarketsPanel(p: {
           )}
           <p style={{ fontSize: 10.5, opacity: 0.85, lineHeight: 1.45,
             borderTop: `1px solid ${AMBER}22`, paddingTop: 6 }}>{d.read}</p>
+          {d.plan && d.plan.side !== "wait" && (
+            <div style={{ border: `1px solid ${biasColor}55`, background: `${biasColor}12`,
+              borderRadius: 6, padding: "6px 8px", display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.08em",
+                  textTransform: "uppercase", color: biasColor }}>{d.plan.side} idea</span>
+                <span style={{ fontSize: 9.5, opacity: 0.8 }}>R:R {d.plan.rr}</span>
+              </div>
+              <div style={{ display: "flex", gap: 10, fontSize: 10 }}>
+                <span>entry <b>{d.plan.entry}</b></span>
+                <span style={{ color: RED }}>SL {d.plan.sl}</span>
+                <span style={{ color: GREEN }}>TP {d.plan.tp}</span>
+              </div>
+              <span style={{ fontSize: 8.5, opacity: 0.5 }}>Draft levels — you place the trade.</span>
+            </div>
+          )}
+          {d.plan && d.plan.side === "wait" && (
+            <p style={{ fontSize: 10, opacity: 0.6, fontStyle: "italic" }}>{d.plan.text}</p>
+          )}
           <button onClick={() => p.onDeliberate(`${d.symbol} ${d.bias}, ${d.read}. Should I take it?`)}
             style={{ ...chip(false), alignSelf: "flex-start", padding: "4px 8px" }}>
             Ask the council ⚖
@@ -1083,6 +1262,432 @@ function Tag({ color, label }: { color: string; label: string }) {
   return (
     <span style={{ fontSize: 9.5, padding: "2px 6px", borderRadius: 4, alignSelf: "flex-start",
       border: `1px solid ${color}55`, color, background: `${color}14` }}>{label}</span>
+  );
+}
+
+function KeyField({ label, set, disabled, value, onChange, placeholder, onGet }: {
+  label: string; set: boolean; disabled: boolean; value: string;
+  onChange: (v: string) => void; placeholder: string; onGet: () => void;
+}) {
+  return (
+    <div className="hud-key-row">
+      <div className="hud-key-head">
+        <span>{label}{set && <span className="hud-key-set"> · set</span>}</span>
+        <button type="button" className="hud-key-link" onClick={onGet}>Get key ↗</button>
+      </div>
+      <input
+        className="hud-modal-input" type="password" autoComplete="off" spellCheck={false}
+        value={value} disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={set ? "•••••••• (leave blank to keep)" : placeholder}
+      />
+    </div>
+  );
+}
+
+function SettingsModal({
+  open, onboarding, name, voiceOptions, currentVoice, onClose, onSave,
+}: {
+  open: boolean; onboarding: boolean; name: string;
+  voiceOptions: { id: string; label: string }[]; currentVoice: string;
+  onClose: () => void; onSave: (name: string, voice: string) => void;
+}) {
+  const hasElectron = typeof window !== "undefined" && !!window.electronAPI?.setApiKeys;
+  const [nm, setNm] = useState(name);
+  const [voice, setVoice] = useState(currentVoice);
+  const [keyStatus, setKeyStatus] = useState<ApiKeyStatus | null>(null);
+  const [groqKey, setGroqKey] = useState("");
+  const [anthropicKey, setAnthropicKey] = useState("");
+  const [keyErr, setKeyErr] = useState("");
+
+  useEffect(() => {
+    if (!open) return;
+    setNm(name);
+    setVoice(currentVoice || voiceOptions[0]?.id || "");
+    setGroqKey(""); setAnthropicKey(""); setKeyErr("");
+    if (hasElectron) window.electronAPI!.getApiKeyStatus!().then(setKeyStatus).catch(() => {});
+  }, [open, name, currentVoice, voiceOptions, hasElectron]);
+
+  const openKeyLink = (url: string) => {
+    if (window.electronAPI?.openExternal) window.electronAPI.openExternal(url);
+    else window.open(url, "_blank", "noopener,noreferrer");
+  };
+
+  const handleSave = async () => {
+    if (hasElectron) {
+      const keys: Record<string, string> = {};
+      if (groqKey.trim()) keys.GROQ_API_KEY = groqKey.trim();
+      if (anthropicKey.trim()) keys.ANTHROPIC_API_KEY = anthropicKey.trim();
+      if (Object.keys(keys).length) {
+        try { setKeyStatus(await window.electronAPI!.setApiKeys!(keys)); }
+        catch (e) { setKeyErr(e instanceof Error ? e.message : "Couldn't save keys."); return; }
+      }
+    }
+    onSave(nm.trim(), voice);
+  };
+
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          className="hud-modal-overlay"
+          initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+          onClick={onboarding ? undefined : onClose}
+        >
+          <motion.div
+            className="hud-modal"
+            initial={{ opacity: 0, scale: 0.96, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.96, y: 8 }}
+            transition={{ duration: 0.2, ease: "easeOut" }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="hud-modal-header">
+              <span>{onboarding ? "Initialize JARVIS" : "Settings"}</span>
+              {!onboarding && <IconBtn onClick={onClose} title="Close"><X className="w-3 h-3" /></IconBtn>}
+            </div>
+
+            <div className="hud-modal-body">
+              {onboarding && (
+                <p className="hud-modal-intro">
+                  I'm JARVIS — your personal AI. Talk or type to me and I'll pick the best AI model
+                  for each request based on your machine. What should I call you?
+                  <br /><br />
+                  <b style={{ color: "var(--c-amber)" }}>Tip:</b> for fast, smart answers, add a free
+                  Groq key below — without one I run on a smaller local model only.
+                </p>
+              )}
+
+              <label className="hud-field-label">Your name</label>
+              <input
+                className="hud-modal-input"
+                value={nm}
+                onChange={(e) => setNm(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && nm.trim()) onSave(nm.trim(), voice); }}
+                placeholder="e.g. Tony"
+                maxLength={40}
+                autoFocus
+                spellCheck={false}
+              />
+
+              <label className="hud-field-label" style={{ marginTop: 12 }}>Voice</label>
+              <select className="hud-modal-input" value={voice} onChange={(e) => setVoice(e.target.value)}>
+                {voiceOptions.map((v) => (
+                  <option key={v.id} value={v.id} style={{ background: "#120a06", color: "#eee" }}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
+
+              <div className="hud-modal-divider" />
+              <label className="hud-field-label">API Keys</label>
+              {!hasElectron && (
+                <p className="hud-modal-intro" style={{ margin: "4px 0 8px" }}>
+                  Secure key storage runs in the desktop app. In the browser/dev, set keys in your{" "}
+                  <code>.env</code> file.
+                </p>
+              )}
+              {hasElectron && keyStatus && !keyStatus.secure && (
+                <p className="hud-modal-warn">OS secure storage is unavailable — keys can't be saved safely here.</p>
+              )}
+              <KeyField
+                label="Groq" set={Boolean(keyStatus?.groq)} disabled={!hasElectron}
+                value={groqKey} onChange={setGroqKey} placeholder="gsk_…"
+                onGet={() => openKeyLink("https://console.groq.com/keys")}
+              />
+              <KeyField
+                label="Anthropic (Claude)" set={Boolean(keyStatus?.anthropic)} disabled={!hasElectron}
+                value={anthropicKey} onChange={setAnthropicKey} placeholder="sk-ant-…"
+                onGet={() => openKeyLink("https://console.anthropic.com/settings/keys")}
+              />
+              {keyErr && <p className="hud-modal-warn">{keyErr}</p>}
+            </div>
+
+            <div className="hud-modal-footer">
+              <button className="hud-modal-btn hud-modal-btn--ghost" onClick={onClose}>
+                {onboarding ? "Later" : "Cancel"}
+              </button>
+              <button
+                className="hud-modal-btn hud-modal-btn--primary"
+                disabled={!nm.trim()}
+                onClick={handleSave}
+              >
+                {onboarding ? "Begin" : "Save"}
+              </button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
+}
+
+// ── Governor / Body / Rig / Memory ────────────────────────
+const C_AMBER = "oklch(0.68 0.22 38)";
+const C_GREEN = "oklch(0.74 0.18 150)";
+const C_RED   = "oklch(0.64 0.21 25)";
+const energyColor = (e: number) => (e > 0.66 ? C_GREEN : e > 0.33 ? C_AMBER : C_RED);
+const benBtn: React.CSSProperties = {
+  fontSize: 8.5, padding: "2px 7px", borderRadius: 4, cursor: "pointer",
+  border: `1px solid ${C_AMBER}44`, background: "transparent", color: C_AMBER,
+  fontFamily: "inherit", textTransform: "uppercase", letterSpacing: "0.08em",
+};
+
+function MiniBar({ value, color }: { value: number; color: string }) {
+  return (
+    <div style={{ height: 3, background: `${color}22`, borderRadius: 2, overflow: "hidden", flex: 1 }}>
+      <div style={{ height: "100%", width: `${Math.max(0, Math.min(100, Math.round(value * 100)))}%`, background: color }} />
+    </div>
+  );
+}
+
+function BodyCard({ h, dev }: { h: Homeostasis | null; dev: DeviceBrief | null }) {
+  const energy = h?.energy ?? 1;
+  const col = energyColor(energy);
+  const bat = dev?.battery;
+  return (
+    <div style={{ padding: "9px 10px", display: "flex", flexDirection: "column", gap: 7 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <span style={{ fontSize: 11, color: col, textTransform: "uppercase", letterSpacing: "0.14em" }}>{h?.label ?? "—"}</span>
+        <span style={{ fontSize: 8.5, opacity: 0.55, textTransform: "uppercase", letterSpacing: "0.1em" }}>{dev?.tier ?? "—"}</span>
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <span style={{ fontSize: 8, opacity: 0.55, width: 40, textTransform: "uppercase", letterSpacing: "0.1em" }}>energy</span>
+        <MiniBar value={energy} color={col} />
+        <span style={{ fontSize: 9, color: col, width: 26, textAlign: "right" }}>{Math.round(energy * 100)}%</span>
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, opacity: 0.65 }}>
+        <span>{dev?.power_state === "battery" ? `battery ${bat?.percent ?? "?"}%` : "on AC"}</span>
+        <span>{typeof dev?.ram_available_gb === "number" ? `${dev.ram_available_gb} GB free` : ""}</span>
+      </div>
+    </div>
+  );
+}
+
+function GovernorPanel(p: {
+  mode: string; setMode: (m: string) => void; decision: GovDecision | null; rungs: Rung[];
+  metrics?: { distribution: Record<string, number>; avg_latency_s: number | null; decisions: number };
+}) {
+  const dec = p.decision;
+  const dist = p.metrics?.distribution ?? {};
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <PanelIntro text="Which AI model handled each request — and why JARVIS chose it." />
+      <div style={{ display: "flex", gap: 4 }}>
+        {["auto", "eco", "local", "cloud"].map(m => (
+          <button key={m} onClick={() => p.setMode(m)}
+            style={{ flex: 1, fontSize: 9, padding: "5px 0", textTransform: "uppercase", letterSpacing: "0.08em",
+              cursor: "pointer", borderRadius: 4, border: `1px solid ${C_AMBER}${p.mode === m ? "" : "33"}`,
+              background: p.mode === m ? `${C_AMBER}22` : "transparent",
+              color: p.mode === m ? C_AMBER : "inherit", opacity: p.mode === m ? 1 : 0.6 }}>
+            {MODE_LABEL[m]}
+          </button>
+        ))}
+      </div>
+      <p style={{ fontSize: 9, opacity: 0.5, marginTop: -4, lineHeight: 1.4 }}>
+        Auto = JARVIS decides · Eco = save battery · Local = private/offline · Cloud = best quality
+      </p>
+
+      {dec ? (
+        <div style={{ border: `1px solid ${C_AMBER}33`, padding: 10, display: "flex", flexDirection: "column", gap: 6 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontSize: 12.5, fontWeight: 600, color: C_AMBER }}>{dec.label}</span>
+            <span style={{ fontSize: 8.5, opacity: 0.55, textTransform: "uppercase" }}>{dec.kind}</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 8, opacity: 0.55, width: 52, textTransform: "uppercase" }}>difficulty</span>
+            <MiniBar value={dec.difficulty} color={dec.difficulty > 0.66 ? C_RED : dec.difficulty > 0.33 ? C_AMBER : C_GREEN} />
+            <span style={{ fontSize: 9, width: 26, textAlign: "right" }}>{Math.round(dec.difficulty * 100)}</span>
+          </div>
+          <p style={{ fontSize: 10, opacity: 0.75, lineHeight: 1.45 }}>{dec.rationale}</p>
+          {dec.factors && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+              {Object.entries(dec.factors).filter(([, v]) => v > 0).map(([k, v]) => (
+                <span key={k} style={{ fontSize: 8, padding: "1px 5px", borderRadius: 3, border: `1px solid ${C_AMBER}33`, opacity: 0.7 }}>
+                  {k} {v < 1 ? v.toFixed(2) : v}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : <EmptyPane text="Ask something — the routing decision appears here." />}
+
+      <div>
+        <p className="hud-section-divider" style={{ borderTop: "none", marginTop: 0 }}>escalation lattice</p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {[...p.rungs].sort((a, b) => a.tier - b.tier).map(r => {
+            const active = dec?.rung === r.id;
+            const used = dist[r.id] ?? 0;
+            return (
+              <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, padding: "5px 8px",
+                border: `1px solid ${active ? C_AMBER : "var(--c-line)"}`,
+                background: active ? `${C_AMBER}14` : "transparent",
+                opacity: r.available ? 1 : 0.4, boxShadow: active ? `0 0 12px ${C_AMBER}33` : "none" }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", flexShrink: 0,
+                  background: r.available ? C_GREEN : "var(--c-muted)" }} />
+                <span style={{ fontSize: 10, flex: 1 }}>{r.label}</span>
+                <div style={{ width: 34 }}><MiniBar value={r.quality} color={C_AMBER} /></div>
+                {used > 0 && <span style={{ fontSize: 8, color: C_AMBER, opacity: 0.7, width: 22, textAlign: "right" }}>{used}×</span>}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 9, opacity: 0.6,
+        borderTop: `1px solid ${C_AMBER}22`, paddingTop: 8 }}>
+        <span>{p.metrics?.decisions ?? 0} routed</span>
+        <span>avg {p.metrics?.avg_latency_s != null ? `${p.metrics.avg_latency_s}s` : "—"}</span>
+        <span>adapts per-machine</span>
+      </div>
+    </div>
+  );
+}
+
+function RigPanel(p: {
+  models: ModelsData | null; pulls: Record<string, { status: string; pct: number }>;
+  bench: Record<string, { tok?: number; status: string }>; onPull: (t: string) => void; onBench: (n: string) => void;
+}) {
+  const m = p.models;
+  if (!m) return <EmptyPane text="Profiling your rig…" />;
+  if (!m.ollama) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        <p style={{ fontSize: 11, opacity: 0.8, lineHeight: 1.5 }}>
+          Ollama isn't running. Local models power the Governor's on-device rungs — private, offline, and battery-aware.
+        </p>
+        <p style={{ fontSize: 10, opacity: 0.55 }}>Install from ollama.com, then run <code>ollama serve</code>.</p>
+      </div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+      <PanelIntro text="Local AI models on this PC. Benchmark them, or download better ones." />
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, opacity: 0.65 }}>
+        <span>Ollama {m.version ? `v${m.version}` : "online"}</span>
+        <span style={{ textTransform: "uppercase" }}>tier · {m.tier}</span>
+      </div>
+      <p className="hud-section-divider" style={{ borderTop: "none", marginTop: 0 }}>installed</p>
+      {(m.installed ?? []).map(mod => {
+        const b = p.bench[mod.name];
+        return (
+          <div key={mod.name} style={{ border: "1px solid var(--c-line)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 10, wordBreak: "break-all" }}>{mod.name}</span>
+              {mod.tools && <span style={{ fontSize: 7.5, color: C_GREEN, border: `1px solid ${C_GREEN}55`, padding: "0 4px", borderRadius: 3, textTransform: "uppercase", flexShrink: 0 }}>tools</span>}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 9, opacity: 0.6 }}>
+              <span>{mod.params ?? ""}{mod.gb ? ` · ${mod.gb}GB` : ""}</span>
+              <button onClick={() => p.onBench(mod.name)} style={benBtn}>
+                {b?.status === "running" ? "…" : b?.tok ? `${b.tok} tok/s` : "benchmark"}
+              </button>
+            </div>
+          </div>
+        );
+      })}
+      <p className="hud-section-divider">recommended · {m.tier}</p>
+      {(m.recommended ?? []).map(rec => {
+        const pull = p.pulls[rec.tag];
+        return (
+          <div key={rec.tag} style={{ border: "1px solid var(--c-line)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 10 }}>{rec.tag}</span>
+              {rec.installed ? <span style={{ fontSize: 8, color: C_GREEN, textTransform: "uppercase" }}>installed</span>
+                : pull ? <span style={{ fontSize: 8, color: C_AMBER }}>{pull.status === "success" || pull.pct >= 100 ? "done" : `${pull.pct}%`}</span>
+                : <button onClick={() => p.onPull(rec.tag)} style={benBtn}>pull</button>}
+            </div>
+            <span style={{ fontSize: 9, opacity: 0.55 }}>{rec.params} · {rec.gb}GB · {rec.note}</span>
+            {pull && pull.pct > 0 && pull.pct < 100 && <MiniBar value={pull.pct / 100} color={C_AMBER} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function MemoryPanel(p: { items: MemItem[]; onForget: (id: number) => void; onSleep: () => void; sleepMsg: string | null; count: number }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <PanelIntro text="Facts JARVIS has saved about you. It learns more as you talk." />
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span style={{ fontSize: 10, opacity: 0.65 }}>{p.count} durable memories</span>
+        <button onClick={p.onSleep} style={benBtn}>consolidate ⤓</button>
+      </div>
+      {p.sleepMsg && <p style={{ fontSize: 9.5, color: C_AMBER, opacity: 0.85 }}>● {p.sleepMsg}</p>}
+      {p.items.length === 0 ? <EmptyPane text="Nothing remembered yet." /> :
+        p.items.map(m => (
+          <div key={m.id} style={{ border: "1px solid var(--c-line)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 3 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span style={{ fontSize: 8, textTransform: "uppercase", letterSpacing: "0.1em", color: C_AMBER, opacity: 0.7 }}>{m.category}</span>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ display: "flex", gap: 1 }}>
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <span key={i} style={{ width: 4, height: 4, borderRadius: "50%", background: i < Math.round(m.importance / 2) ? C_AMBER : `${C_AMBER}33` }} />
+                  ))}
+                </span>
+                <button onClick={() => p.onForget(m.id)} title="Forget" style={{ background: "transparent", border: "none", cursor: "pointer", color: "var(--c-muted)", fontSize: 12, lineHeight: 1, padding: 0 }}>×</button>
+              </div>
+            </div>
+            <span style={{ fontSize: 10, lineHeight: 1.4 }}>{m.content}</span>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+function PanelIntro({ text }: { text: string }) {
+  return <p className="hud-panel-intro">{text}</p>;
+}
+
+function HelpRow({ label, text }: { label: string; text: string }) {
+  return (
+    <div className="hud-help-row">
+      <span className="hud-help-label">{label}</span>
+      <span className="hud-help-text">{text}</span>
+    </div>
+  );
+}
+
+function HelpModal({ open, onClose, onOpenSettings }: { open: boolean; onClose: () => void; onOpenSettings: () => void }) {
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div className="hud-modal-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={onClose}>
+          <motion.div className="hud-modal hud-modal--wide"
+            initial={{ opacity: 0, scale: 0.96, y: 8 }} animate={{ opacity: 1, scale: 1, y: 0 }} exit={{ opacity: 0, scale: 0.96, y: 8 }}
+            transition={{ duration: 0.2, ease: "easeOut" }} onClick={(e) => e.stopPropagation()}>
+            <div className="hud-modal-header">
+              <span>What is JARVIS?</span>
+              <IconBtn onClick={onClose} title="Close"><X className="w-3 h-3" /></IconBtn>
+            </div>
+            <div className="hud-modal-body">
+              <p className="hud-modal-intro" style={{ marginBottom: 10 }}>
+                JARVIS is your personal AI. <b>Talk to it (mic) or type</b> in the bar at the bottom —
+                ask questions, search the web, check your PC, remember things, or read the markets.
+              </p>
+              <p className="hud-modal-intro" style={{ marginBottom: 12 }}>
+                <b>It picks the best AI for each request.</b> Easy things run on a fast local model on
+                your PC; harder ones escalate to a stronger cloud model — automatically, factoring in
+                your battery and load. <b style={{ color: "var(--c-amber)" }}>Add a free Groq key</b> in
+                Settings for the full experience; without one it's local-only (and weaker).
+              </p>
+              <div className="hud-help-grid">
+                <HelpRow label="Brain" text="Which AI model handled each request, and why." />
+                <HelpRow label="Models" text="Local AI models on this PC — benchmark or download." />
+                <HelpRow label="Memory" text="Facts JARVIS has saved about you." />
+                <HelpRow label="Markets" text="Smart-money read on Indian indices. Analysis only." />
+                <HelpRow label="Tasks" text="Things you've asked JARVIS to track." />
+                <HelpRow label="Activity" text="Tools JARVIS just used, step by step." />
+              </div>
+            </div>
+            <div className="hud-modal-footer">
+              <button className="hud-modal-btn hud-modal-btn--ghost" onClick={() => { onClose(); onOpenSettings(); }}>Open Settings</button>
+              <button className="hud-modal-btn hud-modal-btn--primary" onClick={onClose}>Got it</button>
+            </div>
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 

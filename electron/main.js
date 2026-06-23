@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import isDev from "electron-is-dev";
 
-const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell } = electron;
+const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage } = electron;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uiRoot  = path.resolve(__dirname, "..");
@@ -13,14 +13,79 @@ const appRoot = uiRoot; // api.py lives in the repo root
 const backendUrl = process.env.JARVIS_BACKEND_URL ?? "http://127.0.0.1:8000";
 const devUiUrl = process.env.JARVIS_DEV_UI_URL ?? "http://127.0.0.1:8080";
 
+// c0mr4des trading terminal — a separate app JARVIS launches in its own window.
+const tradingRoot = process.env.C0MR4DES_DIR ?? path.resolve(appRoot, "..", "c0mr4des_terminal");
+const tradingApiPort = 8100;          // its backend (kept off JARVIS's :8000)
+const tradingUiPort = 5173;           // its Vite frontend
+const tradingUiUrl = `http://127.0.0.1:${tradingUiPort}`;
+
 let mainWindow;
 let tray;
 let pythonProcess;
 let ownsBackend = false;
+let tradingWindow;
+let tradingProcs = [];
 
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
+
+// ── Secure API-key storage ──────────────────────────────────────────────────
+// Keys are encrypted with the OS keychain (DPAPI on Windows, Keychain on macOS,
+// libsecret on Linux) via Electron safeStorage — never written in plaintext and
+// never handed back to the renderer. The decrypted values are injected into the
+// Python backend's environment when it spawns.
+const KEY_IDS = ["GROQ_API_KEY", "ANTHROPIC_API_KEY"];
+const keysFilePath = () => path.join(app.getPath("userData"), "jarvis-keys.json");
+
+function loadDecryptedKeys() {
+  try {
+    const enc = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
+    if (!safeStorage.isEncryptionAvailable()) return {};
+    const out = {};
+    for (const id of KEY_IDS) {
+      if (!enc[id]) continue;
+      try {
+        out[id] = safeStorage.decryptString(Buffer.from(enc[id], "base64"));
+      } catch {
+        /* corrupt / different machine — skip */
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveEncryptedKeys(keys) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("OS secure storage is unavailable on this machine.");
+  }
+  let store = {};
+  try {
+    store = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
+  } catch {
+    /* first write */
+  }
+  for (const id of KEY_IDS) {
+    if (!(id in keys)) continue; // omitted field → leave unchanged
+    const val = String(keys[id] ?? "").trim();
+    if (val) store[id] = safeStorage.encryptString(val).toString("base64");
+    else delete store[id]; // empty string → clear it
+  }
+  fs.writeFileSync(keysFilePath(), JSON.stringify(store), { mode: 0o600 });
+}
+
+function apiKeyStatus() {
+  let secure = false;
+  try {
+    secure = safeStorage.isEncryptionAvailable();
+  } catch {
+    /* not ready yet */
+  }
+  const keys = loadDecryptedKeys();
+  return { secure, groq: Boolean(keys.GROQ_API_KEY), anthropic: Boolean(keys.ANTHROPIC_API_KEY) };
+}
 
 function resolvePythonPath() {
   const isWindows = process.platform === "win32";
@@ -83,10 +148,12 @@ async function startPythonBackend() {
   }
 
   console.log(`[Electron] Starting Python backend: ${pythonPath} ${pythonArgs.join(" ")}`);
+  const apiKeys = loadDecryptedKeys();
   pythonProcess = spawn(pythonPath, pythonArgs, {
     cwd: appRoot,
     env: {
       ...process.env,
+      ...apiKeys,
       PYTHONUNBUFFERED: "1",
       JARVIS_DESKTOP: "1",
     },
@@ -233,6 +300,88 @@ function stopPythonBackend() {
   ownsBackend = false;
 }
 
+// ── Trading terminal (c0mr4des) — launched in its own window ──────────────────
+async function isUrlReady(url) {
+  try { const r = await fetch(url); return r.ok || r.status < 500; } catch { return false; }
+}
+
+function spawnAndLog(cmd, args, opts, tag) {
+  const p = spawn(cmd, args, opts);
+  p.stdout?.on("data", (d) => console.log(`[${tag}] ${d.toString().trim()}`));
+  p.stderr?.on("data", (d) => console.error(`[${tag}] ${d.toString().trim()}`));
+  tradingProcs.push(p);
+  return p;
+}
+
+const LOADING_HTML = (msg, color = "#f59e0b") =>
+  "data:text/html," + encodeURIComponent(
+    `<body style="background:#0a0705;color:${color};font-family:ui-monospace,monospace;display:flex;` +
+    `align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">` +
+    `<div><div style="font-size:18px">${msg}</div>` +
+    `<div style="opacity:.55;margin-top:10px;font-size:12px">c0mr4des terminal · backend :${tradingApiPort} · ui :${tradingUiPort}</div></div></body>`);
+
+async function openTradingTerminal() {
+  if (tradingWindow && !tradingWindow.isDestroyed()) {
+    tradingWindow.show();
+    tradingWindow.focus();
+    return { ok: true };
+  }
+  if (!fs.existsSync(tradingRoot)) {
+    return { ok: false, error: `c0mr4des_terminal not found at ${tradingRoot}` };
+  }
+
+  tradingWindow = new BrowserWindow({
+    width: 1500, height: 920, backgroundColor: "#0a0705",
+    title: "JARVIS · Trading Terminal", autoHideMenuBar: true,
+    webPreferences: { nodeIntegration: false, contextIsolation: true },
+  });
+  tradingWindow.on("closed", () => { tradingWindow = undefined; });
+  tradingWindow.loadURL(LOADING_HTML("⟳ Spinning up the trading terminal…"));
+
+  if (await isUrlReady(tradingUiUrl)) { tradingWindow.loadURL(tradingUiUrl); return { ok: true }; }
+
+  const isWin = process.platform === "win32";
+  const venvPy = path.join(tradingRoot, ".venv", "Scripts", isWin ? "python.exe" : "python");
+  const py = fs.existsSync(venvPy) ? venvPy : (isWin ? "py" : "python3");
+  const env = { ...process.env, PYTHONUNBUFFERED: "1", C0MR4DES_API: `http://127.0.0.1:${tradingApiPort}` };
+  const npm = isWin ? "npm.cmd" : "npm";
+
+  spawnAndLog(py, ["-m", "uvicorn", "backend.main:app", "--port", String(tradingApiPort)],
+    { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }, "Trading-BE");
+
+  // First run: install frontend deps before starting Vite.
+  if (!fs.existsSync(path.join(tradingRoot, "node_modules"))) {
+    tradingWindow.loadURL(LOADING_HTML("⟳ Installing trading UI deps (first run, ~1–2 min)…"));
+    await new Promise((resolve) => {
+      const inst = spawnAndLog(npm, ["install"], { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: isWin }, "Trading-npm");
+      inst.on("exit", resolve);
+      inst.on("error", resolve);
+    });
+    if (tradingWindow?.isDestroyed()) return { ok: true };
+    tradingWindow?.loadURL(LOADING_HTML("⟳ Starting the trading terminal…"));
+  }
+
+  spawnAndLog(npm, ["run", "dev"], { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: isWin }, "Trading-FE");
+
+  const deadline = Date.now() + 180000;
+  while (Date.now() < deadline) {
+    if (!tradingWindow || tradingWindow.isDestroyed()) return { ok: true };
+    if (await isUrlReady(tradingUiUrl)) { tradingWindow.loadURL(tradingUiUrl); return { ok: true }; }
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+  if (tradingWindow && !tradingWindow.isDestroyed()) {
+    tradingWindow.loadURL(LOADING_HTML("Trading terminal didn't start in time — check deps + console.", "#ff6b6b"));
+  }
+  return { ok: false, error: "timeout" };
+}
+
+function stopTrading() {
+  tradingProcs.forEach((p) => { try { p.kill(); } catch (_) {} });
+  tradingProcs = [];
+}
+
+ipcMain.handle("open-trading", openTradingTerminal);
+
 ipcMain.on("window-hide", () => mainWindow?.hide());
 ipcMain.on("window-minimize", () => mainWindow?.minimize());
 ipcMain.on("window-toggle-maximize", () => {
@@ -243,6 +392,18 @@ ipcMain.on("window-close", () => {
   if (mainWindow) mainWindow.hide();
 });
 ipcMain.handle("backend-restart", restartBackend);
+
+ipcMain.handle("keys:status", () => apiKeyStatus());
+ipcMain.handle("keys:set", async (_event, keys) => {
+  saveEncryptedKeys(keys || {});
+  // Restart the Python backend so it picks up the new keys from its environment.
+  stopPythonBackend();
+  await startPythonBackend();
+  return apiKeyStatus();
+});
+ipcMain.on("open-external", (_event, url) => {
+  if (typeof url === "string" && /^https:\/\//i.test(url)) shell.openExternal(url);
+});
 
 app.whenReady().then(async () => {
   createWindow();
@@ -271,7 +432,7 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", stopPythonBackend);
+app.on("before-quit", () => { stopPythonBackend(); stopTrading(); });
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
