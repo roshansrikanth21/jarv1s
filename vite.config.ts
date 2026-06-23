@@ -11,8 +11,12 @@ import { defineConfig } from "@lovable.dev/vite-tanstack-config";
 export default defineConfig({
   tanstackStart: {
     server: { entry: "server" },
+    // Desktop is a local SPA — emit a static index.html the backend can serve
+    // (Electron loads http://127.0.0.1:8000); SSR is pointless inside Electron.
+    spa: { enabled: true, prerender: { outputPath: "/index.html", crawlLinks: false } },
   },
   vite: {
+    base: "./",
     server: {
       proxy: {
         "/api": {
