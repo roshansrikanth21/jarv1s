@@ -68,6 +68,7 @@ type AgentStatus = {
   trace?: AgentTrace[];
 };
 type CouncilState = { active: boolean; panel: string[]; proposals: { model: string; text: string }[]; verdict: string };
+type TradePlan = { side: string; entry?: number; sl?: number; tp?: number; rr?: number; text: string };
 type IctRead = {
   ok: boolean; error?: string;
   symbol?: string; tv?: string; interval?: string; last?: number;
@@ -75,6 +76,8 @@ type IctRead = {
   bos?: string; sweep?: string; order_block?: string; read?: string;
   fvgs?: { dir: string; lo: number; hi: number }[];
   buyside?: number[]; sellside?: number[];
+  htf_bias?: "bullish" | "bearish" | "neutral"; confluence?: string;
+  plan?: TradePlan; session?: { open: boolean; note: string; ist: string };
 };
 
 // "openai/gpt-oss-120b" -> "gpt-oss-120b"
@@ -1033,6 +1036,20 @@ function MarketsPanel(p: {
               textTransform: "uppercase", color: biasColor }}>{d.bias}</span>
           </div>
           <p style={{ fontSize: 10.5, opacity: 0.7, lineHeight: 1.4 }}>{d.structure}</p>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 9.5, opacity: 0.75 }}>
+              Daily: <span style={{ color: d.htf_bias === "bullish" ? GREEN : d.htf_bias === "bearish" ? RED : AMBER }}>{d.htf_bias}</span>
+            </span>
+            {d.confluence && (
+              <Tag color={d.confluence === "aligned" ? GREEN : d.confluence === "conflicting" ? RED : AMBER}
+                   label={d.confluence === "aligned" ? "✓ HTF aligned" : d.confluence === "conflicting" ? "⚠ HTF conflict" : "HTF neutral"} />
+            )}
+          </div>
+          {d.session && (
+            <p style={{ fontSize: 9.5, opacity: 0.6 }}>
+              <span style={{ color: d.session.open ? GREEN : AMBER }}>●</span> Market {d.session.note} · {d.session.ist}
+            </p>
+          )}
           {d.bos && <Tag color={biasColor} label={d.bos} />}
           {d.sweep && <Tag color={AMBER} label={"sweep: " + d.sweep} />}
           {d.order_block && <Tag color={biasColor} label={d.order_block} />}
@@ -1049,6 +1066,25 @@ function MarketsPanel(p: {
           )}
           <p style={{ fontSize: 10.5, opacity: 0.85, lineHeight: 1.45,
             borderTop: `1px solid ${AMBER}22`, paddingTop: 6 }}>{d.read}</p>
+          {d.plan && d.plan.side !== "wait" && (
+            <div style={{ border: `1px solid ${biasColor}55`, background: `${biasColor}12`,
+              borderRadius: 6, padding: "6px 8px", display: "flex", flexDirection: "column", gap: 3 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: "0.08em",
+                  textTransform: "uppercase", color: biasColor }}>{d.plan.side} idea</span>
+                <span style={{ fontSize: 9.5, opacity: 0.8 }}>R:R {d.plan.rr}</span>
+              </div>
+              <div style={{ display: "flex", gap: 10, fontSize: 10 }}>
+                <span>entry <b>{d.plan.entry}</b></span>
+                <span style={{ color: RED }}>SL {d.plan.sl}</span>
+                <span style={{ color: GREEN }}>TP {d.plan.tp}</span>
+              </div>
+              <span style={{ fontSize: 8.5, opacity: 0.5 }}>Draft levels — you place the trade.</span>
+            </div>
+          )}
+          {d.plan && d.plan.side === "wait" && (
+            <p style={{ fontSize: 10, opacity: 0.6, fontStyle: "italic" }}>{d.plan.text}</p>
+          )}
           <button onClick={() => p.onDeliberate(`${d.symbol} ${d.bias}, ${d.read}. Should I take it?`)}
             style={{ ...chip(false), alignSelf: "flex-start", padding: "4px 8px" }}>
             Ask the council ⚖
