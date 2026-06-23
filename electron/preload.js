@@ -12,4 +12,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.on("window-maximized", handler);
     return () => ipcRenderer.removeListener("window-maximized", handler);
   },
+  // Secure API-key management (values never come back — only set/secure flags).
+  getApiKeyStatus: () => ipcRenderer.invoke("keys:status"),
+  setApiKeys: (keys) => ipcRenderer.invoke("keys:set", keys),
+  openExternal: (url) => ipcRenderer.send("open-external", url),
 });

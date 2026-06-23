@@ -5,7 +5,7 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import isDev from "electron-is-dev";
 
-const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell } = electron;
+const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage } = electron;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uiRoot  = path.resolve(__dirname, "..");
@@ -29,6 +29,63 @@ let tradingProcs = [];
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
+
+// ── Secure API-key storage ──────────────────────────────────────────────────
+// Keys are encrypted with the OS keychain (DPAPI on Windows, Keychain on macOS,
+// libsecret on Linux) via Electron safeStorage — never written in plaintext and
+// never handed back to the renderer. The decrypted values are injected into the
+// Python backend's environment when it spawns.
+const KEY_IDS = ["GROQ_API_KEY", "ANTHROPIC_API_KEY"];
+const keysFilePath = () => path.join(app.getPath("userData"), "jarvis-keys.json");
+
+function loadDecryptedKeys() {
+  try {
+    const enc = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
+    if (!safeStorage.isEncryptionAvailable()) return {};
+    const out = {};
+    for (const id of KEY_IDS) {
+      if (!enc[id]) continue;
+      try {
+        out[id] = safeStorage.decryptString(Buffer.from(enc[id], "base64"));
+      } catch {
+        /* corrupt / different machine — skip */
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function saveEncryptedKeys(keys) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error("OS secure storage is unavailable on this machine.");
+  }
+  let store = {};
+  try {
+    store = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
+  } catch {
+    /* first write */
+  }
+  for (const id of KEY_IDS) {
+    if (!(id in keys)) continue; // omitted field → leave unchanged
+    const val = String(keys[id] ?? "").trim();
+    if (val) store[id] = safeStorage.encryptString(val).toString("base64");
+    else delete store[id]; // empty string → clear it
+  }
+  fs.writeFileSync(keysFilePath(), JSON.stringify(store), { mode: 0o600 });
+}
+
+function apiKeyStatus() {
+  let secure = false;
+  try {
+    secure = safeStorage.isEncryptionAvailable();
+  } catch {
+    /* not ready yet */
+  }
+  const keys = loadDecryptedKeys();
+  return { secure, groq: Boolean(keys.GROQ_API_KEY), anthropic: Boolean(keys.ANTHROPIC_API_KEY) };
+}
 
 function resolvePythonPath() {
   const isWindows = process.platform === "win32";
@@ -91,10 +148,12 @@ async function startPythonBackend() {
   }
 
   console.log(`[Electron] Starting Python backend: ${pythonPath} ${pythonArgs.join(" ")}`);
+  const apiKeys = loadDecryptedKeys();
   pythonProcess = spawn(pythonPath, pythonArgs, {
     cwd: appRoot,
     env: {
       ...process.env,
+      ...apiKeys,
       PYTHONUNBUFFERED: "1",
       JARVIS_DESKTOP: "1",
     },
@@ -334,6 +393,18 @@ ipcMain.on("window-close", () => {
 });
 ipcMain.handle("backend-restart", restartBackend);
 
+ipcMain.handle("keys:status", () => apiKeyStatus());
+ipcMain.handle("keys:set", async (_event, keys) => {
+  saveEncryptedKeys(keys || {});
+  // Restart the Python backend so it picks up the new keys from its environment.
+  stopPythonBackend();
+  await startPythonBackend();
+  return apiKeyStatus();
+});
+ipcMain.on("open-external", (_event, url) => {
+  if (typeof url === "string" && /^https:\/\//i.test(url)) shell.openExternal(url);
+});
+
 app.whenReady().then(async () => {
   createWindow();
   createTray();
@@ -361,7 +432,7 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", stopPythonBackend);
+app.on("before-quit", () => { stopPythonBackend(); stopTrading(); });
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();
