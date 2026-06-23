@@ -616,6 +616,73 @@ def _tv_symbol(ysym: str, name: str) -> str:
     return f"NSE:{name}"
 
 
+def _market_session() -> dict:
+    """NSE/BSE session status in IST (09:15–15:30, Mon–Fri)."""
+    from datetime import timezone, timedelta
+    ist = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    mins = ist.hour * 60 + ist.minute
+    open_m, close_m = 9 * 60 + 15, 15 * 60 + 30
+    weekday = ist.weekday() < 5
+    if weekday and open_m <= mins <= close_m:
+        state = "open"
+        if mins <= open_m + 60:
+            state = "open (opening hour — prime killzone)"
+        note = f"{state}; {close_m - mins} min to close"
+    elif weekday and mins < open_m:
+        note = f"pre-market; opens in {open_m - mins} min"
+    else:
+        note = "closed"
+    return {"open": weekday and open_m <= mins <= close_m, "note": note,
+            "ist": ist.strftime("%a %H:%M IST")}
+
+
+def _quick_bias(ysym: str, interval: str, period: str) -> str:
+    """Lightweight higher-timeframe bias (structure only) for confluence."""
+    try:
+        import yfinance as yf
+        import pandas as pd
+        df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or len(df) < 25:
+            return "neutral"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        h, l = df["High"].to_numpy(), df["Low"].to_numpy()
+        n, w = len(df), 2
+        sh = [i for i in range(w, n - w) if h[i] == max(h[i - w:i + w + 1])]
+        sl = [i for i in range(w, n - w) if l[i] == min(l[i - w:i + w + 1])]
+        if len(sh) >= 2 and len(sl) >= 2:
+            if h[sh[-1]] > h[sh[-2]] and l[sl[-1]] > l[sl[-2]]:
+                return "bullish"
+            if h[sh[-1]] < h[sh[-2]] and l[sl[-1]] < l[sl[-2]]:
+                return "bearish"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
+def _trade_plan(bias: str, last: float, fvgs: list, last_sl: float, last_sh: float,
+                buyside: list, sellside: list) -> dict:
+    """Draft an entry/SL/TP from the structure. Analysis only — user places it."""
+    if bias == "bullish":
+        zone = next((f for f in reversed(fvgs) if f["dir"] == "bullish" and f["hi"] < last), None)
+        entry = round((zone["lo"] + zone["hi"]) / 2, 1) if zone else round(last_sl, 1)
+        sl = round(last_sl * 0.998, 1)
+        tp = round(buyside[0], 1) if buyside else round(last_sh, 1)
+    elif bias == "bearish":
+        zone = next((f for f in reversed(fvgs) if f["dir"] == "bearish" and f["lo"] > last), None)
+        entry = round((zone["lo"] + zone["hi"]) / 2, 1) if zone else round(last_sh, 1)
+        sl = round(last_sh * 1.002, 1)
+        tp = round(sellside[0], 1) if sellside else round(last_sl, 1)
+    else:
+        return {"side": "wait", "text": "No setup — stand aside until structure or a sweep prints."}
+    risk, reward = abs(entry - sl), abs(tp - entry)
+    rr = round(reward / risk, 2) if risk else 0
+    return {"side": "long" if bias == "bullish" else "short",
+            "entry": entry, "sl": sl, "tp": tp, "rr": rr,
+            "text": f"{'Long' if bias == 'bullish' else 'Short'} idea — entry {entry}, stop {sl}, target {tp} (R:R {rr})."}
+
+
 def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     """Structured ICT read. Returns a dict (ok/error + signals) used by both the
     voice tool and the Markets panel / watcher."""
@@ -708,11 +775,21 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     else:
         read = "No clean directional edge — wait for a liquidity sweep or a break of structure before committing."
 
+    # Higher-timeframe confluence: intraday TFs read the daily; daily reads weekly.
+    htf_interval, htf_period = ("1d", "6mo") if interval != "1d" else ("1wk", "2y")
+    htf_bias = _quick_bias(ysym, htf_interval, htf_period)
+    confluence = "aligned" if htf_bias == bias and bias != "neutral" else (
+        "conflicting" if bias != "neutral" and htf_bias != "neutral" and htf_bias != bias else "neutral")
+
+    plan = _trade_plan(bias, last, recent_fvgs, last_sl, last_sh, buyside, sellside)
+    session = _market_session()
+
     return {
         "ok": True, "symbol": name, "yahoo": ysym, "tv": _tv_symbol(ysym, name),
         "interval": interval, "last": round(last, 1), "bias": bias, "structure": structure,
         "bos": bos, "sweep": sweep, "fvgs": recent_fvgs, "order_block": ob,
         "buyside": buyside, "sellside": sellside, "read": read,
+        "htf_bias": htf_bias, "confluence": confluence, "plan": plan, "session": session,
     }
 
 
@@ -721,8 +798,8 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     a = _ict_analyze(symbol, interval)
     if not a.get("ok"):
         return a.get("error", "Scan failed.")
-    out = [f"{a['symbol']} on the {a['interval']}: last {a['last']}.",
-           f"Structure: {a['structure']}; bias {a['bias']}."]
+    out = [f"{a['symbol']} on the {a['interval']}: last {a['last']}. Market {a['session']['note']}.",
+           f"Structure: {a['structure']}; {a['interval']} bias {a['bias']}, daily bias {a['htf_bias']} ({a['confluence']})."]
     if a["bos"]:
         out.append(a["bos"].capitalize() + ".")
     if a["sweep"]:
@@ -736,6 +813,7 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     if a["sellside"]:
         out.append("Sell-side liquidity: " + ", ".join(f"{x:.1f}" for x in a["sellside"]) + ".")
     out.append(a["read"])
+    out.append(a["plan"]["text"])
     out.append("Analysis only — not advice, and I won't place trades.")
     return " ".join(out)
 
