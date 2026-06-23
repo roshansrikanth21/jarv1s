@@ -11,6 +11,7 @@ import {
   Database,
   Eye,
   Lock,
+  LineChart,
   Maximize2,
   Mic,
   MicOff,
@@ -90,6 +91,7 @@ declare global {
       toggleMaximize?: () => void;
       closeWindow?: () => void;
       restartBackend?: () => Promise<void>;
+      openTrading?: () => Promise<{ ok: boolean; error?: string }>;
       onMaximizeChange?: (cb: (isMax: boolean) => void) => (() => void) | void;
     };
   }
@@ -300,6 +302,10 @@ function CommandDeck() {
           setCouncil(c => ({ ...c, active: false, verdict: txt }));
         }
         if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
+        if (d.type === "open_trading") {
+          addLineRef.current("system", "Opening trading terminal…");
+          window?.electronAPI?.openTrading?.();
+        }
         if (d.type === "watch_state") setWatching(Boolean(d.watching));
         if (d.type === "ict_alert") {
           const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -470,6 +476,7 @@ function CommandDeck() {
           <StatusPill tone={connTone} label={connLabel} />
           <IconBtn onClick={refreshStatus} title="Refresh"><Activity className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => window?.electronAPI?.restartBackend?.()} title="Restart backend"><Zap className="w-3.5 h-3.5" /></IconBtn>
+          <IconBtn onClick={() => window?.electronAPI?.openTrading?.()} title="Open trading terminal"><LineChart className="w-3.5 h-3.5" /></IconBtn>
           <div className="hud-sep" />
           <IconBtn onClick={() => window?.electronAPI?.minimizeWindow?.()} title="Minimize"><Minus className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => window?.electronAPI?.toggleMaximize?.()} title={maximized ? "Restore" : "Maximize"}>

@@ -397,6 +397,18 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_trading",
+            "description": (
+                "Open the full c0mr4des trading terminal in its own window — the dedicated "
+                "trading workspace with live charts, options pricing, backtesting, and broker "
+                "tools. Use when the user wants to trade or open the trading terminal/dashboard."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -579,6 +591,10 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
     if name == "ict_scan":
         return _ict_scan(args.get("symbol", "nifty"), args.get("interval", "15m"))
+
+    if name == "open_trading":
+        broadcast_from_thread({"type": "open_trading"})
+        return "Opening the trading terminal in its own window."
 
     return f"Unknown tool: {name}"
 
