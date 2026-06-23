@@ -4,17 +4,19 @@ interface Props {
   active?: boolean;
   speaking?: boolean;
   size?: "sm" | "md";
+  energy?: number;   // 0..1 homeostatic energy — dims the reactor when the body is low
 }
 
 const AMBER = "oklch(0.68 0.22 38)";
 const AMBER_DIM = "oklch(0.52 0.16 38)";
 
-export function ArcReactor({ active = false, speaking = false, size = "md" }: Props) {
+export function ArcReactor({ active = false, speaking = false, size = "md", energy = 1 }: Props) {
   const px   = size === "sm" ? 128 : 192;
   const core = size === "sm" ?  56 :  80;
 
   return (
-    <div style={{ position: "relative", width: px, height: px, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+    <div style={{ position: "relative", width: px, height: px, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0,
+                  opacity: 0.6 + 0.4 * Math.max(0, Math.min(1, energy)), transition: "opacity 1.2s ease" }}>
 
       {/* Ambient glow */}
       <motion.div

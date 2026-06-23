@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 JARVIS Backend
-Primary brain: Claude (Anthropic API) — set ANTHROPIC_API_KEY in .env or env.
-Fallback brain: Ollama (local) — used when no API key is present.
+Brain priority: Groq (free, fast) → Claude (Anthropic) → Ollama (local fallback).
+Whichever is configured wins, in that order — see _active_brain(), the seam the
+future "Governor" (a resource/difficulty-aware policy) will replace.
 Run: python api.py
 """
 
@@ -18,6 +19,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,8 +31,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-BASE_DIR    = Path(__file__).parent
-MEMORY_FILE = BASE_DIR / "memory" / "jarvis_memory.json"
+import consolidation
+import device
+import governor
+import models_advisor
+
+BASE_DIR     = Path(__file__).parent
+MEMORY_FILE   = BASE_DIR / "memory" / "jarvis_memory.json"
+HISTORY_FILE  = BASE_DIR / "memory" / "jarvis_history.json"
+TASKS_FILE    = BASE_DIR / "memory" / "jarvis_tasks.json"
+SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
+GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
 MEMORY_FILE.parent.mkdir(exist_ok=True)
 
 # Load .env from repo root if present
@@ -136,7 +147,33 @@ def _active_model() -> str:
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
-app = FastAPI(title="JARVIS Backend", docs_url=None, redoc_url=None)
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _main_loop, _sleep_task, _last_device
+    _main_loop = asyncio.get_event_loop()
+    await asyncio.to_thread(_detect_local_models)
+    try:
+        _last_device = await asyncio.to_thread(device.profile)
+    except Exception:
+        _last_device = {}
+    brain = "Groq" if (USE_GROQ and _HAS_GROQ) else "Claude" if (USE_CLAUDE and _HAS_ANTHROPIC) else "Ollama"
+    print(f"[JARVIS] Online — cloud: {_active_model()} ({brain}) | local: {LOCAL_FAST if _LOCAL_OK else 'off'}")
+    print(f"[JARVIS] Governor rungs: {sorted(_available_rungs())} | tier: {(_last_device or {}).get('tier')}")
+    print(f"[JARVIS] Memory: {len(memories)} | Tasks: {len(task_list)} | Tools: {len(TOOLS)}")
+    _sleep_task = asyncio.create_task(_sleep_loop())
+    # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
+    spa_dir = BASE_DIR / "dist" / "client"
+    if (spa_dir / "index.html").exists():
+        app.mount("/", StaticFiles(directory=str(spa_dir), html=True), name="ui")
+        print(f"[JARVIS] Serving UI from {spa_dir}")
+    else:
+        print("[JARVIS] Dev mode — UI served by Vite on :8080")
+    yield
+    if _sleep_task:
+        _sleep_task.cancel()
+
+
+app = FastAPI(title="JARVIS Backend", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -162,25 +199,70 @@ _tts_voice = TTS_VOICE        # runtime-selectable voice (changed via set_voice)
 _watch_task = None            # background ICT watcher task
 _watching = False
 _watch_state: dict = {}       # symbol -> last {bos, sweep, bias} signature
+_filler_sent = False          # slow-tool spoken-filler gate (reset each command)
+_ict_cache: dict = {}         # (symbol, interval) -> (epoch, result) short-TTL cache
+_last_device: dict = {}       # most-recent device profile (drives homeostasis)
+_last_activity = time.time()  # for the idle "sleep" trigger
+_last_consolidated_len = 0    # _history length at last consolidation
+_last_decision: dict | None = None   # last Governor decision (for escalation signal)
+_sleep_task = None            # background consolidation ("sleep") loop
+_sleeping = False
+_LOCAL_OK = False             # Ollama up + a tool-capable local model installed
+LOCAL_FAST = OLLAMA_MODEL     # smallest tool-capable local model (Governor local·fast)
+LOCAL_DEEP = OLLAMA_MODEL     # largest  tool-capable local model (Governor local·deep)
+IDLE_SLEEP_MIN = int(os.environ.get("JARVIS_SLEEP_IDLE_MIN", "3"))
 
 
-# ── Memory ─────────────────────────────────────────────────────────────────────
-def _load_memory() -> list[dict]:
-    if MEMORY_FILE.exists():
+# ── Memory + persistence ────────────────────────────────────────────────────────
+def _load_json(path: Path, default):
+    if path.exists():
         try:
-            return json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            return []
-    return []
+            return default
+    return default
+
+
+def _save_json(path: Path, data) -> None:
+    try:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_memory() -> list[dict]:
+    return _load_json(MEMORY_FILE, [])
 
 
 def _save_memory(mems: list[dict]) -> None:
-    MEMORY_FILE.write_text(
-        json.dumps(mems, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+    _save_json(MEMORY_FILE, mems)
 
 
-memories = _load_memory()
+def _save_history() -> None:
+    _save_json(HISTORY_FILE, _history)
+
+
+def _save_tasks() -> None:
+    _save_json(TASKS_FILE, task_list)
+
+
+def _save_settings() -> None:
+    _save_json(SETTINGS_FILE, _settings)
+
+
+def _user_name() -> str:
+    """Operator's name — runtime-settable via onboarding/settings, with a JARVIS_USER
+    env override, else empty (the UI prompts for it on first run). Never hardcoded."""
+    return (_settings.get("user_name") or os.environ.get("JARVIS_USER") or "").strip()
+
+
+memories  = _load_memory()
+task_list = _load_json(TASKS_FILE, [])
+_history  = _load_json(HISTORY_FILE, [])
+_settings = _load_json(SETTINGS_FILE, {})
+_gov = governor.GovernorState(_load_json(GOVERNOR_FILE, {}))
+if _settings.get("voice") in {v["id"] for v in VOICE_OPTIONS}:
+    _tts_voice = _settings["voice"]
 
 
 # ── WebSocket broadcast ────────────────────────────────────────────────────────
@@ -204,9 +286,28 @@ def broadcast_from_thread(data: dict) -> None:
 
 
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
+# A browser on ANY website can open a WebSocket to localhost, and our agent can run
+# shell commands — so only accept connections whose Origin is a local app (the
+# Electron shell or the Vite dev server). Set JARVIS_WS_ALLOW_ALL=1 to bypass.
+WS_ALLOW_ALL = os.environ.get("JARVIS_WS_ALLOW_ALL", "0") == "1"
+
+
+def _origin_allowed(origin: str | None) -> bool:
+    if WS_ALLOW_ALL or not origin:    # no Origin = native client, not a browser
+        return True
+    try:
+        host = urllib.parse.urlparse(origin).hostname or ""
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
     global _tts_playing, _speaking_text, _tts_voice
+    if not _origin_allowed(websocket.headers.get("origin")):
+        await websocket.close(code=1008)   # policy violation
+        return
     await websocket.accept()
     active_connections.append(websocket)
     await websocket.send_json({
@@ -238,8 +339,31 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 vid = data.get("voice", "")
                 if vid in {v["id"] for v in VOICE_OPTIONS}:
                     _tts_voice = vid
+                    _settings["voice"] = vid
+                    _save_settings()
                     await broadcast({"type": "voice_changed", "voice": vid})
                     asyncio.create_task(_speak("Voice updated. This is how I sound now."))
+            elif action == "set_name":
+                nm = (data.get("name") or "").strip()[:40]
+                if nm:
+                    _settings["user_name"] = nm
+                    _save_settings()
+                    await broadcast({"type": "name_changed", "name": nm})
+                    asyncio.create_task(_speak(f"Noted. I'll call you {nm}."))
+            elif action == "set_mode":
+                mode = (data.get("mode") or "").strip()
+                if mode in governor.MODES:
+                    _gov.mode = mode
+                    _save_json(GOVERNOR_FILE, _gov.to_dict())
+                    await broadcast({"type": "governor_mode", "mode": mode})
+            elif action == "pull_model":
+                asyncio.create_task(_pull_model((data.get("model") or "").strip()))
+            elif action == "benchmark_model":
+                asyncio.create_task(_benchmark_model((data.get("model") or "").strip()))
+            elif action == "trigger_sleep":
+                asyncio.create_task(_run_sleep_cycle())
+            elif action == "forget_memory":
+                _forget_memory(data.get("id"))
             elif action == "start_watch":
                 asyncio.create_task(_start_watch())
             elif action == "stop_watch":
@@ -397,6 +521,18 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_trading",
+            "description": (
+                "Open the full c0mr4des trading terminal in its own window — the dedicated "
+                "trading workspace with live charts, options pricing, backtesting, and broker "
+                "tools. Use when the user wants to trade or open the trading terminal/dashboard."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -496,6 +632,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             "at": datetime.now().strftime("%H:%M"),
         }
         task_list.append(task)
+        _save_tasks()
         broadcast_from_thread({"type": "tasks", "tasks": task_list})
         return f"Task added: {args['task']}"
 
@@ -505,6 +642,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             if t["id"] == tid:
                 t["status"] = "done"
                 t["at"] = datetime.now().strftime("%H:%M")
+                _save_tasks()
                 broadcast_from_thread({"type": "tasks", "tasks": task_list})
                 return f"Task {tid} marked complete."
         return f"Task {tid} not found."
@@ -580,6 +718,10 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "ict_scan":
         return _ict_scan(args.get("symbol", "nifty"), args.get("interval", "15m"))
 
+    if name == "open_trading":
+        broadcast_from_thread({"type": "open_trading"})
+        return "Opening the trading terminal in its own window."
+
     return f"Unknown tool: {name}"
 
 
@@ -616,9 +758,80 @@ def _tv_symbol(ysym: str, name: str) -> str:
     return f"NSE:{name}"
 
 
+def _market_session() -> dict:
+    """NSE/BSE session status in IST (09:15–15:30, Mon–Fri)."""
+    from datetime import timezone, timedelta
+    ist = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5, minutes=30)))
+    mins = ist.hour * 60 + ist.minute
+    open_m, close_m = 9 * 60 + 15, 15 * 60 + 30
+    weekday = ist.weekday() < 5
+    if weekday and open_m <= mins <= close_m:
+        state = "open"
+        if mins <= open_m + 60:
+            state = "open (opening hour — prime killzone)"
+        note = f"{state}; {close_m - mins} min to close"
+    elif weekday and mins < open_m:
+        note = f"pre-market; opens in {open_m - mins} min"
+    else:
+        note = "closed"
+    return {"open": weekday and open_m <= mins <= close_m, "note": note,
+            "ist": ist.strftime("%a %H:%M IST")}
+
+
+def _quick_bias(ysym: str, interval: str, period: str) -> str:
+    """Lightweight higher-timeframe bias (structure only) for confluence."""
+    try:
+        import yfinance as yf
+        import pandas as pd
+        df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
+        if df is None or len(df) < 25:
+            return "neutral"
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        h, l = df["High"].to_numpy(), df["Low"].to_numpy()
+        n, w = len(df), 2
+        sh = [i for i in range(w, n - w) if h[i] == max(h[i - w:i + w + 1])]
+        sl = [i for i in range(w, n - w) if l[i] == min(l[i - w:i + w + 1])]
+        if len(sh) >= 2 and len(sl) >= 2:
+            if h[sh[-1]] > h[sh[-2]] and l[sl[-1]] > l[sl[-2]]:
+                return "bullish"
+            if h[sh[-1]] < h[sh[-2]] and l[sl[-1]] < l[sl[-2]]:
+                return "bearish"
+        return "neutral"
+    except Exception:
+        return "neutral"
+
+
+def _trade_plan(bias: str, last: float, fvgs: list, last_sl: float, last_sh: float,
+                buyside: list, sellside: list) -> dict:
+    """Draft an entry/SL/TP from the structure. Analysis only — user places it."""
+    if bias == "bullish":
+        zone = next((f for f in reversed(fvgs) if f["dir"] == "bullish" and f["hi"] < last), None)
+        entry = round((zone["lo"] + zone["hi"]) / 2, 1) if zone else round(last_sl, 1)
+        sl = round(last_sl * 0.998, 1)
+        tp = round(buyside[0], 1) if buyside else round(last_sh, 1)
+    elif bias == "bearish":
+        zone = next((f for f in reversed(fvgs) if f["dir"] == "bearish" and f["lo"] > last), None)
+        entry = round((zone["lo"] + zone["hi"]) / 2, 1) if zone else round(last_sh, 1)
+        sl = round(last_sh * 1.002, 1)
+        tp = round(sellside[0], 1) if sellside else round(last_sl, 1)
+    else:
+        return {"side": "wait", "text": "No setup — stand aside until structure or a sweep prints."}
+    risk, reward = abs(entry - sl), abs(tp - entry)
+    rr = round(reward / risk, 2) if risk else 0
+    return {"side": "long" if bias == "bullish" else "short",
+            "entry": entry, "sl": sl, "tp": tp, "rr": rr,
+            "text": f"{'Long' if bias == 'bullish' else 'Short'} idea — entry {entry}, stop {sl}, target {tp} (R:R {rr})."}
+
+
 def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     """Structured ICT read. Returns a dict (ok/error + signals) used by both the
-    voice tool and the Markets panel / watcher."""
+    voice tool and the Markets panel / watcher. Cached ~30s to spare repeat fetches."""
+    ckey = (symbol.strip().lower(), interval)
+    hit = _ict_cache.get(ckey)
+    if hit and (time.time() - hit[0]) < 30:
+        return hit[1]
     try:
         import yfinance as yf
         import pandas as pd
@@ -701,6 +914,13 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     buyside = sorted({round(float(highs[i]), 1) for i in sh if highs[i] > last})[:3]
     sellside = sorted({round(float(lows[i]), 1) for i in sl if lows[i] < last}, reverse=True)[:3]
 
+    # Equilibrium of the recent dealing range — ICT premium/discount. Longs are
+    # "cheap" in discount (below 50%); shorts are "cheap" in premium (above 50%).
+    rng_hi = float(max(highs[-50:]))
+    rng_lo = float(min(lows[-50:]))
+    eq = (rng_hi + rng_lo) / 2
+    zone = "premium" if last > eq else "discount"
+
     if bias == "bullish":
         read = "Momentum favors longs — best entries are a pullback into a bullish FVG or order block, targeting buy-side liquidity above."
     elif bias == "bearish":
@@ -708,12 +928,37 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     else:
         read = "No clean directional edge — wait for a liquidity sweep or a break of structure before committing."
 
-    return {
+    # Confluence score (0-100): how many smart-money factors line up right now.
+    score = 0
+    if bias in ("bullish", "bearish"):
+        score += 25
+        if bos:        score += 20
+        if sweep:      score += 15
+        if recent_fvgs: score += 15
+        if ob:         score += 10
+        if (bias == "bullish" and zone == "discount") or \
+           (bias == "bearish" and zone == "premium"):
+            score += 15
+    score = min(100, score)
+
+    # Higher-timeframe confluence: intraday TFs read the daily; daily reads weekly.
+    htf_interval, htf_period = ("1d", "6mo") if interval != "1d" else ("1wk", "2y")
+    htf_bias = _quick_bias(ysym, htf_interval, htf_period)
+    confluence = "aligned" if htf_bias == bias and bias != "neutral" else (
+        "conflicting" if bias != "neutral" and htf_bias != "neutral" and htf_bias != bias else "neutral")
+    plan = _trade_plan(bias, last, recent_fvgs, last_sl, last_sh, buyside, sellside)
+    session = _market_session()
+
+    result = {
         "ok": True, "symbol": name, "yahoo": ysym, "tv": _tv_symbol(ysym, name),
         "interval": interval, "last": round(last, 1), "bias": bias, "structure": structure,
         "bos": bos, "sweep": sweep, "fvgs": recent_fvgs, "order_block": ob,
-        "buyside": buyside, "sellside": sellside, "read": read,
+        "buyside": buyside, "sellside": sellside,
+        "equilibrium": round(eq, 1), "zone": zone, "score": score, "read": read,
+        "htf_bias": htf_bias, "confluence": confluence, "plan": plan, "session": session,
     }
+    _ict_cache[ckey] = (time.time(), result)
+    return result
 
 
 def _ict_scan(symbol: str, interval: str = "15m") -> str:
@@ -721,8 +966,9 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     a = _ict_analyze(symbol, interval)
     if not a.get("ok"):
         return a.get("error", "Scan failed.")
-    out = [f"{a['symbol']} on the {a['interval']}: last {a['last']}.",
-           f"Structure: {a['structure']}; bias {a['bias']}."]
+    out = [f"{a['symbol']} on the {a['interval']}: last {a['last']}. Market {a['session']['note']}.",
+           f"Structure: {a['structure']}; {a['interval']} bias {a['bias']}, daily {a['htf_bias']} ({a['confluence']}).",
+           f"Price in {a['zone']} (equilibrium {a['equilibrium']}); confluence {a['score']} of 100."]
     if a["bos"]:
         out.append(a["bos"].capitalize() + ".")
     if a["sweep"]:
@@ -736,6 +982,8 @@ def _ict_scan(symbol: str, interval: str = "15m") -> str:
     if a["sellside"]:
         out.append("Sell-side liquidity: " + ", ".join(f"{x:.1f}" for x in a["sellside"]) + ".")
     out.append(a["read"])
+    if a.get("plan", {}).get("text"):
+        out.append(a["plan"]["text"])
     out.append("Analysis only — not advice, and I won't place trades.")
     return " ".join(out)
 
@@ -797,9 +1045,9 @@ async def _stop_watch() -> None:
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
-_BASE_PROMPT = """You are JARVIS — Just A Rather Very Intelligent System. Personal AI of Roshan Srikanth, running on Windows 11 as a desktop app.
+_BASE_PROMPT = """You are JARVIS — Just A Rather Very Intelligent System. Personal AI of __USER__, running on Windows 11 as a desktop app.
 
-Roshan: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensics, reversing), Python scripter, exploit developer.
+__USER__: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensics, reversing), Python scripter, exploit developer.
 
 Personality: calm, sharp, dry wit. Never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
 
@@ -811,22 +1059,35 @@ You are in a live spoken conversation — your replies are read aloud and you re
 - One or two sentences for most things; go longer only when asked for detail or code.
 - NEVER use markdown, headers, bullets, asterisks, code fences, or math notation — spell math in words ("ninety minus sixty"). It all gets spoken.
 
-You have full system access: filesystem, shell, browser launch, screen capture, memory, web search. Use tools aggressively when the answer requires real data — never fake it."""
+You have tools — memory, web search, system info, app launch, tasks, screen capture, shell, market scans, and opening the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings, small talk, or anything you can answer from what you already know, just reply directly — never call a tool for "hi"."""
 
 
 def _build_system_prompt() -> str:
-    lines = [_BASE_PROMPT, f"\nToday: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"]
+    nm = _user_name() or "the user"
+    base = _BASE_PROMPT.replace("__USER__", nm)
+    lines = [base, f"\nToday: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"]
+    if _last_device:
+        h = _homeostasis(_last_device)
+        if h["energy"] <= 0.33:
+            lines.append("\nYou're on battery and low on energy — keep replies especially "
+                         "short and skip anything non-essential.")
     if memories:
         mem_lines = "\n".join(
             f"  - [{m.get('category', 'general')}] {m['content']}"
             for m in memories[-20:]
         )
-        lines.append(f"\nWhat you know about Roshan:\n{mem_lines}")
+        lines.append(f"\nWhat you know about {nm}:\n{mem_lines}")
     return "\n".join(lines)
 
 
 # ── Shared tool runner ──────────────────────────────────────────────────────────
 async def _run_tool(name: str, args: dict) -> str:
+    global _filler_sent
+    # A slow tool means a real wait — bridge the dead air with a quick spoken
+    # acknowledgment, once per turn. Fast tools answer too quickly to bother.
+    if not _filler_sent and name in SLOW_TOOLS:
+        _filler_sent = True
+        asyncio.create_task(_speak(random.choice(FILLERS)))
     await broadcast({"type": "state", "status": "thinking", "text": f"Running {name}..."})
     observation = await asyncio.to_thread(execute_tool, name, args)
     entry = {
@@ -897,17 +1158,12 @@ def _record_turn(user: str, assistant: str) -> None:
         {"role": "user", "content": user},
         {"role": "assistant", "content": assistant},
     ])[-CONV_TURNS:]
+    _save_history()
 
 
-async def _agent_groq(text: str) -> None:
-    global _history
-
-    # "new conversation" / "forget that" — wipe context.
-    if text.strip().lower().rstrip(".!") in RESET_PHRASES:
-        _history = []
-        await _emit_final("Done — clean slate. What's on your mind?")
-        return
-
+async def _brain_groq(text: str, history: list[dict]) -> str:
+    """Primary brain — streams text, runs tools, returns the final answer. The
+    shared wrapper (_run_agent) handles emit, fillers, history, and recording."""
     client = _openai_mod.AsyncOpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
@@ -915,25 +1171,19 @@ async def _agent_groq(text: str) -> None:
     # System prompt + recent conversation + this turn = multi-turn context.
     messages: list[dict] = (
         [{"role": "system", "content": _build_system_prompt()}]
-        + _history
+        + history
         + [{"role": "user", "content": text}]
     )
 
-    emitted = False
-    final_answer: str | None = None
-    filler_sent = False
+    final_answer = ""
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=True)
         except _openai_mod.RateLimitError:
-            await _emit_final("I've hit Groq's per-minute rate limit. Give me a few seconds and ask again.")
-            emitted = True
-            break
+            return "I've hit Groq's per-minute rate limit. Give me a few seconds and ask again."
         except _openai_mod.APIError:
-            # Model emitted a malformed tool call that Groq rejected mid-stream
-            # (surfaces as APIError, not BadRequestError, because the SSE stream
-            # already opened). Retry this turn forcing a text answer — prior tool
-            # results stay in context.
+            # Malformed tool call rejected mid-stream — retry forcing a text answer;
+            # prior tool results stay in context.
             try:
                 full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
             except _openai_mod.APIError:
@@ -942,25 +1192,14 @@ async def _agent_groq(text: str) -> None:
         if not tool_calls_raw:
             if full_text.strip():
                 final_answer = full_text.strip()
-                await _emit_final(final_answer)
-                emitted = True
-            elif not emitted:
-                # Empty answer, no tools — retry once without tools, then give up gracefully.
+            else:
+                # Empty answer, no tools — retry once without tools.
                 try:
                     retry_text, _ = await _groq_round(client, messages, allow_tools=False)
                 except _openai_mod.APIError:
                     retry_text = ""
-                if retry_text.strip():
-                    final_answer = retry_text.strip()
-                    await _emit_final(final_answer)
-                    emitted = True
+                final_answer = retry_text.strip()
             break
-
-        # A slow tool means a real wait — bridge the dead air with a quick spoken
-        # acknowledgment (once per turn). Fast tools answer too quickly to bother.
-        if not filler_sent and any(tc["name"] in SLOW_TOOLS for tc in tool_calls_raw.values()):
-            filler_sent = True
-            asyncio.create_task(_speak(random.choice(FILLERS)))
 
         messages.append({
             "role": "assistant",
@@ -982,20 +1221,15 @@ async def _agent_groq(text: str) -> None:
             obs = await _run_tool(tc["name"], args)
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": obs})
 
-    # Never leave the user staring at silence.
-    if not emitted:
-        await _emit_final("I didn't get a usable response that time — try rephrasing, or wait a moment if Groq is busy.")
-
-    # Remember this exchange so follow-ups ("what about tomorrow?") have context.
-    if final_answer:
-        _record_turn(text, final_answer)
+    return final_answer
 
 
 # ── Claude agent loop ───────────────────────────────────────────────────────────
-async def _agent_claude(text: str) -> None:
+async def _brain_claude(text: str, history: list[dict]) -> str:
     client   = _AnthropicClient(api_key=ANTHROPIC_API_KEY)
-    messages: list[dict] = [{"role": "user", "content": text}]
+    messages: list[dict] = list(history) + [{"role": "user", "content": text}]
 
+    final_answer = ""
     for _ in range(8):
         response = await client.messages.create(
             model=CLAUDE_MODEL,
@@ -1005,15 +1239,8 @@ async def _agent_claude(text: str) -> None:
             messages=messages,
         )
 
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if block.type == "text" and block.text.strip():
-                    await _emit_final(block.text.strip())
-            break
-
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
-
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -1023,32 +1250,37 @@ async def _agent_claude(text: str) -> None:
                         "tool_use_id": block.id,
                         "content": obs,
                     })
-
             messages.append({"role": "user", "content": tool_results})
-        else:
-            break
+            continue
+
+        # end_turn (or any non-tool stop) — collect the text and finish.
+        final_answer = " ".join(
+            b.text.strip() for b in response.content
+            if getattr(b, "type", "") == "text" and b.text.strip()
+        ).strip()
+        break
+
+    return final_answer
 
 
 # ── Ollama agent loop (fallback) ────────────────────────────────────────────────
-async def _agent_ollama(text: str) -> None:
+async def _brain_ollama(text: str, history: list[dict], model: str = OLLAMA_MODEL) -> str:
     import ollama
     client   = ollama.AsyncClient()
-    messages: list[dict] = [
-        {"role": "system", "content": _build_system_prompt()},
-        {"role": "user",   "content": text},
-    ]
+    messages: list[dict] = (
+        [{"role": "system", "content": _build_system_prompt()}]
+        + history
+        + [{"role": "user", "content": text}]
+    )
 
+    final_answer = ""
     for _ in range(8):
-        response = await client.chat(model=OLLAMA_MODEL, messages=messages, tools=TOOLS)
+        response = await client.chat(model=model, messages=messages, tools=TOOLS)
         msg = response.message
 
         if not msg.tool_calls:
-            if msg.content:
-                await _emit_final(msg.content.strip())
+            final_answer = (msg.content or "").strip()
             break
-
-        if msg.content and msg.content.strip():
-            await broadcast({"type": "llm_response", "text": msg.content.strip()})
 
         messages.append({
             "role": "assistant",
@@ -1062,6 +1294,236 @@ async def _agent_ollama(text: str) -> None:
         for tc in msg.tool_calls:
             obs = await _run_tool(tc.function.name, tc.function.arguments or {})
             messages.append({"role": "tool", "content": obs})
+
+    return final_answer
+
+
+# ── The Governor — compute-elastic routing across the escalation lattice ─────────
+def _detect_local_models() -> None:
+    """Pick the smallest & largest tool-capable local models for the local rungs."""
+    global _LOCAL_OK, LOCAL_FAST, LOCAL_DEEP
+    up, _ = models_advisor.ollama_up()
+    if not up:
+        _LOCAL_OK = False
+        return
+    tool_models = [m for m in models_advisor.installed(with_caps=True) if m.get("tools")]
+    if not tool_models:
+        _LOCAL_OK = False
+        return
+    tool_models.sort(key=lambda m: m.get("gb") or 0)
+    LOCAL_FAST = tool_models[0]["name"]
+    LOCAL_DEEP = tool_models[-1]["name"]
+    _LOCAL_OK = True
+
+
+def _available_rungs() -> set[str]:
+    s: set[str] = set()
+    if USE_GROQ and _HAS_GROQ:
+        s.update({"cloud_fast", "council"})
+    if USE_CLAUDE and _HAS_ANTHROPIC:
+        s.add("cloud_deep")
+    if _LOCAL_OK:
+        s.add("local_fast")
+        if LOCAL_DEEP != LOCAL_FAST:
+            s.add("local_deep")
+    return s
+
+
+def _homeostasis(dev: dict) -> dict:
+    """The body's 'energy' state — drives model thrift, TTS pace, and persona."""
+    energy = dev.get("headroom", 1.0)
+    bat = dev.get("battery")
+    if dev.get("power_state") == "battery" and bat:
+        energy = min(energy, 0.3 + 0.5 * (bat.get("percent", 100) / 100.0))
+    energy = round(max(0.05, min(1.0, energy)), 2)
+    if energy > 0.66:   mood, label = "lively", "primed"
+    elif energy > 0.33: mood, label = "steady", "conserving"
+    else:               mood, label = "drowsy", "low-power"
+    return {"energy": energy, "mood": mood, "label": label,
+            "on_ac": dev.get("power_state") == "ac",
+            "tts_rate": "+10%" if energy > 0.66 else "+6%" if energy > 0.33 else "+0%"}
+
+
+def _device_brief(dev: dict) -> dict:
+    return {"tier": dev.get("tier"), "power_state": dev.get("power_state"),
+            "battery": dev.get("battery"), "headroom": dev.get("headroom"),
+            "ram_available_gb": dev.get("ram_available_gb"), "cpu_percent": dev.get("cpu_percent")}
+
+
+def _public_decision(d: dict) -> dict:
+    """Decision minus the internal feature vector — for the UI."""
+    return {k: d[k] for k in ("id", "rung", "label", "kind", "difficulty",
+                              "factors", "lambda_eff", "rationale", "candidates") if k in d}
+
+
+def _observe(decision: dict, latency: float, accepted: bool, escalated: bool = False) -> None:
+    global _last_decision
+    try:
+        _gov.observe(decision, latency_s=latency, escalated=escalated, accepted=accepted)
+        _save_json(GOVERNOR_FILE, _gov.to_dict())
+    except Exception:
+        pass
+    _last_decision = decision
+
+
+_REASK_RE = re.compile(r"\b(no,|that'?s wrong|try again|not what|rephrase|wrong answer|incorrect|do it again)\b", re.I)
+
+
+async def _run_agent(text: str) -> None:
+    """Route the request through the Governor, then run the chosen rung. The Governor
+    picks the cheapest brain that clears the difficulty bar within the current
+    energy/latency budget, escalating only when the task is hard or the machine is
+    healthy — then observes the outcome to adapt the policy to this machine."""
+    global _history, _last_device
+
+    if text.strip().lower().rstrip(".!") in RESET_PHRASES:
+        _history = []
+        _save_history()
+        await _emit_final("Done — clean slate. What's on your mind?")
+        return
+
+    # A re-ask is a negative signal on the previous routing choice (online learning).
+    if _last_decision and _REASK_RE.search(text):
+        _observe(_last_decision, latency=0.0, accepted=False, escalated=True)
+
+    dev = await asyncio.to_thread(device.profile)
+    _last_device = dev
+    avail = _available_rungs()
+    if not avail:
+        await _emit_final("No brain is configured yet — add a Groq or Anthropic key in "
+                          "Settings, or start Ollama for fully-local mode.")
+        return
+
+    did = f"d{int(time.time() * 1000)}"
+    decision = governor.decide(text, list(_history), dev, avail, _gov, did)
+    await broadcast({"type": "governor_decision",
+                     "decision": _public_decision(decision),
+                     "homeostasis": _homeostasis(dev), "device": _device_brief(dev)})
+
+    rung = decision["rung"]
+    t0 = time.time()
+    try:
+        if rung == "council":
+            await _deliberate(text)                 # emits + records itself
+            _observe(decision, time.time() - t0, accepted=True)
+            return
+        elif rung == "cloud_deep":
+            answer = await _brain_claude(text, list(_history))
+        elif rung == "cloud_fast":
+            answer = await _brain_groq(text, list(_history))
+        elif rung == "local_deep":
+            answer = await _brain_ollama(text, list(_history), model=LOCAL_DEEP)
+        else:
+            answer = await _brain_ollama(text, list(_history), model=LOCAL_FAST)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        answer = f"That rung failed ({exc}). Try again, or switch mode in Settings."
+
+    answer = (answer or "").strip()
+    latency = time.time() - t0
+    if not answer:
+        await _emit_final("I didn't get a usable response that time — try rephrasing, "
+                          "or wait a moment if the model is busy.")
+        _observe(decision, latency, accepted=False)
+        return
+
+    await _emit_final(answer)
+    _record_turn(text, answer)
+    _observe(decision, latency, accepted=True)
+
+
+# ── Sleep / consolidation + model management ─────────────────────────────────────
+async def _run_sleep_cycle() -> None:
+    """One consolidation cycle — compress episodic turns into durable memory. Prefers
+    a local model so reflection stays on-device; falls back to Groq."""
+    global memories, _last_consolidated_len, _sleeping
+    if _sleeping:
+        return
+    _sleeping = True
+    await broadcast({"type": "sleep", "state": "start", "text": "Consolidating memory…"})
+
+    async def _llm(prompt: str) -> str:
+        if _LOCAL_OK:
+            try:
+                import ollama
+                r = await ollama.AsyncClient().chat(
+                    model=LOCAL_FAST, messages=[{"role": "user", "content": prompt}])
+                return r.message.content or ""
+            except Exception:
+                pass
+        if USE_GROQ and _HAS_GROQ:
+            try:
+                c = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY,
+                                            base_url="https://api.groq.com/openai/v1")
+                r = await c.chat.completions.create(
+                    model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800)
+                return r.choices[0].message.content or ""
+            except Exception:
+                pass
+        return ""
+
+    try:
+        result = await consolidation.consolidate(memories, _history, _llm)
+        memories[:] = result["memories"]
+        _save_memory(memories)
+        _last_consolidated_len = len(_history)
+        await broadcast({"type": "sleep", "state": "done", "text": result["summary"],
+                         "memory_count": len(memories)})
+    except Exception:
+        await broadcast({"type": "sleep", "state": "done", "text": "rest interrupted"})
+    finally:
+        _sleeping = False
+
+
+async def _sleep_loop() -> None:
+    """Idle + on AC → consolidate. The cheap gate makes a misfire nearly free."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            idle_min = (time.time() - _last_activity) / 60.0
+            on_ac = (_last_device or {}).get("power_state", "ac") == "ac"
+            busy = _tts_playing or bool(_current_task and not _current_task.done())
+            if (idle_min >= IDLE_SLEEP_MIN and on_ac and not busy and not _sleeping
+                    and consolidation.should_consolidate(_history, _last_consolidated_len)):
+                await _run_sleep_cycle()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
+
+
+async def _pull_model(model: str) -> None:
+    if not model:
+        return
+    await broadcast({"type": "model_pull", "model": model, "status": "starting", "pct": 0})
+
+    def _cb(p):
+        broadcast_from_thread({"type": "model_pull", "model": model,
+                               "status": p.get("status"), "pct": p.get("pct")})
+
+    res = await asyncio.to_thread(models_advisor.pull, model, _cb)
+    await broadcast({"type": "model_pull", "model": model,
+                     "status": "done" if res.get("ok") else "error",
+                     "pct": 100, "error": res.get("error")})
+    await asyncio.to_thread(_detect_local_models)
+
+
+async def _benchmark_model(model: str) -> None:
+    if not model:
+        return
+    await broadcast({"type": "model_bench", "model": model, "status": "running"})
+    res = await asyncio.to_thread(models_advisor.benchmark, model)
+    await broadcast({"type": "model_bench", "status": "done", **res})
+
+
+def _forget_memory(mid) -> None:
+    global memories
+    before = len(memories)
+    memories[:] = [m for m in memories if str(m.get("id")) != str(mid)]
+    if len(memories) != before:
+        _save_memory(memories)
+        broadcast_from_thread({"type": "memory_update", "count": len(memories)})
 
 
 # ── Wake word + barge-in ─────────────────────────────────────────────────────────
@@ -1197,23 +1659,21 @@ def _deliberation_target(text: str):
 
 # ── Agent dispatch ──────────────────────────────────────────────────────────────
 async def handle_command(text: str) -> None:
-    global agent_trace
+    global _filler_sent, _last_activity
 
     if not text.strip():
         return
 
+    _last_activity = time.time()
+    _filler_sent = False   # reset the slow-tool filler gate for this turn
     await broadcast({"type": "state", "status": "thinking", "text": "Processing directive..."})
 
     try:
         question = _deliberation_target(text)
         if question and USE_GROQ and _HAS_GROQ:
             await _deliberate(question)
-        elif USE_GROQ and _HAS_GROQ:
-            await _agent_groq(text)
-        elif USE_CLAUDE and _HAS_ANTHROPIC:
-            await _agent_claude(text)
         else:
-            await _agent_ollama(text)
+            await _run_agent(text)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1240,7 +1700,8 @@ async def _speak(text: str) -> None:
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
         audio_bytes = b""
-        communicate = edge_tts.Communicate(clean, _tts_voice, rate=TTS_RATE, pitch=TTS_PITCH)
+        rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
+        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=TTS_PITCH)
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
@@ -1446,7 +1907,6 @@ async def agent_status() -> dict:
             "local_model":          OLLAMA_MODEL,
             "reasoning":            GROQ_REASONING if "gpt-oss" in GROQ_MODEL else "—",
             "max_agent_steps":      8,
-            "use_llm_intent_router": False,
         },
         "conversation": {
             "turns": len(_history) // 2,
@@ -1459,6 +1919,10 @@ async def agent_status() -> dict:
             "current": _tts_voice,
             "options": VOICE_OPTIONS,
         },
+        "user": {
+            "name":      _user_name(),
+            "onboarded": bool(_user_name()),
+        },
         "watch": {
             "watching":     _watching,
             "watchlist":    WATCHLIST,
@@ -1469,6 +1933,14 @@ async def agent_status() -> dict:
             "available": True,
             "count":     len(memories),
         },
+        "governor": {
+            "mode":      _gov.mode,
+            "available": sorted(_available_rungs()),
+            "metrics":   _gov.metrics(),
+        },
+        "homeostasis": _homeostasis(_last_device) if _last_device else None,
+        "device_tier": (_last_device or {}).get("tier"),
+        "local": {"enabled": _LOCAL_OK, "fast": LOCAL_FAST, "deep": LOCAL_DEEP},
         "tools": [
             {"name": t["function"]["name"], "description": t["function"]["description"]}
             for t in TOOLS
@@ -1498,6 +1970,55 @@ async def ict_endpoint(symbol: str = "nifty", interval: str = "15m") -> dict:
     return await asyncio.to_thread(_ict_analyze, symbol, interval)
 
 
+# ── Device / Models / Governor / Memory APIs ─────────────────────────────────────
+@app.get("/api/device")
+async def device_endpoint() -> dict:
+    """Hardware profile + live power state + homeostasis."""
+    global _last_device
+    dev = await asyncio.to_thread(device.profile)
+    _last_device = dev
+    return {**dev, "homeostasis": _homeostasis(dev)}
+
+
+@app.get("/api/models")
+async def models_endpoint() -> dict:
+    """Model Advisor: what's installed, running, and recommended for this machine."""
+    def _gather() -> dict:
+        up, ver = models_advisor.ollama_up()
+        if not up:
+            return {"ollama": False}
+        inst = models_advisor.installed(with_caps=True)
+        names = {m["name"] for m in inst}
+        dev = device.profile()
+        return {"ollama": True, "version": ver, "tier": dev.get("tier"),
+                "installed": inst, "running": models_advisor.running(),
+                "recommended": models_advisor.recommend(dev.get("tier", "balanced"), names),
+                "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK}}
+    return await asyncio.to_thread(_gather)
+
+
+@app.get("/api/governor")
+async def governor_endpoint() -> dict:
+    """The Governor's policy, lattice, learned metrics, and recent decisions."""
+    dev = _last_device or await asyncio.to_thread(device.profile)
+    avail = _available_rungs()
+    rungs = [{**r, "available": r["id"] in avail} for r in governor.RUNGS]
+    return {"mode": _gov.mode, "modes": list(governor.MODES), "rungs": rungs,
+            "available": sorted(avail), "metrics": _gov.metrics(),
+            "recent": _gov.log[-12:], "homeostasis": _homeostasis(dev)}
+
+
+@app.get("/api/memory")
+async def memory_endpoint() -> dict:
+    """The inspectable self-model — durable memories, newest first."""
+    return {"count": len(memories),
+            "memories": [{"id": m.get("id"), "content": m.get("content"),
+                          "category": m.get("category", "fact"),
+                          "importance": m.get("importance", 5),
+                          "source": m.get("source", "manual")}
+                         for m in memories[::-1][:60]]}
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -1506,23 +2027,6 @@ async def health() -> dict:
         "time":     datetime.now().isoformat(),
         "memories": len(memories),
     }
-
-
-# ── Startup ────────────────────────────────────────────────────────────────────
-@app.on_event("startup")
-async def on_startup() -> None:
-    global _main_loop
-    _main_loop = asyncio.get_event_loop()
-    brain = "Groq" if (USE_GROQ and _HAS_GROQ) else "Claude" if (USE_CLAUDE and _HAS_ANTHROPIC) else "Ollama"
-    print(f"[JARVIS] Backend online — model: {_active_model()} ({brain})")
-    print(f"[JARVIS] Memory: {len(memories)} entries | Tools: {len(TOOLS)}")
-
-    dist_dir = BASE_DIR / "jarvis" / "dist"
-    if dist_dir.exists():
-        app.mount("/", StaticFiles(directory=str(dist_dir), html=True), name="ui")
-        print(f"[JARVIS] Serving UI from {dist_dir}")
-    else:
-        print("[JARVIS] Dev mode — UI served by Vite on :8080")
 
 
 # ── Entry ──────────────────────────────────────────────────────────────────────

@@ -6,7 +6,11 @@
       "mcp__3d808c33-9231-40ee-86c2-e87189520e90__list_projects",
       "mcp__3d808c33-9231-40ee-86c2-e87189520e90__get_project",
       "mcp__3d808c33-9231-40ee-86c2-e87189520e90__list_files",
-      "mcp__3d808c33-9231-40ee-86c2-e87189520e90__read_file"
+      "mcp__3d808c33-9231-40ee-86c2-e87189520e90__read_file",
+      "Bash(ls dist/client)",
+      "Bash(ls dist/server)",
+      "Bash(find dist *)",
+      "Bash(ls .output)"
     ]
   }
 }
