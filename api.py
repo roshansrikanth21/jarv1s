@@ -112,7 +112,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -533,6 +533,50 @@ TOOLS: list[dict] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_image",
+            "description": "Look at an image file on disk and describe/answer about it. Use when the user points at a picture, screenshot, photo, or diagram file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":     {"type": "string", "description": "Absolute path to the image (.png/.jpg/.jpeg/.webp/.gif)"},
+                    "question": {"type": "string", "description": "Optional specific question about the image"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "watch_video",
+            "description": "Watch a video (local file path OR a URL like YouTube) and describe/answer about it. Samples frames and transcribes the audio, then reasons over both.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source":   {"type": "string", "description": "Local video path or a video URL"},
+                    "question": {"type": "string", "description": "Optional specific question about the video"},
+                },
+                "required": ["source"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculate",
+            "description": "Evaluate a math expression exactly (arithmetic, powers, %, parentheses). Use this for any calculation instead of doing mental math.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {"type": "string", "description": "e.g. '1850*0.07' or '(3+4)**2/5'"},
+                },
+                "required": ["expression"],
+            },
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -722,7 +766,169 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
         broadcast_from_thread({"type": "open_trading"})
         return "Opening the trading terminal in its own window."
 
+    if name == "analyze_image":
+        return _analyze_image(args.get("path", ""), args.get("question", ""))
+
+    if name == "watch_video":
+        return _watch_video(args.get("source", ""), args.get("question", ""))
+
+    if name == "calculate":
+        return _calculate(args.get("expression", ""))
+
     return f"Unknown tool: {name}"
+
+
+def _calculate(expr: str) -> str:
+    """Safe arithmetic eval via AST — numbers and operators only, no names/calls."""
+    import ast, operator
+    ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+           ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+           ast.FloorDiv: operator.floordiv, ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+    def ev(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in ops:
+            return ops[type(node.op)](ev(node.left), ev(node.right))
+        if isinstance(node, ast.UnaryOp) and type(node.op) in ops:
+            return ops[type(node.op)](ev(node.operand))
+        raise ValueError("unsupported expression")
+
+    try:
+        result = ev(ast.parse(expr.strip(), mode="eval").body)
+        return f"{expr} = {result}"
+    except Exception:
+        return f"Couldn't evaluate: {expr!r}"
+
+
+# ── Vision: image + video understanding (Groq Llama-4 vision + Whisper) ─────────
+def _groq_vision(b64_images: list, prompt: str, max_tokens: int = 600) -> str:
+    """Send one or more base64 JPEGs + a prompt to Groq's multimodal model."""
+    if not (USE_GROQ and _HAS_GROQ):
+        return "Vision needs a Groq API key."
+    client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    content = [{"type": "text", "text": prompt}]
+    for b in b64_images:
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}})
+    resp = client.chat.completions.create(
+        model=GROQ_VISION_MODEL,
+        messages=[{"role": "user", "content": content}],
+        max_tokens=max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
+def _analyze_image(path: str, question: str = "") -> str:
+    """Describe / answer about an image file via cloud vision."""
+    path = path.strip().strip('"').strip("'")
+    if not os.path.isfile(path):
+        return f"No image file at: {path}"
+    try:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+        img.thumbnail((1280, 1280), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        b64 = base64.b64encode(buf.getvalue()).decode()
+    except ImportError:
+        return "Image deps missing. Run: pip install Pillow."
+    except Exception as exc:
+        return f"Couldn't read image: {exc}"
+    prompt = question.strip() or "Describe this image concisely — the main subject, text, and any notable detail."
+    try:
+        return _groq_vision([b64], prompt, max_tokens=700)
+    except Exception as exc:
+        return f"Image analysis failed: {exc}"
+
+
+def _watch_video(source: str, question: str = "") -> str:
+    """Watch a local video or URL: sample frames + transcribe audio, then reason over both."""
+    import tempfile, glob
+    source = source.strip().strip('"').strip("'")
+    try:
+        import cv2
+    except ImportError:
+        return "Video deps missing. Run: pip install opencv-python-headless yt-dlp."
+
+    # Work + temp files on a drive with space (K: if present, else system temp).
+    tmp_root = "K:\\jarvis_tmp" if os.path.isdir("K:\\") else tempfile.gettempdir()
+    os.makedirs(tmp_root, exist_ok=True)
+    workdir = tempfile.mkdtemp(dir=tmp_root)
+    video_path = source
+
+    # If it's a URL, download a small progressive MP4 with yt-dlp.
+    if source.lower().startswith(("http://", "https://", "www.")):
+        try:
+            import yt_dlp
+        except ImportError:
+            return "URL video needs yt-dlp. Run: pip install yt-dlp."
+        out_tmpl = os.path.join(workdir, "vid.%(ext)s")
+        broadcast_from_thread({"type": "state", "status": "thinking", "text": "Downloading video..."})
+        try:
+            opts = {"outtmpl": out_tmpl, "quiet": True, "noplaylist": True,
+                    "format": "mp4[height<=480]/best[height<=480]/best", "max_filesize": 80 * 1024 * 1024}
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([source])
+            hits = glob.glob(os.path.join(workdir, "vid.*"))
+            if not hits:
+                return "Couldn't download that video (too large or unsupported)."
+            video_path = hits[0]
+        except Exception as exc:
+            return f"Video download failed: {exc}"
+
+    if not os.path.isfile(video_path):
+        return f"No video at: {video_path}"
+
+    # Sample frames with OpenCV (budget by duration, hard cap 12 frames for token cost).
+    broadcast_from_thread({"type": "state", "status": "thinking", "text": "Sampling frames..."})
+    frames_b64 = []
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        dur = total / fps if fps else 0
+        n = 5  # Groq's multimodal models accept up to 5 images per request
+        idxs = [int(total * i / (n + 1)) for i in range(1, n + 1)] if total else []
+        for fi in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            ok, enc = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                frames_b64.append(base64.b64encode(enc.tobytes()).decode())
+        cap.release()
+    except Exception as exc:
+        return f"Frame sampling failed: {exc}"
+    if not frames_b64:
+        return "Couldn't read any frames from that video."
+
+    # Transcribe audio via Groq Whisper (it accepts mp4/webm; skip if file too big).
+    transcript = ""
+    try:
+        if USE_GROQ and _HAS_GROQ and os.path.getsize(video_path) <= 24 * 1024 * 1024:
+            broadcast_from_thread({"type": "state", "status": "thinking", "text": "Transcribing audio..."})
+            client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+            with open(video_path, "rb") as f:
+                r = client.audio.transcriptions.create(model=STT_MODEL, file=f, response_format="text")
+            transcript = (r or "").strip()
+    except Exception:
+        transcript = ""
+
+    q = question.strip() or "What happens in this video? Summarize it concisely."
+    prompt = (f"These are {len(frames_b64)} frames sampled across a video, in order.\n"
+              + (f"Audio transcript:\n{transcript[:4000]}\n\n" if transcript else "")
+              + f"{q}\nAnswer in plain spoken sentences.")
+    try:
+        out = _groq_vision(frames_b64, prompt, max_tokens=800)
+    except Exception as exc:
+        out = f"Video analysis failed: {exc}"
+    try:
+        import shutil
+        shutil.rmtree(workdir, ignore_errors=True)
+    except Exception:
+        pass
+    return out
 
 
 # ── ICT / Smart-Money scanner (Indian markets) ─────────────────────────────────
