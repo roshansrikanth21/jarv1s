@@ -39,7 +39,8 @@ function Page() {
 
   return (
     <>
-      <Deck />
+      {/* key forces a clean remount on switch — no stale state bleeds across presets */}
+      <Deck key={preset} />
       <PresetSwitcher value={preset} onChange={setPreset} />
     </>
   );
@@ -49,28 +50,34 @@ function PresetSwitcher({ value, onChange }: { value: string; onChange: (v: stri
   const AMBER = "oklch(0.68 0.22 38)";
   return (
     <div
-      title="Switch UI preset"
       style={{
-        position: "fixed", bottom: 8, left: 8, zIndex: 99999,
-        display: "flex", alignItems: "center", gap: 6,
-        background: "rgba(10,7,5,0.82)", border: `1px solid ${AMBER}33`,
-        borderRadius: 6, padding: "3px 7px", backdropFilter: "blur(4px)",
-        fontFamily: "JetBrains Mono, ui-monospace, monospace", fontSize: 10, color: AMBER,
+        position: "fixed", bottom: 10, left: "50%", transform: "translateX(-50%)",
+        zIndex: 99999, display: "flex", alignItems: "center", gap: 2,
+        background: "rgba(10,7,5,0.9)", border: `1px solid ${AMBER}40`,
+        borderRadius: 999, padding: 3, backdropFilter: "blur(6px)",
+        fontFamily: "JetBrains Mono, ui-monospace, monospace",
+        boxShadow: `0 2px 18px ${AMBER}22`,
       }}
     >
-      <span style={{ opacity: 0.55, letterSpacing: "0.12em" }}>UI</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        style={{
-          background: "transparent", color: AMBER, border: "none", outline: "none",
-          fontFamily: "inherit", fontSize: 10, cursor: "pointer",
-        }}
-      >
-        {PRESETS.map((p) => (
-          <option key={p.id} value={p.id} style={{ background: "#120a06", color: "#eee" }}>{p.label}</option>
-        ))}
-      </select>
+      <span style={{ fontSize: 8, opacity: 0.45, letterSpacing: "0.18em", padding: "0 6px 0 4px" }}>UI</span>
+      {PRESETS.map((p) => {
+        const active = p.id === value;
+        return (
+          <button
+            key={p.id}
+            onClick={() => onChange(p.id)}
+            style={{
+              border: "none", cursor: "pointer", borderRadius: 999,
+              padding: "4px 12px", fontFamily: "inherit", fontSize: 10, letterSpacing: "0.04em",
+              background: active ? AMBER : "transparent",
+              color: active ? "#0a0705" : `${AMBER}aa`,
+              fontWeight: active ? 700 : 500, transition: "all 0.15s",
+            }}
+          >
+            {p.label}
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -29,6 +29,13 @@ Pillow
 yfinance
 pandas
 
-# Optional fallback brains (only if you set the keys / run Ollama locally)
-anthropic
+# Video understanding: frame sampling (opencv) + URL download (yt-dlp);
+# audio is transcribed by Groq Whisper, so no ffmpeg binary needed.
+opencv-python-headless
+yt-dlp
+
+# Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama
+
+# Optional fallback brain (only if you set ANTHROPIC_API_KEY)
+anthropic
