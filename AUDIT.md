@@ -62,3 +62,26 @@ Legend: ✅ done & verified · 🟡 done, not verified end-to-end · ⛔ not sta
 3. **Video + image understanding** (now unblocked by disk).
 4. **Lift E.D.I.T.H's cheap tools** (weather/news/youtube/calculator).
 5. Reconcile `requirements.txt` + rewrite `README` for the unified project; delete `merge-dev`.
+
+---
+
+## 8. Affect / perception / ambient (2026-06-28) ✅
+New, dependency-free layer giving JARVIS a temperament, a read on the user, and a
+sense of its surroundings. All wired into `api.py` and guarded by `JARVIS_EMOTION`
+(off => original static persona). No new pip deps (stdlib only).
+- `persona.py` — **PAD emotion engine**: sharp/dry/dominant baseline, event nudges,
+  exponential **decay timer** back to baseline, 10 named moods, sarcasm dial
+  (`playful`/`sharp`/`savage`), JSON persistence, prompt `[Affect]` block + subtle TTS bias.
+- `perception.py` — **perceptual intelligence**: classifies user affect/intent from the
+  transcript (+ mic-loudness cue) → PAD nudge + per-turn guidance. **Distress always
+  suppresses sarcasm** (the "never offensive" guarantee).
+- `ambient.py` — time-of-day + IP geolocation (`ip-api.com`) + weather (Open-Meteo),
+  both keyless, cached, offline-safe; new `get_weather` tool; `[Surroundings]` prompt line.
+- Verified: `python -m py_compile` clean; `python scripts/selftest_affect.py` → **27/27**;
+  live import of `api.py` exercised `_build_system_prompt`, `_update_affect`, `agent_status`,
+  `_voice_params`, and the `get_weather` tool.
+- STT verdict: the existing Groq Whisper large-v3-turbo + energy-VAD + wake-word/echo
+  guard is **good — kept as-is**; perception is layered *on top* (text + loudness), not a
+  replacement.
+- ⛔ Not yet: a HUD readout for the mood (data is already exposed on `/api/agent/status`
+  and the `emotion` WS event — UI wiring is a small follow-up).
