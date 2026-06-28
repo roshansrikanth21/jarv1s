@@ -35,6 +35,17 @@ to spare. See [Roadmap](#roadmap).
   TTS, with barge-in, an echo guard, and hallucination filtering.
 - **Agentic brain** — a tool-calling loop behind one unified `Brain` contract spanning
   Groq, Claude, and any local Ollama model, with multi-turn memory and fillers.
+- **Affect & persona — a PAD emotion engine** — a live mood in Pleasure-Arousal-
+  Dominance space over a sharp/dry/dominant baseline, nudged by how the conversation
+  goes and relaxed back home by a half-life **decay timer**. It tints JARVIS's register
+  (and a touch of his TTS) every reply. Sarcasm dial: `playful · sharp · savage`; kill
+  switch `JARVIS_EMOTION=0`. (`persona.py`)
+- **Perceptual intelligence** — reads the user's affect/intent from the transcript
+  (frustration, stress, gratitude, banter, insults, a "good morning" sent at 1 AM…)
+  plus a mic-loudness cue, and steers the mood. Genuine distress always **suppresses the
+  comedy** — playful never tips into offensive. (`perception.py`)
+- **Ambient awareness** — time of day, IP-based location, and live weather (both keyless)
+  ground his answers and his wit, and back a new `get_weather` tool. (`ambient.py`)
 - **Tools** — memory, web search, system stats, app launch, tasks, screen capture +
   vision, shell, ICT market scan, and **open the c0mr4des trading terminal**.
 - **Council (Mixture-of-Agents)** — *"deliberate …"* convenes a panel of models that
@@ -52,7 +63,7 @@ to spare. See [Roadmap](#roadmap).
 
 ```
 Electron shell ──spawns──► Python FastAPI backend (api.py)  ◄──WebSocket──►  React HUD
-   (electron/)                  brain · tools · voice · markets         (TanStack Start, src/)
+   (electron/)                  brain · tools · voice · affect · markets         (TanStack Start, src/)
 ```
 
 - **Backend** — `api.py` (FastAPI + WebSocket). One file, deliberately.
@@ -127,5 +138,5 @@ tells you what to add.
 
 Common overrides: `GROQ_MODEL`, `GROQ_REASONING_EFFORT`, `CLAUDE_MODEL`,
 `JARVIS_TTS_VOICE`, `JARVIS_WAKE_WORDS`, `JARVIS_WAKE_REQUIRED`, `JARVIS_WATCHLIST`,
-`JARVIS_WATCH_INTERVAL_MIN`, `JARVIS_USER`, `JARVIS_WS_ALLOW_ALL`. See the top of
+`JARVIS_WATCH_INTERVAL_MIN`, `JARVIS_USER`, `JARVIS_WS_ALLOW_ALL`, `JARVIS_EMOTION`, `JARVIS_SARCASM`, `JARVIS_HOME_CITY`. See `AFFECT.md` and the top of
 `api.py` for the full list and defaults.
