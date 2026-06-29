@@ -79,6 +79,7 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 # set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
+GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard cap so a slow/hung API never stalls the agent
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
@@ -763,7 +764,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             try:
                 b64 = base64.b64encode(img_bytes).decode()
                 client = _openai_mod.OpenAI(
-                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
                 )
                 resp = client.chat.completions.create(
                     model=GROQ_VISION_MODEL,
@@ -855,7 +856,7 @@ def _groq_vision(b64_images: list, prompt: str, max_tokens: int = 600) -> str:
     """Send one or more base64 JPEGs + a prompt to Groq's multimodal model."""
     if not (USE_GROQ and _HAS_GROQ):
         return "Vision needs a Groq API key."
-    client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
     content = [{"type": "text", "text": prompt}]
     for b in b64_images:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}})
@@ -957,7 +958,7 @@ def _watch_video(source: str, question: str = "") -> str:
     try:
         if USE_GROQ and _HAS_GROQ and os.path.getsize(video_path) <= 24 * 1024 * 1024:
             broadcast_from_thread({"type": "state", "status": "thinking", "text": "Transcribing audio..."})
-            client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+            client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
             with open(video_path, "rb") as f:
                 r = client.audio.transcriptions.create(model=STT_MODEL, file=f, response_format="text")
             transcript = (r or "").strip()
@@ -1438,6 +1439,7 @@ async def _brain_groq(text: str, history: list[dict]) -> str:
     client = _openai_mod.AsyncOpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
+        timeout=GROQ_TIMEOUT,
     )
     # System prompt + recent conversation + this turn = multi-turn context.
     messages: list[dict] = (
@@ -1726,7 +1728,7 @@ async def _run_sleep_cycle() -> None:
         if USE_GROQ and _HAS_GROQ:
             try:
                 c = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY,
-                                            base_url="https://api.groq.com/openai/v1")
+                                            base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
                 r = await c.chat.completions.create(
                     model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800)
                 return r.choices[0].message.content or ""
@@ -1873,7 +1875,7 @@ async def _deliberate(question: str) -> None:
         await _emit_final("Multi-agent deliberation needs the Groq backend.")
         return
 
-    client = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+    client = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
     await broadcast({"type": "council_start", "question": question,
                      "panel": [_short_model(m) for m in MOA_PROPOSERS]})
     await broadcast({"type": "state", "status": "thinking", "text": "Convening the panel..."})
@@ -2111,7 +2113,7 @@ def _transcribe(wav_bytes: bytes) -> str:
         return ""
     try:
         client = _openai_mod.OpenAI(
-            api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
         )
         result = client.audio.transcriptions.create(
             model=STT_MODEL,
