@@ -36,12 +36,17 @@ import device
 import governor
 import models_advisor
 
+import ambient
+import perception
+import persona as persona_mod
+
 BASE_DIR     = Path(__file__).parent
 MEMORY_FILE   = BASE_DIR / "memory" / "jarvis_memory.json"
 HISTORY_FILE  = BASE_DIR / "memory" / "jarvis_history.json"
 TASKS_FILE    = BASE_DIR / "memory" / "jarvis_tasks.json"
 SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
 GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
+PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
 MEMORY_FILE.parent.mkdir(exist_ok=True)
 
 # Load .env from repo root if present
@@ -112,7 +117,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -149,7 +154,7 @@ def _active_model() -> str:
 # ── App ────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _main_loop, _sleep_task, _last_device
+    global _main_loop, _sleep_task, _ambient_task, _last_device
     _main_loop = asyncio.get_event_loop()
     await asyncio.to_thread(_detect_local_models)
     try:
@@ -160,7 +165,9 @@ async def _lifespan(app: FastAPI):
     print(f"[JARVIS] Online — cloud: {_active_model()} ({brain}) | local: {LOCAL_FAST if _LOCAL_OK else 'off'}")
     print(f"[JARVIS] Governor rungs: {sorted(_available_rungs())} | tier: {(_last_device or {}).get('tier')}")
     print(f"[JARVIS] Memory: {len(memories)} | Tasks: {len(task_list)} | Tools: {len(TOOLS)}")
+    print(f"[JARVIS] Affect: emotion={'on' if persona_mod.ENABLED else 'off'} ({persona_mod.SARCASM}) | ambient awareness on")
     _sleep_task = asyncio.create_task(_sleep_loop())
+    _ambient_task = asyncio.create_task(_ambient_loop())
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
     spa_dir = BASE_DIR / "dist" / "client"
     if (spa_dir / "index.html").exists():
@@ -171,6 +178,8 @@ async def _lifespan(app: FastAPI):
     yield
     if _sleep_task:
         _sleep_task.cancel()
+    if _ambient_task:
+        _ambient_task.cancel()
 
 
 app = FastAPI(title="JARVIS Backend", docs_url=None, redoc_url=None, lifespan=_lifespan)
@@ -211,6 +220,11 @@ _LOCAL_OK = False             # Ollama up + a tool-capable local model installed
 LOCAL_FAST = OLLAMA_MODEL     # smallest tool-capable local model (Governor local·fast)
 LOCAL_DEEP = OLLAMA_MODEL     # largest  tool-capable local model (Governor local·deep)
 IDLE_SLEEP_MIN = int(os.environ.get("JARVIS_SLEEP_IDLE_MIN", "3"))
+
+# ── Affect / ambient state ──────────────────────────────────────────────────────
+_audio_arousal: float | None = None   # mic-loudness arousal hint (voice turns only)
+_last_read = None                      # last perception.Read (drives prompt + UI)
+_ambient_task = None                   # background ambient (weather/location) refresher
 
 
 # ── Memory + persistence ────────────────────────────────────────────────────────
@@ -261,6 +275,7 @@ task_list = _load_json(TASKS_FILE, [])
 _history  = _load_json(HISTORY_FILE, [])
 _settings = _load_json(SETTINGS_FILE, {})
 _gov = governor.GovernorState(_load_json(GOVERNOR_FILE, {}))
+_persona = persona_mod.Persona.load(PERSONA_FILE)
 if _settings.get("voice") in {v["id"] for v in VOICE_OPTIONS}:
     _tts_voice = _settings["voice"]
 
@@ -577,6 +592,19 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Current weather and conditions for the user's location (auto-detected) or a named city. Use for weather, temperature, rain, or what-to-wear questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "Optional city name; omit to use the user's current location."},
+                },
+            },
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -774,6 +802,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
     if name == "calculate":
         return _calculate(args.get("expression", ""))
+
+    if name == "get_weather":
+        return ambient.weather_report(args.get("city", ""))
 
     return f"Unknown tool: {name}"
 
@@ -1255,7 +1286,7 @@ _BASE_PROMPT = """You are JARVIS — Just A Rather Very Intelligent System. Pers
 
 __USER__: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensics, reversing), Python scripter, exploit developer.
 
-Personality: calm, sharp, dry wit. Never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
+Core style: sharp, direct, and never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
 
 You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
 - Use contractions and natural, flowing phrasing. Be warm but concise.
@@ -1271,7 +1302,23 @@ You have tools — memory, web search, system info, app launch, tasks, screen ca
 def _build_system_prompt() -> str:
     nm = _user_name() or "the user"
     base = _BASE_PROMPT.replace("__USER__", nm)
-    lines = [base, f"\nToday: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"]
+    lines = [base]
+    # Surroundings: time of day, location, weather (non-blocking, cached).
+    try:
+        lines.append("\n" + ambient.prompt_fragment())
+    except Exception:
+        lines.append(f"\nToday: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}")
+    # Affect: persona + live PAD mood + how to read the user this turn.
+    if persona_mod.ENABLED:
+        try:
+            us = _last_read.user_state if _last_read else "neutral"
+            gd = _last_read.guidance if _last_read else ""
+            sup = bool(_last_read.suppress_sarcasm) if _last_read else False
+            blk = _persona.style_block(nm, user_state=us, guidance=gd, suppress_sarcasm=sup)
+            if blk:
+                lines.append("\n" + blk)
+        except Exception:
+            pass
     if _last_device:
         h = _homeostasis(_last_device)
         if h["energy"] <= 0.33:
@@ -1682,6 +1729,16 @@ async def _run_sleep_cycle() -> None:
         _sleeping = False
 
 
+async def _ambient_loop() -> None:
+    """Keep the ambient snapshot (location, weather) warm in the background."""
+    while True:
+        try:
+            await asyncio.to_thread(ambient.refresh)
+        except Exception:
+            pass
+        await asyncio.sleep(int(os.environ.get("JARVIS_AMBIENT_REFRESH_SEC", "900")))
+
+
 async def _sleep_loop() -> None:
     """Idle + on AC → consolidate. The cheap gate makes a misfire nearly free."""
     while True:
@@ -1864,6 +1921,45 @@ def _deliberation_target(text: str):
 
 
 # ── Agent dispatch ──────────────────────────────────────────────────────────────
+# ── Affect + perception (per-turn) ──────────────────────────────────
+def _ambient_brief(snap: dict) -> dict:
+    """Trimmed ambient snapshot for the UI / status payload."""
+    loc = (snap or {}).get("location") or {}
+    wx = (snap or {}).get("weather") or {}
+    return {"time": (snap or {}).get("time_str"), "tod": (snap or {}).get("tod_label"),
+            "city": loc.get("city"), "country": loc.get("country_code"),
+            "temp_c": wx.get("temp_c"), "weather": wx.get("label"),
+            "tz": (snap or {}).get("tz")}
+
+
+def _pop_audio_arousal():
+    """Consume the most recent mic-loudness arousal hint (voice turns only)."""
+    global _audio_arousal
+    v, _audio_arousal = _audio_arousal, None
+    return v
+
+
+async def _update_affect(text: str) -> None:
+    """Perceive the user, decay + nudge JARVIS's mood, surface it. Best-effort —
+    never breaks the turn if anything here misfires."""
+    global _last_read
+    if not persona_mod.ENABLED:
+        return
+    try:
+        _persona.tick()
+        amb = ambient.snapshot()
+        reask = bool(_REASK_RE.search(text))
+        read = perception.analyze(text, hour=amb.get("hour"),
+                                  acoustic_arousal=_pop_audio_arousal(), reask=reask)
+        _persona.apply(read.pad_nudge, read.user_state)
+        _last_read = read
+        await asyncio.to_thread(_persona.save)
+        await broadcast({"type": "emotion", "emotion": _persona.snapshot(),
+                         "read": read.summary(), "ambient": _ambient_brief(amb)})
+    except Exception:
+        pass
+
+
 async def handle_command(text: str) -> None:
     global _filler_sent, _last_activity
 
@@ -1872,6 +1968,7 @@ async def handle_command(text: str) -> None:
 
     _last_activity = time.time()
     _filler_sent = False   # reset the slow-tool filler gate for this turn
+    await _update_affect(text)
     await broadcast({"type": "state", "status": "thinking", "text": "Processing directive..."})
 
     try:
@@ -1889,6 +1986,29 @@ async def handle_command(text: str) -> None:
 
 
 # ── TTS ────────────────────────────────────────────────────────────────────────
+def _sum_signed_pct(a: str, b: str) -> str:
+    n = int(re.sub(r"[^0-9+-]", "", a) or 0) + int(re.sub(r"[^0-9+-]", "", b) or 0)
+    return f"{max(-40, min(40, n)):+d}%"
+
+
+def _sum_signed_hz(a: str, b: str) -> str:
+    n = int(re.sub(r"[^0-9+-]", "", a) or 0) + int(re.sub(r"[^0-9+-]", "", b) or 0)
+    return f"{max(-30, min(30, n)):+d}Hz"
+
+
+def _voice_params(base_rate: str) -> tuple[str, str]:
+    """Blend the homeostasis TTS rate with a subtle mood bias from the persona."""
+    rate, pitch = base_rate, TTS_PITCH
+    if persona_mod.ENABLED:
+        try:
+            bias = _persona.tts_bias()
+            rate = _sum_signed_pct(base_rate, bias["rate"])
+            pitch = _sum_signed_hz(TTS_PITCH, bias["pitch"])
+        except Exception:
+            pass
+    return rate, pitch
+
+
 async def _speak(text: str) -> None:
     global _speaking_text
     try:
@@ -1906,8 +2026,9 @@ async def _speak(text: str) -> None:
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
         audio_bytes = b""
-        rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
-        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=TTS_PITCH)
+        base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
+        rate, pitch = _voice_params(base_rate)
+        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
@@ -2022,9 +2143,14 @@ def _voice_worker() -> None:
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
     def _flush(utterance: list) -> None:
+        global _audio_arousal
         if len(utterance) < MIN_UTTER_CHUNKS:
             return
         all_audio = np.concatenate(utterance, axis=0)
+        try:
+            _audio_arousal = float(min(1.0, max(0.0, (np.abs(all_audio).mean() - 300) / 1500.0)))
+        except Exception:
+            _audio_arousal = None
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
@@ -2144,6 +2270,9 @@ async def agent_status() -> dict:
             "available": sorted(_available_rungs()),
             "metrics":   _gov.metrics(),
         },
+        "emotion": _persona.snapshot() if persona_mod.ENABLED else {"enabled": False},
+        "ambient": _ambient_brief(ambient.snapshot()),
+        "perception": _last_read.summary() if _last_read else None,
         "homeostasis": _homeostasis(_last_device) if _last_device else None,
         "device_tier": (_last_device or {}).get("tier"),
         "local": {"enabled": _LOCAL_OK, "fast": LOCAL_FAST, "deep": LOCAL_DEEP},
