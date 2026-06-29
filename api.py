@@ -152,20 +152,35 @@ def _active_model() -> str:
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
-@asynccontextmanager
-async def _lifespan(app: FastAPI):
-    global _main_loop, _sleep_task, _ambient_task, _last_device
-    _main_loop = asyncio.get_event_loop()
-    await asyncio.to_thread(_detect_local_models)
+async def _boot_probe():
+    """Hardware + local-model detection, OFF the startup critical path — an Ollama
+    probe or device scan can be slow or hang, and must not delay serving requests."""
+    global _last_device
+    try:
+        await asyncio.to_thread(_detect_local_models)
+    except Exception:
+        pass
     try:
         _last_device = await asyncio.to_thread(device.profile)
     except Exception:
         _last_device = {}
+    try:
+        print(f"[JARVIS] Governor rungs: {sorted(_available_rungs())} | "
+              f"tier: {(_last_device or {}).get('tier')} | local: {LOCAL_FAST if _LOCAL_OK else 'off'}")
+    except Exception:
+        pass
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    global _main_loop, _sleep_task, _ambient_task, _boot_task
+    _main_loop = asyncio.get_event_loop()
     brain = "Groq" if (USE_GROQ and _HAS_GROQ) else "Claude" if (USE_CLAUDE and _HAS_ANTHROPIC) else "Ollama"
-    print(f"[JARVIS] Online — cloud: {_active_model()} ({brain}) | local: {LOCAL_FAST if _LOCAL_OK else 'off'}")
-    print(f"[JARVIS] Governor rungs: {sorted(_available_rungs())} | tier: {(_last_device or {}).get('tier')}")
+    print(f"[JARVIS] Online — cloud: {_active_model()} ({brain})")
     print(f"[JARVIS] Memory: {len(memories)} | Tasks: {len(task_list)} | Tools: {len(TOOLS)}")
     print(f"[JARVIS] Affect: emotion={'on' if persona_mod.ENABLED else 'off'} ({persona_mod.SARCASM}) | ambient awareness on")
+    # Background tasks (don't block serving): hardware probe, sleep cycle, ambient.
+    _boot_task = asyncio.create_task(_boot_probe())
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
@@ -176,16 +191,18 @@ async def _lifespan(app: FastAPI):
     else:
         print("[JARVIS] Dev mode — UI served by Vite on :8080")
     yield
-    if _sleep_task:
-        _sleep_task.cancel()
-    if _ambient_task:
-        _ambient_task.cancel()
+    for _t in (_boot_task, _sleep_task, _ambient_task):
+        if _t:
+            _t.cancel()
 
 
 app = FastAPI(title="JARVIS Backend", docs_url=None, redoc_url=None, lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    # Local desktop app only — never the open internet. Allows any localhost port
+    # (Vite dev, packaged SPA) + Electron file/app origins; blocks external sites
+    # from reaching the backend through the user's browser.
+    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|file://.*|app://.*)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -225,6 +242,7 @@ IDLE_SLEEP_MIN = int(os.environ.get("JARVIS_SLEEP_IDLE_MIN", "3"))
 _audio_arousal: float | None = None   # mic-loudness arousal hint (voice turns only)
 _last_read = None                      # last perception.Read (drives prompt + UI)
 _ambient_task = None                   # background ambient (weather/location) refresher
+_boot_task = None                      # one-shot hardware/local-model probe (off critical path)
 
 
 # ── Memory + persistence ────────────────────────────────────────────────────────
