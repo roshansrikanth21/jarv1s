@@ -684,7 +684,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "get_system_info":
         cpu  = psutil.cpu_percent(interval=0.5)
         vm   = psutil.virtual_memory()
-        disk = psutil.disk_usage("C:\\")
+        disk = psutil.disk_usage(os.path.abspath(os.sep))
         procs = sorted(
             psutil.process_iter(["name", "cpu_percent"]),
             key=lambda p: p.info.get("cpu_percent") or 0,
@@ -901,7 +901,7 @@ def _watch_video(source: str, question: str = "") -> str:
         return "Video deps missing. Run: pip install opencv-python-headless yt-dlp."
 
     # Work + temp files on a drive with space (K: if present, else system temp).
-    tmp_root = "K:\\jarvis_tmp" if os.path.isdir("K:\\") else tempfile.gettempdir()
+    tmp_root = os.environ.get("JARVIS_TMP") or tempfile.gettempdir()
     os.makedirs(tmp_root, exist_ok=True)
     workdir = tempfile.mkdtemp(dir=tmp_root)
     video_path = source
@@ -2252,7 +2252,7 @@ def _voice_worker() -> None:
 async def agent_status() -> dict:
     cpu  = psutil.cpu_percent(interval=0)
     vm   = psutil.virtual_memory()
-    disk = psutil.disk_usage("C:\\")
+    disk = psutil.disk_usage(os.path.abspath(os.sep))
     return {
         "brain": {
             "primary_llm":          _active_model(),
