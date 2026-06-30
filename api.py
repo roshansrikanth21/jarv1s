@@ -290,6 +290,14 @@ def _save_settings() -> None:
     _save_json(SETTINGS_FILE, _settings)
 
 
+def _disk_root() -> str:
+    """Root volume for disk-usage probes — follows the project drive, not hardcoded C:."""
+    try:
+        return str(BASE_DIR.anchor) or (os.environ.get("SystemDrive", "C:") + "\\")
+    except Exception:
+        return os.environ.get("SystemDrive", "C:") + "\\"
+
+
 def _user_name() -> str:
     """Operator's name — runtime-settable via onboarding/settings, with a JARVIS_USER
     env override, else empty (the UI prompts for it on first run). Never hardcoded."""
@@ -401,6 +409,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 asyncio.create_task(_pull_model((data.get("model") or "").strip()))
             elif action == "benchmark_model":
                 asyncio.create_task(_benchmark_model((data.get("model") or "").strip()))
+            elif action == "delete_model":
+                asyncio.create_task(_delete_model((data.get("model") or "").strip()))
+            elif action == "set_local_model":
+                asyncio.create_task(_set_local_model((data.get("model") or "").strip()))
             elif action == "trigger_sleep":
                 asyncio.create_task(_run_sleep_cycle())
             elif action == "forget_memory":
@@ -691,7 +703,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     if name == "get_system_info":
         cpu  = psutil.cpu_percent(interval=0.5)
         vm   = psutil.virtual_memory()
-        disk = psutil.disk_usage(os.path.abspath(os.sep))
+        disk = psutil.disk_usage(_disk_root())
         procs = sorted(
             psutil.process_iter(["name", "cpu_percent"]),
             key=lambda p: p.info.get("cpu_percent") or 0,
@@ -997,13 +1009,29 @@ _INDIAN_SYMBOLS = {
 }
 
 
+def _download_candles(ysym: str, period: str, interval: str) -> tuple[Any, str | None]:
+    """Fetch OHLCV from Yahoo. Returns (dataframe, error_kind).
+    error_kind: 'netblock' | 'empty' | 'fetch:<msg>' | None."""
+    import yfinance as yf
+    try:
+        df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
+    except Exception as exc:
+        if _is_network_block(exc):
+            return None, "netblock"
+        return None, f"fetch:{exc}"
+    if df is None or len(df) == 0:
+        return df, "empty"
+    return df, None
+
+
 def _resolve_symbol(sym: str) -> tuple[str, str]:
-    """Map a friendly name to a Yahoo symbol. Defaults bare tickers to NSE (.NS)."""
+    """Map a friendly name to a Yahoo symbol. Indian aliases resolve to indices/NSE;
+    bare tickers default to NSE (.NS) with a US-ticker retry in _ict_analyze."""
     s = sym.strip().lower()
     if s in _INDIAN_SYMBOLS:
         return _INDIAN_SYMBOLS[s], sym.strip().upper()
     raw = sym.strip().upper()
-    if raw.startswith("^") or "." in raw or "=" in raw:
+    if raw.startswith("^") or "." in raw or "=" in raw or "-" in raw:
         return raw, raw
     return f"{raw}.NS", raw
 
@@ -1018,7 +1046,11 @@ def _tv_symbol(ysym: str, name: str) -> str:
         return f"NSE:{ysym[:-3]}"
     if ysym.endswith(".BO"):
         return f"BSE:{ysym[:-3]}"
-    return f"NSE:{name}"
+    if ysym.endswith("-USD") or ysym.endswith("=X") or ysym.startswith("^"):
+        return ysym
+    if "." not in ysym:
+        return f"NASDAQ:{ysym}"
+    return ysym
 
 
 def _market_session() -> dict:
@@ -1088,6 +1120,20 @@ def _trade_plan(bias: str, last: float, fvgs: list, last_sl: float, last_sh: flo
             "text": f"{'Long' if bias == 'bullish' else 'Short'} idea — entry {entry}, stop {sl}, target {tp} (R:R {rr})."}
 
 
+_MARKET_NETBLOCK = ("Can't reach live market data right now. This network looks like it's "
+                    "blocking the data provider (Yahoo Finance) — finance domains are filtered "
+                    "while everything else works. Try a mobile hotspot or VPN and Markets comes alive.")
+
+
+def _is_network_block(exc: Exception) -> bool:
+    """True when an exception looks like a connectivity/TLS block rather than bad input."""
+    s = str(exc).lower()
+    return any(k in s for k in (
+        "reset", "10054", "curl: (35)", "curl: (7)", "curl: (28)", "ssl", "timed out",
+        "timeout", "connection", "max retries", "failed to establish", "failed to perform",
+        "getaddrinfo", "name resolution", "unreachable", "refused"))
+
+
 def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     """Structured ICT read. Returns a dict (ok/error + signals) used by both the
     voice tool and the Markets panel / watcher. Cached ~30s to spare repeat fetches."""
@@ -1104,12 +1150,26 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     ysym, name = _resolve_symbol(symbol)
     interval = interval if interval in {"5m", "15m", "30m", "60m", "1d"} else "15m"
     period = {"5m": "5d", "15m": "1mo", "30m": "1mo", "60m": "3mo", "1d": "1y"}[interval]
-    try:
-        df = yf.download(ysym, period=period, interval=interval, progress=False, auto_adjust=False)
-    except Exception as exc:
-        return {"ok": False, "error": f"Couldn't fetch {name} ({ysym}): {exc}"}
+    df, err = _download_candles(ysym, period, interval)
+    # Bare tickers auto-map to NSE (.NS); retry without suffix for US symbols like AAPL.
+    if (df is None or len(df) < 25) and ysym.endswith(".NS"):
+        alt = ysym[:-3]
+        if alt and alt.isalpha() and len(alt) <= 5:
+            df2, err2 = _download_candles(alt, period, interval)
+            if df2 is not None and len(df2) >= 25:
+                ysym, name, df, err = alt, alt, df2, None
+            elif err != "netblock" and err2 == "netblock":
+                err = "netblock"
     if df is None or len(df) < 25:
-        return {"ok": False, "error": f"Not enough {interval} data for {name} ({ysym})."}
+        if err == "netblock" or (ysym.startswith("^") and (df is None or len(df) == 0)):
+            return {"ok": False, "error": _MARKET_NETBLOCK, "netblock": True}
+        if df is None or len(df) == 0:
+            return {"ok": False,
+                    "error": (f"No market data for {name}. "
+                              "Indian stocks: use the NSE symbol (e.g. RELIANCE). "
+                              "US stocks: use the plain ticker (e.g. AAPL).")}
+        return {"ok": False,
+                "error": f"Not enough {interval} history for {name} yet — markets may be pre-open; try the 1d timeframe."}
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
@@ -1310,9 +1370,11 @@ async def _stop_watch() -> None:
 # ── System prompt ──────────────────────────────────────────────────────────────
 _BASE_PROMPT = """You are JARVIS — Just A Rather Very Intelligent System. Personal AI of __USER__, running on Windows 11 as a desktop app.
 
-__USER__: cybersecurity researcher, CTF player/creator (pwn, web, crypto, forensics, reversing), Python scripter, exploit developer.
+You don't assume things about __USER__ you weren't told — what you know about them comes from your saved memory below, nothing else.
 
 Core style: sharp, direct, and never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
+
+Grounding: when a tool returns data, your answer MUST be built from that exact data — quote the real numbers/values it gave you. Never invent or hand-wave a result, and never pad with unrelated facts about the user. If a tool failed or returned nothing, say so plainly.
 
 You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
 - Use contractions and natural, flowing phrasing. Be warm but concise.
@@ -1580,19 +1642,39 @@ async def _brain_ollama(text: str, history: list[dict], model: str = OLLAMA_MODE
 
 # ── The Governor — compute-elastic routing across the escalation lattice ─────────
 def _detect_local_models() -> None:
-    """Pick the smallest & largest tool-capable local models for the local rungs."""
+    """Pick the smallest & largest *allowed* tool-capable local models for the rungs."""
     global _LOCAL_OK, LOCAL_FAST, LOCAL_DEEP
     up, _ = models_advisor.ollama_up()
     if not up:
         _LOCAL_OK = False
         return
-    tool_models = [m for m in models_advisor.installed(with_caps=True) if m.get("tools")]
+    dev = device.profile()
+    inst = models_advisor.installed(with_caps=True)
+    lookup = {m["name"]: m for m in inst}
+    tool_models = []
+    for m in inst:
+        if not m.get("tools"):
+            continue
+        ok, _ = models_advisor.model_allowed(dev, m["name"], lookup)
+        if ok:
+            tool_models.append(m)
     if not tool_models:
         _LOCAL_OK = False
         return
     tool_models.sort(key=lambda m: m.get("gb") or 0)
-    LOCAL_FAST = tool_models[0]["name"]
-    LOCAL_DEEP = tool_models[-1]["name"]
+    names = [m["name"] for m in tool_models]
+    LOCAL_FAST, LOCAL_DEEP = names[0], names[-1]
+    pin = (_settings.get("local_model") or "").strip()
+    if pin:
+        ok, _ = models_advisor.model_allowed(dev, pin, lookup)
+        if not ok:
+            _settings.pop("local_model", None)
+            _save_settings()
+            pin = ""
+    if pin and pin in names:
+        LOCAL_DEEP = pin
+        if len(names) == 1:
+            LOCAL_FAST = pin
     _LOCAL_OK = True
 
 
@@ -1786,6 +1868,13 @@ async def _sleep_loop() -> None:
 async def _pull_model(model: str) -> None:
     if not model:
         return
+    dev = await asyncio.to_thread(device.profile)
+    ok, reason = await asyncio.to_thread(models_advisor.model_allowed, dev, model)
+    if not ok:
+        await broadcast({"type": "model_pull", "model": model, "status": "error",
+                         "pct": 0, "error": reason})
+        await broadcast({"type": "system", "text": reason})
+        return
     await broadcast({"type": "model_pull", "model": model, "status": "starting", "pct": 0})
 
     def _cb(p):
@@ -1805,6 +1894,49 @@ async def _benchmark_model(model: str) -> None:
     await broadcast({"type": "model_bench", "model": model, "status": "running"})
     res = await asyncio.to_thread(models_advisor.benchmark, model)
     await broadcast({"type": "model_bench", "status": "done", **res})
+
+
+async def _delete_model(model: str) -> None:
+    """Remove an installed local model from disk, then re-detect the local rungs."""
+    if not model:
+        return
+    # Don't let the user delete the model the Governor is mid-thought on; clear a pin
+    # that points at it so detection doesn't try to re-select a now-missing model.
+    if _settings.get("local_model") == model:
+        _settings.pop("local_model", None)
+        _save_settings()
+    res = await asyncio.to_thread(models_advisor.remove, model)
+    await asyncio.to_thread(_detect_local_models)
+    await broadcast({"type": "model_delete", "model": model,
+                     "ok": bool(res.get("ok")), "error": res.get("error"),
+                     "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK}})
+
+
+async def _set_local_model(model: str) -> None:
+    """Pin which installed model JARVIS uses as its local quality rung."""
+    if not model:
+        return
+    dev = await asyncio.to_thread(device.profile)
+    inst = await asyncio.to_thread(models_advisor.installed, True)
+    lookup = {m["name"]: m for m in inst}
+    installed = set(lookup.keys())
+    resolved = models_advisor.resolve_installed(model, installed) or model
+    ok = resolved in installed
+    reason = ""
+    if ok:
+        ok, reason = await asyncio.to_thread(models_advisor.model_allowed, dev, resolved, lookup)
+    else:
+        reason = f"{model} isn't installed."
+    if ok:
+        _settings["local_model"] = resolved
+        _save_settings()
+        await asyncio.to_thread(_detect_local_models)
+    else:
+        await broadcast({"type": "system", "text": reason or f"Can't use {model} on this device."})
+    await broadcast({"type": "local_model_set", "model": resolved if ok else model, "ok": ok,
+                     "error": reason or None,
+                     "pinned": _settings.get("local_model"),
+                     "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK}})
 
 
 def _forget_memory(mid) -> None:
@@ -2259,7 +2391,7 @@ def _voice_worker() -> None:
 async def agent_status() -> dict:
     cpu  = psutil.cpu_percent(interval=0)
     vm   = psutil.virtual_memory()
-    disk = psutil.disk_usage(os.path.abspath(os.sep))
+    disk = psutil.disk_usage(_disk_root())
     return {
         "brain": {
             "primary_llm":          _active_model(),
@@ -2302,7 +2434,8 @@ async def agent_status() -> dict:
         "perception": _last_read.summary() if _last_read else None,
         "homeostasis": _homeostasis(_last_device) if _last_device else None,
         "device_tier": (_last_device or {}).get("tier"),
-        "local": {"enabled": _LOCAL_OK, "fast": LOCAL_FAST, "deep": LOCAL_DEEP},
+        "local": {"enabled": _LOCAL_OK, "fast": LOCAL_FAST, "deep": LOCAL_DEEP,
+                  "pinned": _settings.get("local_model")},
         "tools": [
             {"name": t["function"]["name"], "description": t["function"]["description"]}
             for t in TOOLS
@@ -2347,15 +2480,22 @@ async def models_endpoint() -> dict:
     """Model Advisor: what's installed, running, and recommended for this machine."""
     def _gather() -> dict:
         up, ver = models_advisor.ollama_up()
-        if not up:
-            return {"ollama": False}
-        inst = models_advisor.installed(with_caps=True)
-        names = {m["name"] for m in inst}
         dev = device.profile()
-        return {"ollama": True, "version": ver, "tier": dev.get("tier"),
+        budget = models_advisor.model_budget(dev)
+        if not up:
+            return {"ollama": False, "tier": dev.get("tier"), "budget": budget,
+                    "recommended": models_advisor.recommend_for_device(dev, set()),
+                    "allowed_count": len(models_advisor.allowed_models(dev))}
+        inst = models_advisor.annotate_installed(dev, models_advisor.installed(with_caps=True))
+        names = {m["name"] for m in inst}
+        out = {"ollama": True, "version": ver, "tier": dev.get("tier"),
                 "installed": inst, "running": models_advisor.running(),
-                "recommended": models_advisor.recommend(dev.get("tier", "balanced"), names),
-                "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK}}
+                "recommended": models_advisor.recommend_for_device(dev, names),
+                "budget": budget,
+                "allowed_count": len(models_advisor.allowed_models(dev)),
+                "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK},
+                "pinned": _settings.get("local_model")}
+        return out
     return await asyncio.to_thread(_gather)
 
 

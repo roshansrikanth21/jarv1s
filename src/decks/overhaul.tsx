@@ -64,7 +64,7 @@ type AgentStatus = {
 type CouncilState = { active: boolean; panel: string[]; proposals: { model: string; text: string }[]; verdict: string };
 type TradePlan = { side: string; entry?: number; sl?: number; tp?: number; rr?: number; text: string };
 type IctRead = {
-  ok: boolean; error?: string;
+  ok: boolean; error?: string; netblock?: boolean;
   symbol?: string; tv?: string; interval?: string; last?: number;
   bias?: "bullish" | "bearish" | "neutral"; structure?: string;
   bos?: string; sweep?: string; order_block?: string; read?: string;
@@ -85,13 +85,30 @@ type DeviceBrief = {
   headroom?: number; ram_available_gb?: number; cpu_percent?: number;
 };
 type Rung = { id: string; label: string; kind: string; tier: number; quality: number; energy: number; latency: number; available: boolean };
-type InstalledModel = { name: string; gb: number | null; params?: string; quant?: string; tools?: boolean };
-type ModelRec = { tag: string; params: string; gb: number; note: string; installed: boolean };
+type InstalledModel = { name: string; gb: number | null; params?: string; quant?: string; tools?: boolean;
+  runnable?: boolean; block_reason?: string | null };
+type ModelRec = {
+  tag: string; params: string; gb: number; ctx?: string; tools?: boolean;
+  best?: boolean; installed?: boolean; best_for?: string; limits?: string; note?: string;
+  needs_gb?: number;
+};
+type ModelBudget = {
+  ram_total_gb: number; ram_available_gb: number; ram_reserve_gb: number;
+  budget_gb: number; vram_gb: number; gpu_accel: boolean;
+  instant_tight?: boolean; local_viable?: boolean;
+  cpu_score?: number; gpu_score?: number; compute_score?: number;
+  compute_label?: string; max_params_b?: number;
+  cpu_cores?: number; cpu_threads?: number; cpu_ghz?: number | null;
+  gpu_name?: string | null;
+};
 type ModelsData = {
   ollama: boolean; version?: string; tier?: string;
   installed?: InstalledModel[];
   running?: { name: string; gb: number | null; on_gpu: boolean }[];
-  recommended?: ModelRec[]; active?: { fast: string; deep: string; enabled: boolean };
+  recommended?: ModelRec[];
+  active?: { fast: string; deep: string; enabled: boolean };
+  pinned?: string | null;
+  budget?: ModelBudget;
 };
 type MemItem = { id: number; content: string; category: string; importance: number; source: string };
 
@@ -199,7 +216,6 @@ function CommandDeck() {
   const [voiceId, setVoiceId]       = useState("");
   const [settingsOpen, setSettingsOpen]         = useState(false);
   const [helpOpen, setHelpOpen]                 = useState(false);
-  const [onboardDismissed, setOnboardDismissed] = useState(false);
   const [mktSymbol, setMktSymbol]   = useState("nifty");
   const [mktData, setMktData]       = useState<IctRead | null>(null);
   const [mktLoading, setMktLoading] = useState(false);
@@ -221,7 +237,8 @@ function CommandDeck() {
   const audioRef    = useRef<HTMLAudioElement | null>(null);
   const scrollRef   = useRef<HTMLDivElement | null>(null);
   const inputRef    = useRef<HTMLInputElement | null>(null);
-  const fetchMemRef = useRef<() => void>(null!);
+  const fetchModelsRef = useRef<() => void>(null!);
+  const fetchMemRef    = useRef<() => void>(null!);
 
   // Stable refs so callbacks never recreate (avoids useEffect re-run loop)
   const addLineRef      = useRef<(role: LineRole, text: string) => void>(null!);
@@ -357,8 +374,19 @@ function CommandDeck() {
           flashReactorRef.current();
         }
         if (d.type === "governor_mode" && d.mode) setGovMode(String(d.mode));
-        if (d.type === "model_pull") setPulls(p => ({ ...p, [String(d.model)]: { status: String(d.status ?? ""), pct: Number(d.pct) || 0 } }));
+        if (d.type === "model_pull") {
+          setPulls(p => ({ ...p, [String(d.model)]: { status: String(d.status ?? ""), pct: Number(d.pct) || 0 } }));
+          const done = d.status === "success" || d.status === "done" || (Number(d.pct) || 0) >= 100;
+          if (d.status === "error" && d.error) addLineRef.current("system", String(d.error));
+          if (done) fetchModelsRef.current?.();
+        }
         if (d.type === "model_bench") setBench(b => ({ ...b, [String(d.model)]: { tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined, status: String(d.status ?? "") } }));
+        if (d.type === "model_delete" || d.type === "local_model_set") {
+          if (d.type === "local_model_set" && d.ok === false && d.error) {
+            addLineRef.current("system", String(d.error));
+          }
+          fetchModelsRef.current?.();
+        }
         if (d.type === "sleep") {
           setSleepMsg(d.state === "start" ? "Consolidating memory…" : (txt || "rested"));
           if (d.state === "done") { fetchMemRef.current?.(); window.setTimeout(() => setSleepMsg(null), 6000); }
@@ -423,15 +451,11 @@ function CommandDeck() {
   // Sync watcher state from periodic status refreshes.
   useEffect(() => { setWatching(Boolean(agentStatus.watch?.watching)); }, [agentStatus.watch?.watching]);
 
-  // First run: if the backend has no operator name yet, open onboarding (once).
-  useEffect(() => {
-    if (agentStatus.user && !agentStatus.user.onboarded && !onboardDismissed) setSettingsOpen(true);
-  }, [agentStatus.user, onboardDismissed]);
-
   // Governor / Model Advisor / Memory data.
   const fetchModels = useCallback(async () => {
     try { const r = await fetch("/api/models"); setModels(await r.json()); } catch { /* silent */ }
   }, []);
+  fetchModelsRef.current = fetchModels;
   const fetchMemory = useCallback(async () => {
     try { const r = await fetch("/api/memory"); const d = await r.json(); setMemItems(d.memories ?? []); } catch { /* silent */ }
   }, []);
@@ -459,8 +483,22 @@ function CommandDeck() {
     setGovMode(m);
     wsRef.current?.send(JSON.stringify({ action: "set_mode", mode: m }));
   }, []);
-  const onPull  = useCallback((tag: string)  => { wsRef.current?.send(JSON.stringify({ action: "pull_model", model: tag })); }, []);
+  const onPull  = useCallback((tag: string) => {
+    const ok = models?.recommended?.some(r => r.tag === tag);
+    if (!ok) return;
+    wsRef.current?.send(JSON.stringify({ action: "pull_model", model: tag }));
+  }, [models?.recommended]);
   const onBench = useCallback((name: string) => { wsRef.current?.send(JSON.stringify({ action: "benchmark_model", model: name })); }, []);
+  const onUse   = useCallback((name: string) => {
+    const mod = models?.installed?.find(m => m.name === name);
+    if (mod && mod.runnable === false) return;
+    wsRef.current?.send(JSON.stringify({ action: "set_local_model", model: name }));
+  }, [models?.installed]);
+  const onDelete = useCallback((name: string) => {
+    if (!window.confirm(`Delete ${name} from disk? You'll need to download it again to use it.`)) return;
+    wsRef.current?.send(JSON.stringify({ action: "delete_model", model: name }));
+    setBench(b => { const n = { ...b }; delete n[name]; return n; });
+  }, []);
   const onForget = useCallback((id: number) => {
     wsRef.current?.send(JSON.stringify({ action: "forget_memory", id }));
     setMemItems(prev => prev.filter(m => m.id !== id));
@@ -521,7 +559,6 @@ function CommandDeck() {
   const voiceOptions = agentStatus.voice?.options ?? [];
   const currentVoice = voiceId || agentStatus.voice?.current || "";
   const userName     = agentStatus.user?.name ?? "";
-  const needsOnboard = Boolean(agentStatus.user) && !agentStatus.user?.onboarded;
   const activeTsk = tasks.find(t => t.status === "active");
   const qTasks    = tasks.filter(t => t.status === "queued");
   const doneTasks = tasks.filter(t => t.status === "done").slice(-4).reverse();
@@ -884,7 +921,8 @@ function CommandDeck() {
               {rightTab === "rig" && (
                 <motion.div key="rig" className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }} animate={{ opacity: 1, x: 0 }} exit={{ opacity: 0, x: -12 }} transition={{ duration: 0.2 }}>
-                  <RigPanel models={models} pulls={pulls} bench={bench} onPull={onPull} onBench={onBench} />
+                  <RigPanel models={models} pulls={pulls} bench={bench}
+                    onPull={onPull} onBench={onBench} onUse={onUse} onDelete={onDelete} />
                 </motion.div>
               )}
 
@@ -930,18 +968,17 @@ function CommandDeck() {
 
       <SettingsModal
         open={settingsOpen}
-        onboarding={needsOnboard}
         name={userName}
         voiceOptions={voiceOptions}
         currentVoice={currentVoice}
-        onClose={() => { setSettingsOpen(false); setOnboardDismissed(true); }}
+        onClose={() => setSettingsOpen(false)}
         onSave={(nm, voice) => {
           if (nm && nm !== userName) wsRef.current?.send(JSON.stringify({ action: "set_name", name: nm }));
           if (voice && voice !== currentVoice) {
             setVoiceId(voice);
             wsRef.current?.send(JSON.stringify({ action: "set_voice", voice }));
           }
-          setSettingsOpen(false); setOnboardDismissed(true);
+          setSettingsOpen(false);
         }}
       />
       <HelpModal open={helpOpen} onClose={() => setHelpOpen(false)} onOpenSettings={() => setSettingsOpen(true)} />
@@ -1124,7 +1161,7 @@ function MarketsPanel(p: {
         <input
           value={custom} onChange={e => setCustom(e.target.value.toUpperCase())}
           onKeyDown={e => { if (e.key === "Enter" && custom.trim()) { p.setSymbol(custom.trim()); setCustom(""); } }}
-          placeholder="NSE…" spellCheck={false}
+          placeholder="NSE or US…" spellCheck={false}
           style={{ flex: 1, minWidth: 48, background: "transparent", color: AMBER, fontSize: 9.5,
             border: `1px solid ${AMBER}33`, borderRadius: 5, padding: "3px 5px", outline: "none", fontFamily: "inherit" }}
         />
@@ -1133,10 +1170,13 @@ function MarketsPanel(p: {
       {d?.ok && d.tv && <TradingViewChart tv={d.tv} />}
 
       {p.loading && !d && <p style={{ fontSize: 11, opacity: 0.5 }}>Reading the tape…</p>}
-      {d && !d.ok && <p style={{ fontSize: 10.5, opacity: 0.55, lineHeight: 1.4 }}>
-        Market data unavailable right now — the market may be closed or offline.
-        Live reads work during NSE hours (9:15–15:30 IST).
-      </p>}
+      {d && !d.ok && (
+        <p style={{ fontSize: 10.5, opacity: d.netblock ? 0.85 : 0.55, lineHeight: 1.45,
+          color: d.netblock ? AMBER : undefined, border: d.netblock ? `1px solid ${AMBER}33` : undefined,
+          padding: d.netblock ? "8px 10px" : 0, borderRadius: d.netblock ? 6 : 0 }}>
+          {d.error ?? "Market data unavailable right now — the market may be closed or offline. Live reads work during NSE hours (9:15–15:30 IST)."}
+        </p>
+      )}
 
       {d?.ok && (
         <>
@@ -1269,9 +1309,9 @@ function KeyField({ label, set, disabled, value, onChange, placeholder, onGet }:
 }
 
 function SettingsModal({
-  open, onboarding, name, voiceOptions, currentVoice, onClose, onSave,
+  open, name, voiceOptions, currentVoice, onClose, onSave,
 }: {
-  open: boolean; onboarding: boolean; name: string;
+  open: boolean; name: string;
   voiceOptions: { id: string; label: string }[]; currentVoice: string;
   onClose: () => void; onSave: (name: string, voice: string) => void;
 }) {
@@ -1315,7 +1355,7 @@ function SettingsModal({
         <motion.div
           className="hud-modal-overlay"
           initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
-          onClick={onboarding ? undefined : onClose}
+          onClick={onClose}
         >
           <motion.div
             className="hud-modal"
@@ -1326,20 +1366,15 @@ function SettingsModal({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="hud-modal-header">
-              <span>{onboarding ? "Initialize JARVIS" : "Settings"}</span>
-              {!onboarding && <IconBtn onClick={onClose} title="Close"><X className="w-3 h-3" /></IconBtn>}
+              <span>Settings</span>
+              <IconBtn onClick={onClose} title="Close"><X className="w-3 h-3" /></IconBtn>
             </div>
 
             <div className="hud-modal-body">
-              {onboarding && (
-                <p className="hud-modal-intro">
-                  I'm JARVIS — your personal AI. Talk or type to me and I'll pick the best AI model
-                  for each request based on your machine. What should I call you?
-                  <br /><br />
-                  <b style={{ color: "var(--c-amber)" }}>Tip:</b> for fast, smart answers, add a free
-                  Groq key below — without one I run on a smaller local model only.
-                </p>
-              )}
+              <p className="hud-modal-intro" style={{ marginBottom: 12 }}>
+                Change how JARVIS addresses you, which voice it uses, or add API keys for
+                faster cloud routing. Local models are managed in the <b style={{ color: "var(--c-amber)" }}>Models</b> tab.
+              </p>
 
               <label className="hud-field-label">Your name</label>
               <input
@@ -1387,15 +1422,13 @@ function SettingsModal({
             </div>
 
             <div className="hud-modal-footer">
-              <button className="hud-modal-btn hud-modal-btn--ghost" onClick={onClose}>
-                {onboarding ? "Later" : "Cancel"}
-              </button>
+              <button className="hud-modal-btn hud-modal-btn--ghost" onClick={onClose}>Cancel</button>
               <button
                 className="hud-modal-btn hud-modal-btn--primary"
                 disabled={!nm.trim()}
                 onClick={handleSave}
               >
-                {onboarding ? "Begin" : "Save"}
+                Save
               </button>
             </div>
           </motion.div>
@@ -1528,10 +1561,16 @@ function GovernorPanel(p: {
 }
 
 function RigPanel(p: {
-  models: ModelsData | null; pulls: Record<string, { status: string; pct: number }>;
-  bench: Record<string, { tok?: number; status: string }>; onPull: (t: string) => void; onBench: (n: string) => void;
+  models: ModelsData | null;
+  pulls: Record<string, { status: string; pct: number }>;
+  bench: Record<string, { tok?: number; status: string }>;
+  onPull: (t: string) => void;
+  onBench: (n: string) => void;
+  onUse: (n: string) => void;
+  onDelete: (n: string) => void;
 }) {
   const m = p.models;
+  const pinned = m?.pinned ?? m?.active?.deep ?? "";
   if (!m) return <EmptyPane text="Profiling your rig…" />;
   if (!m.ollama) {
     return (
@@ -1545,41 +1584,114 @@ function RigPanel(p: {
   }
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 9 }}>
-      <PanelIntro text="Local AI models on this PC. Benchmark them, or download better ones." />
+      <PanelIntro text="Local models matched to your CPU, GPU, and RAM. Pin, benchmark, download, or delete." />
       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, opacity: 0.65 }}>
         <span>Ollama {m.version ? `v${m.version}` : "online"}</span>
-        <span style={{ textTransform: "uppercase" }}>tier · {m.tier}</span>
+        <span style={{ textTransform: "uppercase" }}>
+          {m.budget
+            ? `${m.budget.compute_label ?? "—"} compute · ${m.budget.budget_gb}GB RAM budget`
+            : `tier · ${m.tier}`}
+        </span>
       </div>
+      {m.budget && (
+        <div style={{ fontSize: 9, opacity: 0.62, lineHeight: 1.45 }}>
+          {m.budget.cpu_cores ? `${m.budget.cpu_cores}c` : ""}
+          {m.budget.cpu_ghz ? ` @ ${m.budget.cpu_ghz}GHz` : ""}
+          {m.budget.gpu_name ? ` · ${m.budget.gpu_name}` : m.budget.gpu_accel ? " · GPU" : " · CPU inference"}
+          {typeof m.budget.max_params_b === "number" ? ` · up to ~${m.budget.max_params_b}B params` : ""}
+        </div>
+      )}
+      {m.budget && m.budget.local_viable === false && (
+        <p style={{ fontSize: 10.5, color: C_AMBER, opacity: 0.9, lineHeight: 1.45,
+          border: `1px solid ${C_AMBER}33`, padding: "8px 10px", borderRadius: 6 }}>
+          Not enough RAM for local models (~{m.budget.budget_gb}GB budget). Add a Groq key in Settings for cloud routing.
+        </p>
+      )}
+      {m.budget?.instant_tight && (
+        <p style={{ fontSize: 9.5, color: C_AMBER, opacity: 0.85, lineHeight: 1.4 }}>
+          RAM is tight ({m.budget.ram_available_gb}GB free) — close apps before pulling a large model.
+        </p>
+      )}
+      {m.active?.enabled && (
+        <div style={{ fontSize: 9.5, opacity: 0.7, lineHeight: 1.45, border: `1px solid ${C_AMBER}33`, padding: "6px 8px" }}>
+          Active rungs — fast: <b>{shortModel(m.active.fast)}</b>
+          {m.active.deep !== m.active.fast && <> · quality: <b>{shortModel(m.active.deep)}</b></>}
+          {pinned && <> · pinned: <b style={{ color: C_AMBER }}>{shortModel(pinned)}</b></>}
+        </div>
+      )}
       <p className="hud-section-divider" style={{ borderTop: "none", marginTop: 0 }}>installed</p>
-      {(m.installed ?? []).map(mod => {
+      {(m.installed ?? []).length === 0 ? (
+        <EmptyPane text="No models yet — pull a recommended one below." />
+      ) : (m.installed ?? []).map(mod => {
         const b = p.bench[mod.name];
+        const isPinned = mod.name === pinned;
+        const runnable = mod.runnable !== false;
         return (
-          <div key={mod.name} style={{ border: "1px solid var(--c-line)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
+          <div key={mod.name} style={{
+            border: `1px solid ${isPinned ? `${C_AMBER}66` : !runnable ? `${C_RED}33` : "var(--c-line)"}`,
+            background: isPinned ? `${C_AMBER}0a` : !runnable ? `${C_RED}06` : "transparent",
+            padding: "6px 8px", display: "flex", flexDirection: "column", gap: 5,
+            opacity: runnable ? 1 : 0.72,
+          }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
               <span style={{ fontSize: 10, wordBreak: "break-all" }}>{mod.name}</span>
-              {mod.tools && <span style={{ fontSize: 7.5, color: C_GREEN, border: `1px solid ${C_GREEN}55`, padding: "0 4px", borderRadius: 3, textTransform: "uppercase", flexShrink: 0 }}>tools</span>}
+              <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                {isPinned && <span style={{ fontSize: 7.5, color: C_AMBER, border: `1px solid ${C_AMBER}55`, padding: "0 4px", borderRadius: 3, textTransform: "uppercase" }}>active</span>}
+                {!runnable && <span style={{ fontSize: 7.5, color: C_RED, border: `1px solid ${C_RED}55`, padding: "0 4px", borderRadius: 3, textTransform: "uppercase" }}>blocked</span>}
+                {mod.tools && runnable && <span style={{ fontSize: 7.5, color: C_GREEN, border: `1px solid ${C_GREEN}55`, padding: "0 4px", borderRadius: 3, textTransform: "uppercase" }}>tools</span>}
+              </div>
             </div>
+            {!runnable && mod.block_reason && (
+              <span style={{ fontSize: 9, color: C_RED, opacity: 0.85, lineHeight: 1.35 }}>{mod.block_reason}</span>
+            )}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 9, opacity: 0.6 }}>
               <span>{mod.params ?? ""}{mod.gb ? ` · ${mod.gb}GB` : ""}</span>
-              <button onClick={() => p.onBench(mod.name)} style={benBtn}>
-                {b?.status === "running" ? "…" : b?.tok ? `${b.tok} tok/s` : "benchmark"}
-              </button>
+              <div style={{ display: "flex", gap: 4 }}>
+                {runnable && mod.tools && !isPinned && (
+                  <button onClick={() => p.onUse(mod.name)} style={benBtn} title="Use as quality model">use</button>
+                )}
+                {runnable && (
+                  <button onClick={() => p.onBench(mod.name)} style={benBtn}>
+                    {b?.status === "running" ? "…" : b?.tok ? `${b.tok} tok/s` : "benchmark"}
+                  </button>
+                )}
+                <button onClick={() => p.onDelete(mod.name)} style={{ ...benBtn, borderColor: `${C_RED}44`, color: C_RED }} title="Delete from disk">
+                  <Trash2 size={10} style={{ display: "inline", verticalAlign: "middle" }} />
+                </button>
+              </div>
             </div>
           </div>
         );
       })}
-      <p className="hud-section-divider">recommended · {m.tier}</p>
-      {(m.recommended ?? []).map(rec => {
+      <p className="hud-section-divider">available for your device</p>
+      {(m.recommended ?? []).length === 0 ? (
+        <EmptyPane text="No local models fit this hardware — use a Groq key for cloud AI." />
+      ) : (m.recommended ?? []).map(rec => {
         const pull = p.pulls[rec.tag];
+        const installing = pull && pull.status !== "success" && pull.status !== "done" && pull.pct < 100;
         return (
-          <div key={rec.tag} style={{ border: "1px solid var(--c-line)", padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <span style={{ fontSize: 10 }}>{rec.tag}</span>
-              {rec.installed ? <span style={{ fontSize: 8, color: C_GREEN, textTransform: "uppercase" }}>installed</span>
-                : pull ? <span style={{ fontSize: 8, color: C_AMBER }}>{pull.status === "success" || pull.pct >= 100 ? "done" : `${pull.pct}%`}</span>
-                : <button onClick={() => p.onPull(rec.tag)} style={benBtn}>pull</button>}
+          <div key={rec.tag} style={{
+            border: `1px solid ${rec.best ? `${C_AMBER}44` : "var(--c-line)"}`,
+            background: rec.best ? `${C_AMBER}06` : "transparent",
+            padding: "6px 8px", display: "flex", flexDirection: "column", gap: 4,
+          }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+              <span style={{ fontSize: 10, fontWeight: rec.best ? 600 : 400 }}>{rec.tag}</span>
+              <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+                {rec.best && <span style={{ fontSize: 7.5, color: C_AMBER, textTransform: "uppercase", fontWeight: 700 }}>best</span>}
+                {rec.tools && <span style={{ fontSize: 7.5, color: C_GREEN, textTransform: "uppercase" }}>tools</span>}
+                {rec.installed
+                  ? <span style={{ fontSize: 8, color: C_GREEN, textTransform: "uppercase" }}>installed</span>
+                  : installing
+                    ? <span style={{ fontSize: 8, color: C_AMBER }}>{pull.pct > 0 ? `${pull.pct}%` : "starting…"}</span>
+                    : <button onClick={() => p.onPull(rec.tag)} style={benBtn}>pull</button>}
+              </div>
             </div>
-            <span style={{ fontSize: 9, opacity: 0.55 }}>{rec.params} · {rec.gb}GB · {rec.note}</span>
+            <span style={{ fontSize: 9, opacity: 0.55 }}>
+              {rec.params} · {rec.gb}GB disk{rec.needs_gb ? ` · ~${rec.needs_gb}GB RAM` : ""}{rec.ctx ? ` · ${rec.ctx}` : ""}
+            </span>
+            {rec.best_for && <span style={{ fontSize: 10, lineHeight: 1.4, opacity: 0.85 }}>{rec.best_for}</span>}
+            {rec.limits && <span style={{ fontSize: 9, lineHeight: 1.35, opacity: 0.55 }}>Trade-off: {rec.limits}</span>}
             {pull && pull.pct > 0 && pull.pct < 100 && <MiniBar value={pull.pct / 100} color={C_AMBER} />}
           </div>
         );
@@ -1656,7 +1768,7 @@ function HelpModal({ open, onClose, onOpenSettings }: { open: boolean; onClose: 
               </p>
               <div className="hud-help-grid">
                 <HelpRow label="Brain" text="Which AI model handled each request, and why." />
-                <HelpRow label="Models" text="Local AI models on this PC — benchmark or download." />
+                <HelpRow label="Models" text="Local AI models — pin your quality brain, benchmark, download, or delete." />
                 <HelpRow label="Memory" text="Facts JARVIS has saved about you." />
                 <HelpRow label="Markets" text="Smart-money read on Indian indices. Analysis only." />
                 <HelpRow label="Tasks" text="Things you've asked JARVIS to track." />

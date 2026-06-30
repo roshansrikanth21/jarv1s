@@ -9,6 +9,18 @@ interface Props {
 
 const AMBER = "oklch(0.68 0.22 38)";
 const AMBER_DIM = "oklch(0.52 0.16 38)";
+// Alpha variants — oklch() can't be concatenated with hex suffixes like `#rrggbbaa`.
+const A = {
+  a00: "oklch(0.68 0.22 38 / 0)",
+  a0D: "oklch(0.68 0.22 38 / 0.05)",
+  a18: "oklch(0.68 0.22 38 / 0.09)",
+  a40: "oklch(0.68 0.22 38 / 0.25)",
+  a55: "oklch(0.52 0.16 38 / 0.33)",
+  a65: "oklch(0.68 0.22 38 / 0.4)",
+  a70: "oklch(0.68 0.22 38 / 0.44)",
+  a80: "oklch(0.68 0.22 38 / 0.5)",
+  aCC: "oklch(0.68 0.22 38 / 0.8)",
+};
 
 export function ArcReactor({ active = false, speaking = false, size = "md", energy = 1 }: Props) {
   const px   = size === "sm" ? 128 : 192;
@@ -24,9 +36,9 @@ export function ArcReactor({ active = false, speaking = false, size = "md", ener
         animate={{
           boxShadow: active
             ? speaking
-              ? [`0 0 30px ${AMBER}80`, `0 0 60px ${AMBER}CC`, `0 0 30px ${AMBER}80`]
-              : [`0 0 18px ${AMBER}40`, `0 0 32px ${AMBER}65`, `0 0 18px ${AMBER}40`]
-            : `0 0 0px ${AMBER}00`,
+              ? [`0 0 30px ${A.a80}`, `0 0 60px ${A.aCC}`, `0 0 30px ${A.a80}`]
+              : [`0 0 18px ${A.a40}`, `0 0 32px ${A.a65}`, `0 0 18px ${A.a40}`]
+            : `0 0 0px ${A.a00}`,
         }}
         transition={{ duration: speaking ? 0.9 : 2.5, repeat: Infinity, ease: "easeInOut" }}
       />
@@ -98,16 +110,16 @@ export function ArcReactor({ active = false, speaking = false, size = "md", ener
         }}
         animate={{
           borderColor: active
-            ? speaking ? `${AMBER}CC` : `${AMBER}70`
-            : `${AMBER_DIM}55`,
-          backgroundColor: active ? `${AMBER}0D` : "transparent",
+            ? speaking ? A.aCC : A.a70
+            : A.a55,
+          backgroundColor: active ? A.a0D : "transparent",
         }}
         transition={{ duration: 0.4 }}
       >
         <div
           style={{
             position: "absolute", inset: 4, borderRadius: "50%",
-            border: `1px solid ${AMBER}18`,
+            border: `1px solid ${A.a18}`,
           }}
         />
 
