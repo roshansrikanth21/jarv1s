@@ -11,6 +11,7 @@ import asyncio
 import base64
 import io
 import json
+import logging
 import os
 import random
 import re
@@ -39,6 +40,12 @@ import models_advisor
 import ambient
 import perception
 import persona as persona_mod
+
+logging.basicConfig(
+    level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] jarvis: %(message)s",
+)
+log = logging.getLogger("jarvis")
 
 BASE_DIR     = Path(__file__).parent
 MEMORY_FILE   = BASE_DIR / "memory" / "jarvis_memory.json"
@@ -259,8 +266,8 @@ def _load_json(path: Path, default):
 def _save_json(path: Path, data) -> None:
     try:
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("failed to save %s: %s", path.name, exc)
 
 
 def _load_memory() -> list[dict]:
@@ -1754,8 +1761,8 @@ async def _ambient_loop() -> None:
     while True:
         try:
             await asyncio.to_thread(ambient.refresh)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.debug("ambient refresh failed (offline?): %s", exc)
         await asyncio.sleep(int(os.environ.get("JARVIS_AMBIENT_REFRESH_SEC", "900")))
 
 
@@ -1772,8 +1779,8 @@ async def _sleep_loop() -> None:
                 await _run_sleep_cycle()
         except asyncio.CancelledError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("sleep/consolidation cycle error: %s", exc)
 
 
 async def _pull_model(model: str) -> None:
