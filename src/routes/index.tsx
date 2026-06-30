@@ -2,6 +2,8 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import ClassicDeck from "@/decks/classic";
 import OverhaulDeck from "@/decks/overhaul";
+import { Onboarding } from "@/components/jarvis/Onboarding";
+import { ArcReactor } from "@/components/jarvis/ArcReactor";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -29,20 +31,65 @@ const PRESETS = [
 
 function Page() {
   const [preset, setPreset] = useState<string>(() => {
-    try { return localStorage.getItem("jarvis_ui_preset") || "classic"; } catch { return "classic"; }
+    try { return localStorage.getItem("jarvis_ui_preset") || "overhaul"; } catch { return "overhaul"; }
   });
   useEffect(() => {
     try { localStorage.setItem("jarvis_ui_preset", preset); } catch { /* ignore */ }
   }, [preset]);
 
-  const Deck = preset === "overhaul" ? OverhaulDeck : ClassicDeck;
+  // First-run gate: does the backend already know the operator's name?
+  const [phase, setPhase] = useState<"loading" | "onboarding" | "ready">("loading");
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/agent/status")
+      .then((r) => r.json())
+      .then((d) => {
+        if (cancelled) return;
+        const onboarded = Boolean(d?.user?.onboarded);
+        if (onboarded) {
+          try { localStorage.setItem("jarvis_user_name", String(d?.user?.name ?? "")); } catch { /* ignore */ }
+        }
+        setPhase(onboarded ? "ready" : "onboarding");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // Backend briefly down — don't trap returning users in onboarding.
+        try {
+          const cached = localStorage.getItem("jarvis_user_name");
+          setPhase(cached?.trim() ? "ready" : "onboarding");
+        } catch {
+          setPhase("onboarding");
+        }
+      });
+    return () => { cancelled = true; };
+  }, []);
 
+  if (phase === "loading") return <BootScreen />;
+  if (phase === "onboarding") return <Onboarding onComplete={() => setPhase("ready")} />;
+
+  const Deck = preset === "classic" ? ClassicDeck : OverhaulDeck;
   return (
     <>
       {/* key forces a clean remount on switch — no stale state bleeds across presets */}
       <Deck key={preset} />
       <PresetSwitcher value={preset} onChange={setPreset} />
     </>
+  );
+}
+
+function BootScreen() {
+  return (
+    <div style={{
+      position: "fixed", inset: 0, display: "flex", flexDirection: "column",
+      alignItems: "center", justifyContent: "center", gap: 18,
+      background: "var(--c-bg, #0a0705)", color: "var(--c-amber, oklch(0.68 0.22 38))",
+      fontFamily: "JetBrains Mono, ui-monospace, monospace",
+    }}>
+      <ArcReactor active size="sm" />
+      <span style={{ fontSize: 11, letterSpacing: "0.3em", textTransform: "uppercase", opacity: 0.6 }}>
+        Booting JARVIS…
+      </span>
+    </div>
   );
 }
 
