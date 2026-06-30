@@ -46,6 +46,7 @@ type AgentStatus = {
   council?: { panel: string[]; chair: string };
   voice?: { current: string; options: { id: string; label: string }[] };
   watch?: { watching: boolean; watchlist: string[]; interval_min: number; tf: string };
+  emotion?: { enabled: boolean; emotion: string; colour: string; intensity: number; sarcasm: string };
   memory?: { available: boolean; count: number };
   tools?: ToolInfo[];
   tasks?: Task[];
@@ -222,6 +223,9 @@ function CommandDeck() {
         if (d.type === "state" || d.type === "status") {
           setSpeaking(d.status === "speaking");
           if (txt) addLineRef.current("system", txt);
+        }
+        if (d.type === "emotion" && d.emotion) {
+          setAgentStatus(prev => ({ ...prev, emotion: d.emotion }));
         }
         if (d.type === "transcription" || d.type === "transcript") addLineRef.current("user", txt);
         if (d.type === "llm_chunk" && d.text) {
@@ -446,6 +450,7 @@ function CommandDeck() {
         </div>
 
         <div className="hud-header-controls no-drag">
+          <MoodChip emotion={agentStatus.emotion} />
           <StatusPill tone={connTone} label={connLabel} />
           <IconBtn onClick={refreshStatus} title="Refresh"><Activity className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => window?.electronAPI?.restartBackend?.()} title="Restart backend"><Zap className="w-3.5 h-3.5" /></IconBtn>
@@ -1107,6 +1112,31 @@ function CardHeader({ title, active }: { title: string; active?: boolean }) {
     <div className="hud-card-header">
       <span>{title}</span>
       {active !== undefined && <StatusDot tone={active ? "online" : "idle"} />}
+    </div>
+  );
+}
+
+function MoodChip({ emotion }: { emotion?: AgentStatus["emotion"] }) {
+  if (!emotion || !emotion.enabled) return null;
+  const AMBER = "oklch(0.68 0.22 38)";
+  const intensity = Math.max(0, Math.min(1, emotion.intensity ?? 0));
+  return (
+    <div
+      title={`${emotion.colour || emotion.emotion} · sarcasm: ${emotion.sarcasm}`}
+      style={{
+        display: "flex", alignItems: "center", gap: 6, padding: "3px 9px",
+        borderRadius: 999, border: `1px solid ${AMBER}33`, background: `${AMBER}0d`,
+        fontFamily: "JetBrains Mono, ui-monospace, monospace", fontSize: 10,
+        letterSpacing: "0.06em", color: AMBER, whiteSpace: "nowrap",
+      }}
+    >
+      <span
+        style={{
+          width: 7, height: 7, borderRadius: "50%", background: AMBER,
+          boxShadow: `0 0 ${4 + intensity * 8}px ${AMBER}`, opacity: 0.55 + intensity * 0.45,
+        }}
+      />
+      <span style={{ textTransform: "lowercase" }}>{emotion.emotion}</span>
     </div>
   );
 }
