@@ -2,6 +2,7 @@ import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import ClassicDeck from "@/decks/classic";
 import OverhaulDeck from "@/decks/overhaul";
+import FocusDeck from "@/decks/focus";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 
@@ -23,11 +24,17 @@ export const Route = createFileRoute("/")({
   component: Page,
 });
 
-// Two full UI designs, both wired to the same backend — pick one in the corner switcher.
+// UI designs, all wired to the same backend — pick one in the corner switcher.
 const PRESETS = [
   { id: "classic",  label: "Command Deck" },
   { id: "overhaul", label: "Overhaul" },
+  { id: "focus",    label: "Focus" },
 ];
+const DECKS = {
+  classic: ClassicDeck,
+  overhaul: OverhaulDeck,
+  focus: FocusDeck,
+} as const;
 
 function Page() {
   const [preset, setPreset] = useState<string>(() => {
@@ -67,7 +74,7 @@ function Page() {
   if (phase === "loading") return <BootScreen />;
   if (phase === "onboarding") return <Onboarding onComplete={() => setPhase("ready")} />;
 
-  const Deck = preset === "classic" ? ClassicDeck : OverhaulDeck;
+  const Deck = DECKS[preset as keyof typeof DECKS] ?? OverhaulDeck;
   return (
     <>
       {/* key forces a clean remount on switch — no stale state bleeds across presets */}
