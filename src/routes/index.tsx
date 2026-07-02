@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import ClassicDeck from "@/decks/classic";
 import OverhaulDeck from "@/decks/overhaul";
 import FocusDeck from "@/decks/focus";
+import TerminalDeck from "@/decks/terminal";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 
@@ -29,11 +30,13 @@ const PRESETS = [
   { id: "classic",  label: "Command Deck" },
   { id: "overhaul", label: "Overhaul" },
   { id: "focus",    label: "Focus" },
+  { id: "terminal", label: "Terminal" },
 ];
 const DECKS = {
   classic: ClassicDeck,
   overhaul: OverhaulDeck,
   focus: FocusDeck,
+  terminal: TerminalDeck,
 } as const;
 
 function Page() {
