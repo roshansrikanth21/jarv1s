@@ -712,7 +712,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
         top = [p.info["name"] for p in procs[:8] if p.info.get("name")]
         return (
             f"CPU {cpu}% | RAM {vm.percent}% ({vm.used // 2**30}GB/{vm.total // 2**30}GB) | "
-            f"Disk C: {disk.percent}% | Top procs: {', '.join(top)}"
+            f"Disk {disk.percent}% | Top procs: {', '.join(top)}"
         )
 
     if name == "launch_app":
