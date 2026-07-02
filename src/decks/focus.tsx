@@ -1,119 +1,25 @@
-// Focus — a third UI preset: minimal, distraction-free, cool-toned.
-// A deliberate departure from the two amber command-deck HUDs: single centered
-// column, big breathing mic orb, calm typography. Fully wired to the same backend
-// WS protocol (command / start_listening / tts_start|end) so it's a real preset,
-// not a mockup. Rendered by src/routes/index.tsx as a plain component.
-import { useCallback, useEffect, useRef, useState } from "react";
+// Focus — a minimal, distraction-free UI preset: single centered column, a big
+// breathing mic orb, calm cool-cyan palette (a deliberate departure from the two
+// amber command-deck HUDs). All backend I/O goes through the shared
+// useJarvisSocket hook — this file is view-only and re-implements no protocol.
+// Rendered by src/routes/index.tsx as a plain component.
+import { useEffect, useRef, useState } from "react";
+import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
-type Role = "user" | "agent" | "system";
-type Line = { id: string; role: Role; text: string };
-type Mood = { enabled?: boolean; emotion?: string; colour?: string; intensity?: number } | null;
-
-const uid = () => Math.random().toString(36).slice(2);
 const ACCENT = "oklch(0.74 0.13 205)";   // cool cyan — distinct from the amber decks
 const BG = "#070b0e";
 
 export default function FocusDeck() {
-  const [connected, setConnected] = useState(false);
-  const [listening, setListening] = useState(false);
-  const [speaking, setSpeaking]   = useState(false);
-  const [input, setInput]         = useState("");
-  const [lines, setLines]         = useState<Line[]>([{ id: uid(), role: "system", text: "JARVIS online. Ask, or tap the orb to speak." }]);
-  const [stream, setStream]       = useState("");
-  const [mood, setMood]           = useState<Mood>(null);
-  const [level, setLevel]         = useState(0);
-
-  const wsRef    = useRef<WebSocket | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const { connected, listening, speaking, lines, stream, mood, level, send, toggleMic } =
+    useJarvisSocket("JARVIS online. Ask, or tap the orb to speak.");
+  const [input, setInput]   = useState("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const addRef   = useRef<(r: Role, t: string) => void>(null!);
-  const connRef  = useRef<() => void>(null!);
-
-  const add = useCallback((role: Role, text: string) => {
-    if (!text.trim()) return;
-    setLines(p => [...p.slice(-120), { id: uid(), role, text }]);
-  }, []);
-  addRef.current = add;
-
-  const playTts = useCallback((b64: string) => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    const blob = new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: "audio/mpeg" });
-    const url = URL.createObjectURL(blob);
-    const a = new Audio(url);
-    audioRef.current = a;
-    setSpeaking(true);
-    const end = () => {
-      setSpeaking(false);
-      URL.revokeObjectURL(url);
-      audioRef.current = null;
-      wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
-    };
-    a.onended = end; a.onerror = end;
-    a.play().then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" }))).catch(end);
-  }, []);
-
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    const ws = new WebSocket(`ws://${window.location.host}/ws`);
-    wsRef.current = ws;
-    ws.onopen = () => {
-      setConnected(true);
-      fetch("/api/agent/status").then(r => r.json()).then(d => { if (d?.emotion) setMood(d.emotion); }).catch(() => {});
-    };
-    ws.onclose = () => { setConnected(false); setListening(false); setSpeaking(false); };
-    ws.onerror = () => { setTimeout(() => connRef.current(), 5000); };
-    ws.onmessage = (ev) => {
-      try {
-        const d = JSON.parse(ev.data);
-        const txt: string = d.text ?? d.message ?? "";
-        if (d.type === "state" || d.type === "status") setSpeaking(d.status === "speaking");
-        if (d.type === "emotion" && d.emotion) setMood(d.emotion);
-        if (d.type === "transcription" || d.type === "transcript") addRef.current("user", txt);
-        if (d.type === "llm_chunk" && d.text) setStream(p => p + (d.text as string));
-        if (d.type === "llm_response" || d.type === "response") { setStream(""); addRef.current("agent", txt); }
-        if (d.type === "tts_audio" && d.data) playTts(d.data as string);
-        if (d.type === "tts_stop") {
-          if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-          setSpeaking(false);
-          wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
-        }
-        if (d.type === "audio_level") setLevel(Number(d.level) || 0);
-      } catch { /* ignore malformed */ }
-    };
-  }, [playTts]);
-  connRef.current = connect;
-
-  useEffect(() => {
-    connect();
-    return () => {
-      if (audioRef.current) audioRef.current.pause();
-      wsRef.current?.close();
-    };
-  }, [connect]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 9e6, behavior: "smooth" });
   }, [lines.length, stream]);
 
-  const send = useCallback((cmd = input) => {
-    const t = cmd.trim();
-    if (!t) return;
-    add("user", t);
-    setInput("");
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: "command", text: t }));
-    } else {
-      fetch("/api/command", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command: t }) })
-        .then(r => r.json()).then(d => add("agent", d.response ?? "Done.")).catch(() => add("system", "No backend connection."));
-    }
-  }, [input, add]);
-
-  const toggleMic = () => {
-    if (!connected) { connect(); return; }
-    const next = !listening;
-    setListening(next);
-    wsRef.current?.send(JSON.stringify({ action: next ? "start_listening" : "stop_listening" }));
-  };
+  const submit = () => { send(input); setInput(""); };
 
   const orbState = speaking ? "speaking" : listening ? "listening" : "idle";
   const orbScale = 1 + (listening ? Math.min(level / 32000, 1) * 0.35 : 0);
@@ -180,7 +86,7 @@ export default function FocusDeck() {
           <input
             value={input}
             onChange={e => setInput(e.target.value)}
-            onKeyDown={e => { if (e.key === "Enter") send(); }}
+            onKeyDown={e => { if (e.key === "Enter") submit(); }}
             placeholder="Message JARVIS…"
             autoFocus
             style={{
@@ -188,7 +94,7 @@ export default function FocusDeck() {
               color: "#e8eef2", fontFamily: "inherit", fontSize: 13,
             }}
           />
-          <button onClick={() => send()} style={{
+          <button onClick={submit} style={{
             border: "none", background: ACCENT, color: BG, cursor: "pointer",
             borderRadius: 9, padding: "6px 14px", fontFamily: "inherit", fontSize: 11, fontWeight: 700,
           }}>Send</button>
