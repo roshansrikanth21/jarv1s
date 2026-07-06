@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
+import { notifyNative } from "@/lib/utils";
 
 // Rendered as a UI preset by src/routes/index.tsx (not a standalone route).
 
@@ -48,6 +49,7 @@ type AgentTrace = { step: number; action: string; args: Record<string, unknown>;
 type AgentStatus = {
   brain?: { primary_llm: string; local_model: string; reasoning?: string; max_agent_steps: number };
   conversation?: { turns: number };
+  emotion?: { enabled: boolean; emotion: string; colour: string; intensity: number; sarcasm: string };
   council?: { panel: string[]; chair: string };
   voice?: { current: string; options: { id: string; label: string }[] };
   user?: { name: string; onboarded: boolean };
@@ -201,7 +203,7 @@ function CommandDeck() {
   const [input, setInput]           = useState("");
   const [error, setError]           = useState<string | null>(null);
   const [lines, setLines]           = useState<Line[]>([
-    mkLine("system", "Neural interface initialised. Awaiting directive."),
+    mkLine("system", "Ready. Type a command or use the mic."),
   ]);
   const [tasks, setTasks]           = useState<Task[]>([]);
   const [agentStatus, setAgentStatus] = useState<AgentStatus>({});
@@ -239,6 +241,15 @@ function CommandDeck() {
   const inputRef    = useRef<HTMLInputElement | null>(null);
   const fetchModelsRef = useRef<() => void>(null!);
   const fetchMemRef    = useRef<() => void>(null!);
+  // Reconnect guards: dedup onclose/onerror both firing for one dropped
+  // connection, and suppress reconnect once we've intentionally closed the
+  // socket on unmount (otherwise a 5s-later reconnect opens a WebSocket
+  // nothing will ever close).
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // A disconnect only becomes user-visible after a short grace period — most
+  // reconnects resolve within it, so brief blips never flash an error.
+  const reconnectHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualCloseRef    = useRef(false);
 
   // Stable refs so callbacks never recreate (avoids useEffect re-run loop)
   const addLineRef      = useRef<(role: LineRole, text: string) => void>(null!);
@@ -273,33 +284,57 @@ function CommandDeck() {
 
   // Stable — uses refs internally, never recreates
   const connectWs = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    const cur = wsRef.current;
+    if (cur && (cur.readyState === WebSocket.OPEN || cur.readyState === WebSocket.CONNECTING)) return;
+    if (cur) {
+      cur.onclose = null;
+      cur.onerror = null;
+      try { cur.close(); } catch { /* stale socket */ }
+      wsRef.current = null;
+    }
     setConnecting(true);
     // Always go through Vite proxy (or same-host in prod) — avoids cross-origin WS issues
-    const url = `ws://${window.location.host}/ws`;
+    const url = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
     ws.onopen = () => {
       setConnected(true); setConnecting(false); setError(null);
-      addLineRef.current("system", "WebSocket uplink established.");
+      if (reconnectHintTimerRef.current) { clearTimeout(reconnectHintTimerRef.current); reconnectHintTimerRef.current = null; }
       refreshRef.current();
+    };
+    const scheduleReconnect = () => {
+      if (!reconnectHintTimerRef.current) {
+        reconnectHintTimerRef.current = setTimeout(() => {
+          reconnectHintTimerRef.current = null;
+          setError("Waking up…");
+        }, 2500);
+      }
+      if (manualCloseRef.current || reconnectTimerRef.current) return;
+      reconnectTimerRef.current = setTimeout(() => {
+        reconnectTimerRef.current = null;
+        connectWsRef.current();
+      }, 5000);
     };
     ws.onclose = () => {
       setConnected(false); setListening(false); setSpeaking(false); setConnecting(false);
+      scheduleReconnect();
     };
     ws.onerror = () => {
-      setError("Backend unreachable — retrying in 5 s");
       setConnecting(false);
-      setTimeout(() => connectWsRef.current(), 5000);
+      scheduleReconnect();
     };
     ws.onmessage = (ev) => {
       try {
         const d = JSON.parse(ev.data);
         const txt: string = d.text ?? d.message ?? "";
         if (d.type === "state" || d.type === "status") {
-          setSpeaking(d.status === "speaking");
+          if (d.status === "speaking") setSpeaking(true);
+          else if (!audioRef.current) setSpeaking(false);
           if (txt) addLineRef.current("system", txt);
+        }
+        if (d.type === "emotion" && d.emotion) {
+          setAgentStatus(prev => ({ ...prev, emotion: d.emotion }));
         }
         if (d.type === "transcription" || d.type === "transcript") addLineRef.current("user", txt);
         if (d.type === "llm_chunk" && d.text) {
@@ -336,10 +371,19 @@ function CommandDeck() {
             .catch(() => ttsEnd());
         }
         if (d.type === "tts_stop") {
-          // Barge-in: backend says stop talking right now.
           if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
           setSpeaking(false);
+          setStreamLine("");
           wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+        }
+        if (d.type === "system" && txt.trim()) {
+          addLineRef.current("system", txt);
+        }
+        if (d.type === "content_panel" && d.title) {
+          addLineRef.current("system", d.body ? `${d.title}\n${d.body}` : String(d.title));
+        }
+        if (d.type === "system_alert" && d.text) {
+          notifyNative("JARVIS", String(d.text));
         }
         if (d.type === "council_start") {
           setCouncil({ active: true, panel: (d.panel as string[]) ?? [], proposals: [], verdict: "" });
@@ -354,8 +398,12 @@ function CommandDeck() {
         }
         if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
         if (d.type === "open_trading") {
-          addLineRef.current("system", "Opening trading terminal…");
-          window?.electronAPI?.openTrading?.();
+          window?.electronAPI?.openTrading?.()
+            .then((r) => {
+              if (r?.ok === false && r.error) addLineRef.current("system", r.error);
+              else addLineRef.current("system", "Opening trading terminal…");
+            })
+            .catch(() => addLineRef.current("system", "Could not open the trading terminal."));
         }
         if (d.type === "name_changed" && d.name) {
           setAgentStatus(prev => ({ ...prev, user: { name: String(d.name), onboarded: true } }));
@@ -416,7 +464,10 @@ function CommandDeck() {
       clearInterval(id);
       if (speakTmr.current) clearTimeout(speakTmr.current);
       if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-      wsRef.current?.close();
+      manualCloseRef.current = true;
+      if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null; }
+      if (reconnectHintTimerRef.current) { clearTimeout(reconnectHintTimerRef.current); reconnectHintTimerRef.current = null; }
+      if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.onerror = null; wsRef.current.close(); }
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -525,13 +576,19 @@ function CommandDeck() {
       if (!r.ok) throw new Error();
       // /api/command only acknowledges — the reply streams back over the WebSocket,
       // which is down if we're on this path. Bring the uplink back to receive it.
-      addLine("system", "Sent — restoring the live uplink for the reply…");
+      addLine("system", "Got it — one moment, then I'll reply.");
       connectWsRef.current?.();
-    } catch { setError("No backend connection."); }
+    } catch { setError("Waking up…"); }
   }, [addLine, input]);
 
   const toggleListen = () => {
     if (!connected) { connectWs(); return; }
+    // While JARVIS is speaking, tapping mic means "stop talking," not "start
+    // listening over you" — surfaces the backend's dedicated interrupt action.
+    if (speaking) {
+      wsRef.current?.send(JSON.stringify({ action: "stop" }));
+      return;
+    }
     const next = !listening;
     setListening(next);
     wsRef.current?.send(JSON.stringify({ action: next ? "start_listening" : "stop_listening" }));
@@ -609,6 +666,7 @@ function CommandDeck() {
         </div>
 
         <div className="hud-header-controls no-drag">
+          <MoodChip emotion={agentStatus.emotion} />
           <IconBtn onClick={() => setHelpOpen(true)} title="What is this? — quick guide"><HelpCircle className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={refreshStatus} title="Refresh"><Activity className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => setSettingsOpen(true)} title="Settings"><Settings className="w-3.5 h-3.5" /></IconBtn>
@@ -811,7 +869,7 @@ function CommandDeck() {
                 </motion.p>
               )}
             </AnimatePresence>
-            <p className="hud-hint">Enter · send &nbsp;|&nbsp; ↑↓ · history &nbsp;|&nbsp; Alt+Space · focus</p>
+            <p className="hud-hint">Enter · send &nbsp;|&nbsp; ↑↓ · history</p>
           </div>
         </section>
 
@@ -1529,7 +1587,7 @@ function GovernorPanel(p: {
       ) : <EmptyPane text="Ask something — the routing decision appears here." />}
 
       <div>
-        <p className="hud-section-divider" style={{ borderTop: "none", marginTop: 0 }}>escalation lattice</p>
+        <p className="hud-section-divider" style={{ borderTop: "none", marginTop: 0 }}>model routing</p>
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
           {[...p.rungs].sort((a, b) => a.tier - b.tier).map(r => {
             const active = dec?.rung === r.id;
@@ -1791,6 +1849,31 @@ function CardHeader({ title, active }: { title: string; active?: boolean }) {
     <div className="hud-card-header">
       <span>{title}</span>
       {active !== undefined && <StatusDot tone={active ? "online" : "idle"} />}
+    </div>
+  );
+}
+
+function MoodChip({ emotion }: { emotion?: AgentStatus["emotion"] }) {
+  if (!emotion || !emotion.enabled) return null;
+  const AMBER = "oklch(0.68 0.22 38)";
+  const intensity = Math.max(0, Math.min(1, emotion.intensity ?? 0));
+  return (
+    <div
+      title={`${emotion.colour || emotion.emotion} · sarcasm: ${emotion.sarcasm}`}
+      style={{
+        display: "flex", alignItems: "center", gap: 6, padding: "3px 9px",
+        borderRadius: 999, border: `1px solid ${AMBER}33`, background: `${AMBER}0d`,
+        fontFamily: "JetBrains Mono, ui-monospace, monospace", fontSize: 10,
+        letterSpacing: "0.06em", color: AMBER, whiteSpace: "nowrap",
+      }}
+    >
+      <span
+        style={{
+          width: 7, height: 7, borderRadius: "50%", background: AMBER,
+          boxShadow: `0 0 ${4 + intensity * 8}px ${AMBER}`, opacity: 0.55 + intensity * 0.45,
+        }}
+      />
+      <span style={{ textTransform: "lowercase" }}>{emotion.emotion}</span>
     </div>
   );
 }

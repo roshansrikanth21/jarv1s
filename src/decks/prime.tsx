@@ -8,7 +8,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
 import { Mic, MicOff, Send, X, Moon, Trash2, Volume2 } from "lucide-react";
 import { ContentPanel, type ContentPanelData } from "@/components/jarvis/ContentPanel";
-import { SystemAlertBanner } from "@/components/jarvis/SystemAlertBanner";
 import { WindowControls } from "@/components/jarvis/WindowControls";
 import { useJarvisSocket } from "@/hooks/useJarvisSocket";
 import "./prime.css";
@@ -234,7 +233,7 @@ const BACKEND_HINT: Record<string, string> = {
 
 /* ═══════════════════════════════════════════════════════════ */
 export default function PrimeDeck() {
-  const { connected, listening, speaking, stream, level, send, toggleMic, sendAction, subscribe } =
+  const { connected, listening, speaking, stream, level, send, toggleMic, sendAction, subscribe, mood, showReconnectHint } =
     useJarvisSocket("Ready. Speak or type below.");
 
   const [feed, setFeed] = useState<Feed[]>([
@@ -262,7 +261,6 @@ export default function PrimeDeck() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [sendErr, setSendErr] = useState<string | null>(null);
   const [contentPanel, setContentPanel] = useState<ContentPanelData | null>(null);
-  const [systemAlert, setSystemAlert] = useState<{ text: string; severity: string } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -505,15 +503,8 @@ export default function PrimeDeck() {
               });
             }
             break;
-          case "system_alert":
-            if (d.text) {
-              const sev = String(d.severity ?? "warn");
-              setSystemAlert({ text: String(d.text), severity: sev });
-              window.setTimeout(() => {
-                setSystemAlert((cur) => (cur?.text === String(d.text) ? null : cur));
-              }, 12000);
-            }
-            break;
+          // system_alert -> a native OS notification (useJarvisSocket), not an
+          // in-page banner — nothing to do with it here.
           case "briefing":
             if (d.phase === "start") push({ kind: "system", text: "Morning briefing starting…" });
             if (d.phase === "done") push({ kind: "system", text: "Briefing complete." });
@@ -540,7 +531,7 @@ export default function PrimeDeck() {
     const t = input.trim();
     if (!t) return;
     if (!connected) {
-      setSendErr("Not connected — reconnecting, try again in a moment");
+      setSendErr("Just a moment — waking up");
       window.setTimeout(() => setSendErr(null), 4000);
     }
     push({ kind: "user", text: t });
@@ -615,7 +606,7 @@ export default function PrimeDeck() {
       : busyText !== null
         ? "thinking"
         : !connected
-          ? "offline"
+          ? (showReconnectHint ? "waking up" : "ready")
           : energy < 0.33
             ? "low power"
             : "ready";
@@ -637,7 +628,7 @@ export default function PrimeDeck() {
   );
   const localOn = Boolean(status.local?.enabled);
   const brainLine = !connected
-    ? "uplink down"
+    ? (showReconnectHint ? "waking up" : "…")
     : cloudOn && localOn
       ? "cloud + local"
       : cloudOn
@@ -698,11 +689,6 @@ export default function PrimeDeck() {
 
   return (
     <div className="pr-root" data-jstate={jstate}>
-      <SystemAlertBanner
-        text={systemAlert?.text ?? ""}
-        severity={systemAlert?.severity}
-        onDismiss={() => setSystemAlert(null)}
-      />
       {/* ═══ header ═══ */}
       <header className="pr-header drag">
         <div className="no-drag" style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
@@ -726,6 +712,14 @@ export default function PrimeDeck() {
               <span style={{ opacity: 0.35 }}>·</span>
               <span>
                 energy <b className="pr-num">{pct(energy)}</b> {homeo.label}
+              </span>
+            </>
+          )}
+          {mood?.enabled && (
+            <>
+              <span style={{ opacity: 0.35 }}>·</span>
+              <span title={mood.colour ?? mood.emotion}>
+                mood <b>{mood.emotion}</b>
               </span>
             </>
           )}
@@ -821,7 +815,7 @@ export default function PrimeDeck() {
 
           <div className="pr-arena-foot">
             <ContentPanel data={contentPanel} onDismiss={() => setContentPanel(null)} />
-            <span className="pr-lab">core · {connected ? "online" : "offline"} · {stateWord}</span>
+            <span className="pr-lab">core · {stateWord}</span>
             {busyText && !agentCaption && (
               <p className="pr-arena-thinking">
                 <span className="pr-thinking-dots" aria-hidden />
@@ -873,7 +867,7 @@ export default function PrimeDeck() {
                 </button>
               </div>
               <div className="pr-composer-hint">
-                <span className={sendErr ? "is-bad" : ""}>{sendErr ?? (connected ? "Connected" : "Reconnecting…")}</span>
+                <span className={sendErr ? "is-bad" : ""}>{sendErr ?? (connected ? "Connected" : showReconnectHint ? "Waking up…" : "")}</span>
               </div>
             </div>
           </div>

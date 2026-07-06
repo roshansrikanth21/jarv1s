@@ -37,5 +37,8 @@ yt-dlp
 # Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama
 
+# Web search — optional faster DDG client (falls back to HTML scrape)
+duckduckgo-search
+
 # Optional fallback brain (only if you set ANTHROPIC_API_KEY)
 anthropic

@@ -21,8 +21,9 @@ CONSOLIDATE_EVERY = 6      # new user+assistant turns (3 exchanges) before a cyc
 _NOW = time.time
 
 
-def should_consolidate(history: list[dict], last_consolidated_len: int) -> bool:
-    return (len(history) - last_consolidated_len) >= CONSOLIDATE_EVERY and len(history) >= 4
+def should_consolidate(turn_seq: int, last_consolidated_turn: int) -> bool:
+    """turn_seq = completed user+assistant exchanges (monotonic, not capped like history)."""
+    return (turn_seq - last_consolidated_turn) >= CONSOLIDATE_EVERY and turn_seq >= 2
 
 
 def decay_and_prune(memories: list[dict]) -> tuple[list[dict], int]:
@@ -118,8 +119,9 @@ async def consolidate(memories: list[dict], history: list[dict], llm_call) -> di
             content = (item.get("content") or "").strip()
             if not content or content.lower() in existing_texts:
                 continue
+            next_id = max((int(m.get("id", 0)) for m in memories), default=0) + 1
             memories.append({
-                "id": len(memories) + 1,
+                "id": next_id,
                 "content": content,
                 "category": item.get("category", "fact"),
                 "importance": int(item.get("importance", 5)),
