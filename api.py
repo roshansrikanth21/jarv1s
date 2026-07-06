@@ -38,8 +38,11 @@ import governor
 import models_advisor
 
 import ambient
+import briefing
 import perception
 import persona as persona_mod
+import system_monitor
+import web_search as websearch_mod
 
 logging.basicConfig(
     level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
@@ -55,6 +58,7 @@ SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
 GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
 PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
 MEMORY_FILE.parent.mkdir(exist_ok=True)
+TRADING_ROOT = Path(os.environ.get("C0MR4DES_DIR", str(BASE_DIR.parent / "c0mr4des_terminal")))
 
 # Load .env from repo root if present
 _env_file = BASE_DIR / ".env"
@@ -63,12 +67,17 @@ if _env_file.exists():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
-            os.environ.setdefault(_k.strip(), _v.strip())
+            _v = _v.strip()
+            if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
+                _v = _v[1:-1]
+            os.environ.setdefault(_k.strip(), _v)
 
 # ── Brain config ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL      = "claude-haiku-4-5-20251001"   # fast + cheap; swap to claude-sonnet-4-6 for more power
-OLLAMA_MODEL      = "llama3.1:8b-instruct-q4_K_M"
+OLLAMA_MODEL      = os.environ.get("OLLAMA_MODEL", "").strip()  # optional pin; else auto-detect from Ollama
+OLLAMA_KEEP_ALIVE = os.environ.get("JARVIS_OLLAMA_KEEP_ALIVE", "90")  # seconds in RAM after each local call
+OLLAMA_RELEASE_RAM_PCT = int(os.environ.get("JARVIS_OLLAMA_RELEASE_RAM", "82"))  # unload after reply when RAM above this
 VISION_MODEL      = "llava:latest"
 USE_CLAUDE        = bool(ANTHROPIC_API_KEY)
 
@@ -154,9 +163,27 @@ except ImportError:
 
 
 def _active_model() -> str:
-    if USE_GROQ and _HAS_GROQ:        return GROQ_MODEL
-    if USE_CLAUDE and _HAS_ANTHROPIC: return CLAUDE_MODEL
-    return OLLAMA_MODEL
+    if USE_GROQ and _HAS_GROQ:
+        return GROQ_MODEL
+    if USE_CLAUDE and _HAS_ANTHROPIC:
+        return CLAUDE_MODEL
+    if _LOCAL_OK and LOCAL_FAST:
+        return LOCAL_FAST
+    return OLLAMA_MODEL or "unconfigured"
+
+
+def _routing_label() -> str:
+    """Honest brain label for status — last Governor pick, not a static config default."""
+    if _last_decision:
+        return str(_last_decision.get("label") or _last_decision.get("rung") or _active_model())
+    avail = _available_rungs()
+    if not avail:
+        return "unconfigured"
+    if _gov.mode == "local":
+        return LOCAL_FAST or LOCAL_DEEP or "local (waiting for Ollama)"
+    if _gov.mode == "cloud" and not (avail & {"cloud_fast", "cloud_deep", "council"}):
+        return "cloud (no API key)"
+    return f"{_gov.mode} · {', '.join(sorted(avail)[:3])}"
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -181,7 +208,7 @@ async def _boot_probe():
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    global _main_loop, _sleep_task, _ambient_task, _boot_task
+    global _main_loop, _sleep_task, _ambient_task, _boot_task, _monitor_task
     _main_loop = asyncio.get_event_loop()
     brain = "Groq" if (USE_GROQ and _HAS_GROQ) else "Claude" if (USE_CLAUDE and _HAS_ANTHROPIC) else "Ollama"
     print(f"[JARVIS] Online — cloud: {_active_model()} ({brain})")
@@ -191,6 +218,7 @@ async def _lifespan(app: FastAPI):
     _boot_task = asyncio.create_task(_boot_probe())
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
+    _monitor_task = asyncio.create_task(_monitor_loop())
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
     spa_dir = BASE_DIR / "dist" / "client"
     if (spa_dir / "index.html").exists():
@@ -199,7 +227,7 @@ async def _lifespan(app: FastAPI):
     else:
         print("[JARVIS] Dev mode — UI served by Vite on :8080")
     yield
-    for _t in (_boot_task, _sleep_task, _ambient_task):
+    for _t in (_boot_task, _sleep_task, _ambient_task, _monitor_task):
         if _t:
             _t.cancel()
 
@@ -228,6 +256,10 @@ _tts_playing = False          # frontend reports the exact playback window
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task   = None          # in-flight _speak task (for barge-in cancel)
+_turn_generation = 0          # bumped on every new dispatch; lets a barged-in tool
+                               # thread (which asyncio.to_thread cannot forcibly stop)
+                               # notice it's stale and quiet down instead of surfacing
+                               # results/progress for a turn that's no longer current
 _history: list[dict] = []     # rolling conversation turns for multi-turn context
 _tts_voice = TTS_VOICE        # runtime-selectable voice (changed via set_voice)
 _watch_task = None            # background ICT watcher task
@@ -235,15 +267,18 @@ _watching = False
 _watch_state: dict = {}       # symbol -> last {bos, sweep, bias} signature
 _filler_sent = False          # slow-tool spoken-filler gate (reset each command)
 _ict_cache: dict = {}         # (symbol, interval) -> (epoch, result) short-TTL cache
+_ICT_CACHE_MAX = 32
+_ICT_CACHE_TTL_SEC = 30
 _last_device: dict = {}       # most-recent device profile (drives homeostasis)
 _last_activity = time.time()  # for the idle "sleep" trigger
-_last_consolidated_len = 0    # _history length at last consolidation
+_turn_seq = 0                   # monotonic completed exchanges (not capped like _history)
+_last_consolidated_turn = 0     # _turn_seq at last consolidation
 _last_decision: dict | None = None   # last Governor decision (for escalation signal)
 _sleep_task = None            # background consolidation ("sleep") loop
 _sleeping = False
 _LOCAL_OK = False             # Ollama up + a tool-capable local model installed
-LOCAL_FAST = OLLAMA_MODEL     # smallest tool-capable local model (Governor local·fast)
-LOCAL_DEEP = OLLAMA_MODEL     # largest  tool-capable local model (Governor local·deep)
+LOCAL_FAST = ""               # set by _detect_local_models()
+LOCAL_DEEP = ""               # set by _detect_local_models()
 IDLE_SLEEP_MIN = int(os.environ.get("JARVIS_SLEEP_IDLE_MIN", "3"))
 
 # ── Affect / ambient state ──────────────────────────────────────────────────────
@@ -251,6 +286,30 @@ _audio_arousal: float | None = None   # mic-loudness arousal hint (voice turns o
 _last_read = None                      # last perception.Read (drives prompt + UI)
 _ambient_task = None                   # background ambient (weather/location) refresher
 _boot_task = None                      # one-shot hardware/local-model probe (off critical path)
+_monitor_task = None                   # proactive CPU/RAM/temp/GPU alerts
+_sys_monitor = system_monitor.SystemMonitor()
+_briefing_running = False
+_pending_content_panel: dict | None = None
+
+_MEMORY_CATEGORIES = {
+    "identity": "personal",
+    "personal": "personal",
+    "preferences": "preference",
+    "preference": "preference",
+    "projects": "project",
+    "project": "project",
+    "relationships": "personal",
+    "wishes": "fact",
+    "notes": "fact",
+    "fact": "fact",
+    "security": "security",
+    "task": "task",
+    "general": "fact",
+}
+
+
+def _norm_memory_category(cat: str) -> str:
+    return _MEMORY_CATEGORIES.get((cat or "fact").lower().strip(), "fact")
 
 
 # ── Memory + persistence ────────────────────────────────────────────────────────
@@ -265,7 +324,11 @@ def _load_json(path: Path, default):
 
 def _save_json(path: Path, data) -> None:
     try:
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, indent=2, ensure_ascii=False)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
     except Exception as exc:
         log.warning("failed to save %s: %s", path.name, exc)
 
@@ -306,7 +369,8 @@ def _user_name() -> str:
 
 memories  = _load_memory()
 task_list = _load_json(TASKS_FILE, [])
-_history  = _load_json(HISTORY_FILE, [])
+_history  = _load_json(HISTORY_FILE, [])[-CONV_TURNS:]
+_turn_seq = len(_history) // 2
 _settings = _load_json(SETTINGS_FILE, {})
 _gov = governor.GovernorState(_load_json(GOVERNOR_FILE, {}))
 _persona = persona_mod.Persona.load(PERSONA_FILE)
@@ -314,10 +378,37 @@ if _settings.get("voice") in {v["id"] for v in VOICE_OPTIONS}:
     _tts_voice = _settings["voice"]
 
 
+def _ollama_chat_options(**extra) -> dict:
+    opts = {"keep_alive": OLLAMA_KEEP_ALIVE}
+    opts.update(extra)
+    return opts
+
+
+async def _ollama_release(model: str) -> None:
+    if model:
+        await asyncio.to_thread(models_advisor.unload, model)
+
+
+def _ict_cache_put(key: tuple, value: dict) -> None:
+    now = time.time()
+    # Proactively drop TTL-expired entries first, not just at the size cap — a
+    # stale-but-unevicted entry otherwise lingers until 32 distinct symbols/
+    # intervals have been queried.
+    for k in [k for k, (t, _) in _ict_cache.items() if now - t >= _ICT_CACHE_TTL_SEC]:
+        _ict_cache.pop(k, None)
+    if len(_ict_cache) >= _ICT_CACHE_MAX:
+        stale = min(_ict_cache, key=lambda k: _ict_cache[k][0])
+        _ict_cache.pop(stale, None)
+    _ict_cache[key] = (now, value)
+
+
 # ── WebSocket broadcast ────────────────────────────────────────────────────────
 async def broadcast(data: dict) -> None:
+    # Snapshot before iterating: an `await` inside this loop yields control, and a
+    # concurrent connect/disconnect mutating the live list mid-iteration could
+    # otherwise silently skip a socket (list iteration doesn't raise on resize).
     dead: list[WebSocket] = []
-    for ws in active_connections:
+    for ws in list(active_connections):
         try:
             await ws.send_json(data)
         except Exception:
@@ -332,6 +423,85 @@ async def broadcast(data: dict) -> None:
 def broadcast_from_thread(data: dict) -> None:
     if _main_loop and not _main_loop.is_closed():
         asyncio.run_coroutine_threadsafe(broadcast(data), _main_loop)
+
+
+async def _emit_content_panel(title: str, body: str) -> None:
+    if not body or len(body) < websearch_mod.PANEL_MIN_CHARS:
+        return
+    await broadcast({
+        "type": "content_panel",
+        "title": title[:80],
+        "body": body[:12000],
+        "ts": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+async def _monitor_loop() -> None:
+    """Background hardware watchdog — speaks + UI alert when thresholds breach."""
+    while True:
+        try:
+            await asyncio.sleep(10)
+            if not active_connections:
+                continue
+            alert = await asyncio.to_thread(_sys_monitor.check)
+            if not alert:
+                continue
+            await broadcast({
+                "type": "system_alert",
+                "severity": alert.get("severity", "warn"),
+                "metric": alert.get("metric", ""),
+                "text": alert.get("detail", ""),
+                "ts": datetime.now().isoformat(timespec="seconds"),
+            })
+            quiet = _tts_playing or (_current_task and not _current_task.done())
+            if not quiet and alert.get("speak"):
+                asyncio.create_task(_schedule_speak(alert["speak"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("monitor loop: %s", exc)
+
+
+async def _run_startup_briefing(*, force: bool = False) -> None:
+    """Two-phase morning briefing — once per calendar day unless forced."""
+    global _briefing_running, _settings
+    if _briefing_running:
+        return
+    today = briefing.today_key()
+    if not force and _settings.get("last_briefing_date") == today:
+        return
+    if not active_connections:
+        return
+
+    _briefing_running = True
+    try:
+        await broadcast({"type": "briefing", "phase": "start"})
+        greet = briefing.greeting_text(_user_name(), memories)
+        await _emit_content_panel(
+            "BRIEFING — status",
+            f"{greet}\n\nFetching headlines…",
+        )
+        await _schedule_speak(greet)
+
+        news = await briefing.fetch_news_phase()
+        if news.get("panel_body"):
+            await _emit_content_panel(news["panel_title"], news["panel_body"])
+        if news.get("speak"):
+            await asyncio.sleep(0.5)
+            await _schedule_speak(news["speak"])
+
+        _settings["last_briefing_date"] = today
+        _save_settings()
+        await broadcast({"type": "briefing", "phase": "done"})
+    except Exception as exc:
+        log.warning("briefing failed: %s", exc)
+        await broadcast({"type": "system", "text": f"Briefing unavailable: {exc}"})
+    finally:
+        _briefing_running = False
+
+
+def _maybe_run_briefing() -> None:
+    asyncio.create_task(_run_startup_briefing())
 
 
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
@@ -359,11 +529,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
     await websocket.accept()
     active_connections.append(websocket)
-    await websocket.send_json({
-        "type": "state",
-        "status": "connected",
-        "text": "JARVIS uplink established. All systems nominal.",
-    })
+    # No text: the UI already shows its own greeting on mount, and decks that
+    # surface a non-empty "state" text (classic/overhaul) would otherwise
+    # duplicate it with server/network language ("uplink established") that
+    # has no business being user-facing.
+    await websocket.send_json({"type": "state", "status": "connected"})
+    _maybe_run_briefing()
     try:
         while True:
             data = await websocket.receive_json()
@@ -391,14 +562,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     _settings["voice"] = vid
                     _save_settings()
                     await broadcast({"type": "voice_changed", "voice": vid})
-                    asyncio.create_task(_speak("Voice updated. This is how I sound now."))
+                    asyncio.create_task(_schedule_speak("Voice updated. This is how I sound now."))
             elif action == "set_name":
                 nm = (data.get("name") or "").strip()[:40]
                 if nm:
                     _settings["user_name"] = nm
                     _save_settings()
                     await broadcast({"type": "name_changed", "name": nm})
-                    asyncio.create_task(_speak(f"Noted. I'll call you {nm}."))
+                    asyncio.create_task(_schedule_speak(f"Noted. I'll call you {nm}."))
             elif action == "set_mode":
                 mode = (data.get("mode") or "").strip()
                 if mode in governor.MODES:
@@ -415,6 +586,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 asyncio.create_task(_set_local_model((data.get("model") or "").strip()))
             elif action == "trigger_sleep":
                 asyncio.create_task(_run_sleep_cycle())
+            elif action == "trigger_briefing":
+                asyncio.create_task(_run_startup_briefing(force=True))
             elif action == "forget_memory":
                 _forget_memory(data.get("id"))
             elif action == "start_watch":
@@ -423,13 +596,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 asyncio.create_task(_stop_watch())
     except WebSocketDisconnect:
         pass
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("websocket handler error: %s", exc)
     finally:
         try:
             active_connections.remove(websocket)
         except ValueError:
             pass
+        # The mic/watch loops are single global resources, not per-connection. If
+        # the last client just disconnected without sending stop_listening (e.g.
+        # the window was simply closed), stop them — otherwise the daemon thread
+        # keeps recording/transcribing indefinitely with nothing to broadcast to.
+        if not active_connections:
+            if _listening:
+                _stop_voice()
+            if _watching:
+                await _stop_watch()
 
 
 # ── Tool definitions (OpenAI / Ollama format) ──────────────────────────────────
@@ -438,12 +620,22 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "remember",
-            "description": "Save a fact, preference, or anything important to long-term memory.",
+            "description": (
+                "Save a durable fact about the user. Use category identity for name/city/language, "
+                "preferences for likes/dislikes, project for goals, relationships for people, "
+                "wishes for future plans, notes for anything else."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "content":  {"type": "string", "description": "What to remember"},
-                    "category": {"type": "string", "description": "Category: personal | preference | task | security | fact"},
+                    "category": {
+                        "type": "string",
+                        "description": (
+                            "identity | preferences | project | relationships | wishes | notes | "
+                            "personal | preference | fact | security | task"
+                        ),
+                    },
                 },
                 "required": ["content"],
             },
@@ -467,11 +659,21 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": "Search the web for current information, news, or facts.",
+            "description": (
+                "Search the web for current information. Modes: search (default), news, "
+                "research (deep), price (product cost), compare (side-by-side — pass items array)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
+                    "query":  {"type": "string", "description": "Search query or topic"},
+                    "mode":   {"type": "string", "description": "search | news | research | price | compare"},
+                    "items":  {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Items to compare (compare mode)",
+                    },
+                    "aspect": {"type": "string", "description": "Comparison aspect: price | specs | reviews"},
                 },
                 "required": ["query"],
             },
@@ -647,6 +849,66 @@ TOOLS: list[dict] = [
 
 # Name → schema lookup for the executor
 _TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+_TOOL_REQUIRED: dict[str, list[str]] = {
+    t["function"]["name"]: list(t["function"]["parameters"].get("required") or [])
+    for t in TOOLS
+}
+
+# Shell safety: block destructive / chained commands the LLM might suggest.
+_CMD_BLOCK_RE = re.compile(
+    r"(?:^|\s)(?:rm\s+-rf|del(?:ete)?\s+|erase\s+|remove-item\b|"
+    r"format\s+|shutdown|reboot|mkfs|diskpart|"
+    r"reg\s+delete|curl\s+.+\|\s*(?:ba)?sh|(?:powershell|pwsh)\s+-(?:e|enc|encodedcommand)\b|"
+    r"invoke-expression|iex\s|wget\s+.+\|\s*sh)",
+    re.I,
+)
+_CMD_META_RE = re.compile(r"[;&|`>]|(?:\$\()")
+
+_LAUNCH_ALLOWLIST = {
+    "chrome": "chrome.exe", "firefox": "firefox.exe", "edge": "msedge.exe",
+    "code": "code", "vscode": "code", "spotify": "spotify.exe",
+    "discord": "discord.exe", "notepad": "notepad.exe",
+    "terminal": "wt.exe", "powershell": "powershell.exe",
+    "explorer": "explorer.exe", "calc": "calc.exe",
+    "calculator": "calc.exe", "paint": "mspaint.exe",
+    "obs": "obs64.exe", "steam": "steam.exe",
+}
+
+
+def _next_id(items: list[dict]) -> int:
+    return max((int(i.get("id", 0)) for i in items), default=0) + 1
+
+
+def _top_memories(limit: int = 20) -> list[dict]:
+    return sorted(
+        memories,
+        key=lambda m: (
+            -(m.get("importance") or 5),
+            -(m.get("access_count") or 0),
+            str(m.get("last_access") or m.get("timestamp") or ""),
+        ),
+    )[:limit]
+
+
+def _validate_tool_args(name: str, args: dict) -> str | None:
+    for key in _TOOL_REQUIRED.get(name, []):
+        val = args.get(key)
+        if val is None or (isinstance(val, str) and not val.strip()):
+            return f"{name} requires '{key}'."
+    return None
+
+
+def _command_allowed(cmd: str) -> str | None:
+    c = cmd.strip()
+    if not c:
+        return "run_command needs a non-empty command string."
+    if _CMD_BLOCK_RE.search(c):
+        return "Command blocked for safety."
+    if _CMD_META_RE.search(c):
+        return "Shell chaining and redirection are blocked — one simple command only."
+    if len(c) > 500:
+        return "Command too long (500 char max)."
+    return None
 
 # Anthropic tool format (input_schema instead of parameters)
 CLAUDE_TOOLS = [
@@ -660,18 +922,29 @@ CLAUDE_TOOLS = [
 
 
 # ── Tool executor ──────────────────────────────────────────────────────────────
-def execute_tool(name: str, args: dict[str, Any]) -> str:
-    global memories, task_list
+def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str:
+    global memories, task_list, _pending_content_panel
+    _pending_content_panel = None
+    if name not in _TOOL_NAMES:
+        return f"Unknown tool: {name}"
+    if not isinstance(args, dict):
+        return f"{name}: invalid arguments."
+    err = _validate_tool_args(name, args)
+    if err:
+        return err
 
     if name == "remember":
         entry = {
-            "id": len(memories) + 1,
+            "id": _next_id(memories),
             "content": args["content"],
-            "category": args.get("category", "general"),
+            "category": _norm_memory_category(args.get("category", "fact")),
             "timestamp": datetime.now().isoformat(),
+            "source": "manual",
+            "importance": 6 if _norm_memory_category(args.get("category", "")) == "personal" else 5,
         }
         memories.append(entry)
         _save_memory(memories)
+        broadcast_from_thread({"type": "memory_update", "count": len(memories)})
         return f"Stored: {args['content']}"
 
     if name == "recall_memory":
@@ -685,24 +958,28 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
     if name == "search_web":
         try:
-            q = urllib.parse.quote_plus(args["query"])
-            url = f"https://html.duckduckgo.com/html/?q={q}"
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            items = args.get("items")
+            if items and not isinstance(items, list):
+                items = [str(items)]
+            result = websearch_mod.search(
+                args.get("query", ""),
+                args.get("mode", "search"),
+                items=items,
+                aspect=str(args.get("aspect") or ""),
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-            snippets = re.findall(
-                r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', html, re.DOTALL
-            )
-            snippets = [re.sub(r"<[^>]+>", "", s).strip() for s in snippets if s.strip()][:6]
-            return "Results:\n" + "\n".join(f"• {s}" for s in snippets) if snippets else "No results found."
+            if result.get("panel_body"):
+                _pending_content_panel = {
+                    "title": result.get("title", "SEARCH"),
+                    "body": result["panel_body"],
+                }
+            return result.get("text", "No results.")
         except Exception as exc:
             return f"Search error: {exc}"
 
     if name == "get_system_info":
-        cpu  = psutil.cpu_percent(interval=0.5)
-        vm   = psutil.virtual_memory()
+        snap = system_monitor.snapshot()
+        cpu = snap["cpu_percent"]
+        ram = snap["ram_percent"]
         disk = psutil.disk_usage(_disk_root())
         procs = sorted(
             psutil.process_iter(["name", "cpu_percent"]),
@@ -710,32 +987,33 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             reverse=True,
         )
         top = [p.info["name"] for p in procs[:8] if p.info.get("name")]
+        vm = psutil.virtual_memory()
+        extra = []
+        if snap.get("cpu_temp_c") is not None:
+            extra.append(f"CPU temp {snap['cpu_temp_c']}°C")
+        if snap.get("gpu_percent") is not None:
+            extra.append(f"GPU {snap['gpu_percent']}%")
+        tail = f" | {' | '.join(extra)}" if extra else ""
         return (
-            f"CPU {cpu}% | RAM {vm.percent}% ({vm.used // 2**30}GB/{vm.total // 2**30}GB) | "
-            f"Disk {disk.percent}% | Top procs: {', '.join(top)}"
+            f"CPU {cpu}% | RAM {ram}% ({vm.used // 2**30}GB/{vm.total // 2**30}GB) | "
+            f"Disk {disk.percent}% | Top procs: {', '.join(top)}{tail}"
         )
 
     if name == "launch_app":
-        app_map = {
-            "chrome": "chrome.exe", "firefox": "firefox.exe", "edge": "msedge.exe",
-            "code": "code", "vscode": "code", "spotify": "spotify.exe",
-            "discord": "discord.exe", "notepad": "notepad.exe",
-            "terminal": "wt.exe", "powershell": "powershell.exe",
-            "explorer": "explorer.exe", "calc": "calc.exe",
-            "calculator": "calc.exe", "paint": "mspaint.exe",
-            "obs": "obs64.exe", "steam": "steam.exe",
-        }
         raw = args["app"].lower().strip()
-        cmd = app_map.get(raw, args["app"])
+        cmd = _LAUNCH_ALLOWLIST.get(raw)
+        if not cmd:
+            supported = ", ".join(sorted(_LAUNCH_ALLOWLIST))
+            return f"Unknown app '{raw}'. Supported: {supported}"
         try:
             subprocess.Popen(cmd, shell=True)
-            return f"Launched {args['app']}."
+            return f"Launched {raw}."
         except Exception as exc:
-            return f"Failed to launch {args['app']}: {exc}"
+            return f"Failed to launch {raw}: {exc}"
 
     if name == "add_task":
         task = {
-            "id": len(task_list) + 1,
+            "id": _next_id(task_list),
             "t": args["task"],
             "eta": args.get("eta", ""),
             "status": "queued",
@@ -804,23 +1082,40 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
             resp = ollama.chat(
                 model=VISION_MODEL,
                 messages=[{"role": "user", "content": prompt, "images": [img_bytes]}],
+                options={"keep_alive": 0},
             )
             return resp.message.content
         except Exception as exc:
             return f"Screen capture failed (no Groq key and Ollama unavailable): {exc}"
 
     if name == "run_command":
-        cmd = args["command"]
-        cwd = args.get("cwd") or str(BASE_DIR)
+        cmd = args.get("command", "").strip()
+        blocked = _command_allowed(cmd)
+        if blocked:
+            return blocked
+        cwd_arg = args.get("cwd")
+        cwd = Path(cwd_arg).expanduser().resolve() if cwd_arg else BASE_DIR
+        if not cwd.is_dir():
+            return f"cwd '{cwd_arg}' is not a valid directory."
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=str(cwd),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
         try:
-            result = subprocess.run(
-                cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=cwd,
-            )
-            out = (result.stdout or "").strip()
-            err = (result.stderr or "").strip()
-            combined = "\n".join(filter(None, [out, err]))
+            out, err = proc.communicate(timeout=30)
+            combined = "\n".join(filter(None, [(out or "").strip(), (err or "").strip()]))
             return combined[:2000] if combined else "(no output)"
         except subprocess.TimeoutExpired:
+            # proc.kill() alone only terminates the direct shell child — a
+            # backgrounded/detached grandchild (e.g. `start /b ...`) survives it.
+            # Kill the whole tree via psutil (cross-platform).
+            try:
+                parent = psutil.Process(proc.pid)
+                for child in parent.children(recursive=True):
+                    child.kill()
+                parent.kill()
+            except psutil.NoSuchProcess:
+                pass
             return "Command timed out after 30s."
         except Exception as exc:
             return f"Command failed: {exc}"
@@ -829,6 +1124,9 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
         return _ict_scan(args.get("symbol", "nifty"), args.get("interval", "15m"))
 
     if name == "open_trading":
+        if not TRADING_ROOT.is_dir():
+            return (f"Trading terminal not installed — expected folder at {TRADING_ROOT}. "
+                    "Set C0MR4DES_DIR or install c0mr4des_terminal alongside JARVIS.")
         broadcast_from_thread({"type": "open_trading"})
         return "Opening the trading terminal in its own window."
 
@@ -836,7 +1134,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
         return _analyze_image(args.get("path", ""), args.get("question", ""))
 
     if name == "watch_video":
-        return _watch_video(args.get("source", ""), args.get("question", ""))
+        return _watch_video(args.get("source", ""), args.get("question", ""), gen)
 
     if name == "calculate":
         return _calculate(args.get("expression", ""))
@@ -910,9 +1208,21 @@ def _analyze_image(path: str, question: str = "") -> str:
         return f"Image analysis failed: {exc}"
 
 
-def _watch_video(source: str, question: str = "") -> str:
-    """Watch a local video or URL: sample frames + transcribe audio, then reason over both."""
+def _watch_video(source: str, question: str = "", gen: int | None = None) -> str:
+    """Watch a local video or URL: sample frames + transcribe audio, then reason over both.
+    `gen` is the turn-generation this call started under; if a barge-in bumps
+    _turn_generation while this (uncancellable, thread-pool-bound) call is still
+    running, we notice at the next checkpoint and stop doing further wasted work
+    and stop broadcasting stale progress for a turn that's no longer current."""
     import tempfile, glob
+
+    def _stale() -> bool:
+        return gen is not None and gen != _turn_generation
+
+    def _progress(text: str) -> None:
+        if not _stale():
+            broadcast_from_thread({"type": "state", "status": "thinking", "text": text})
+
     source = source.strip().strip('"').strip("'")
     try:
         import cv2
@@ -932,7 +1242,7 @@ def _watch_video(source: str, question: str = "") -> str:
         except ImportError:
             return "URL video needs yt-dlp. Run: pip install yt-dlp."
         out_tmpl = os.path.join(workdir, "vid.%(ext)s")
-        broadcast_from_thread({"type": "state", "status": "thinking", "text": "Downloading video..."})
+        _progress("Downloading video...")
         try:
             opts = {"outtmpl": out_tmpl, "quiet": True, "noplaylist": True,
                     "format": "mp4[height<=480]/best[height<=480]/best", "max_filesize": 80 * 1024 * 1024}
@@ -945,11 +1255,14 @@ def _watch_video(source: str, question: str = "") -> str:
         except Exception as exc:
             return f"Video download failed: {exc}"
 
+    if _stale():
+        return "Cancelled — a newer command superseded this one."
+
     if not os.path.isfile(video_path):
         return f"No video at: {video_path}"
 
     # Sample frames with OpenCV (budget by duration, hard cap 12 frames for token cost).
-    broadcast_from_thread({"type": "state", "status": "thinking", "text": "Sampling frames..."})
+    _progress("Sampling frames...")
     frames_b64 = []
     try:
         cap = cv2.VideoCapture(video_path)
@@ -972,11 +1285,14 @@ def _watch_video(source: str, question: str = "") -> str:
     if not frames_b64:
         return "Couldn't read any frames from that video."
 
+    if _stale():
+        return "Cancelled — a newer command superseded this one."
+
     # Transcribe audio via Groq Whisper (it accepts mp4/webm; skip if file too big).
     transcript = ""
     try:
         if USE_GROQ and _HAS_GROQ and os.path.getsize(video_path) <= 24 * 1024 * 1024:
-            broadcast_from_thread({"type": "state", "status": "thinking", "text": "Transcribing audio..."})
+            _progress("Transcribing audio...")
             client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
             with open(video_path, "rb") as f:
                 r = client.audio.transcriptions.create(model=STT_MODEL, file=f, response_format="text")
@@ -1139,7 +1455,7 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     voice tool and the Markets panel / watcher. Cached ~30s to spare repeat fetches."""
     ckey = (symbol.strip().lower(), interval)
     hit = _ict_cache.get(ckey)
-    if hit and (time.time() - hit[0]) < 30:
+    if hit and (time.time() - hit[0]) < _ICT_CACHE_TTL_SEC:
         return hit[1]
     try:
         import yfinance as yf
@@ -1280,7 +1596,7 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
         "equilibrium": round(eq, 1), "zone": zone, "score": score, "read": read,
         "htf_bias": htf_bias, "confluence": confluence, "plan": plan, "session": session,
     }
-    _ict_cache[ckey] = (time.time(), result)
+    _ict_cache_put(ckey, result)
     return result
 
 
@@ -1339,7 +1655,7 @@ async def _watch_loop() -> None:
                 await broadcast(broadcast_log)
                 quiet = _tts_playing or (_current_task and not _current_task.done())
                 if WATCH_SPEAK and not quiet:
-                    asyncio.create_task(_speak(f"Heads up — {name}, {alerts[0]}."))
+                    asyncio.create_task(_schedule_speak(f"Heads up — {name}, {alerts[0]}."))
         # sleep in short slices so stop is responsive
         for _ in range(max(1, WATCH_INTERVAL_MIN) * 6):
             if not _watching:
@@ -1415,7 +1731,7 @@ def _build_system_prompt() -> str:
     if memories:
         mem_lines = "\n".join(
             f"  - [{m.get('category', 'general')}] {m['content']}"
-            for m in memories[-20:]
+            for m in _top_memories(20)
         )
         lines.append(f"\nWhat you know about {nm}:\n{mem_lines}")
     return "\n".join(lines)
@@ -1423,14 +1739,22 @@ def _build_system_prompt() -> str:
 
 # ── Shared tool runner ──────────────────────────────────────────────────────────
 async def _run_tool(name: str, args: dict) -> str:
-    global _filler_sent
+    global _filler_sent, _pending_content_panel
     # A slow tool means a real wait — bridge the dead air with a quick spoken
     # acknowledgment, once per turn. Fast tools answer too quickly to bother.
     if not _filler_sent and name in SLOW_TOOLS:
         _filler_sent = True
-        asyncio.create_task(_speak(random.choice(FILLERS)))
+        asyncio.create_task(_schedule_speak(random.choice(FILLERS)))
     await broadcast({"type": "state", "status": "thinking", "text": f"Running {name}..."})
-    observation = await asyncio.to_thread(execute_tool, name, args)
+    my_gen = _turn_generation
+    try:
+        observation = await asyncio.to_thread(execute_tool, name, args, my_gen)
+    except Exception as exc:
+        observation = f"Tool {name} failed: {exc}"
+    if _pending_content_panel:
+        panel = _pending_content_panel
+        _pending_content_panel = None
+        await _emit_content_panel(panel["title"], panel["body"])
     entry = {
         "step": len(agent_trace) + 1,
         "action": name,
@@ -1444,9 +1768,8 @@ async def _run_tool(name: str, args: dict) -> str:
 
 
 async def _emit_final(text: str) -> None:
-    global _speak_task
     await broadcast({"type": "llm_response", "text": text})
-    _speak_task = asyncio.create_task(_speak(text))
+    asyncio.create_task(_schedule_speak(text))
 
 
 # ── Groq agent loop (primary — gpt-oss-120b reasoning model, streaming) ────────
@@ -1494,7 +1817,8 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool):
 
 def _record_turn(user: str, assistant: str) -> None:
     """Keep a short rolling window of the conversation for multi-turn context."""
-    global _history
+    global _history, _turn_seq
+    _turn_seq += 1
     _history = (_history + [
         {"role": "user", "content": user},
         {"role": "assistant", "content": assistant},
@@ -1502,7 +1826,7 @@ def _record_turn(user: str, assistant: str) -> None:
     _save_history()
 
 
-async def _brain_groq(text: str, history: list[dict]) -> str:
+async def _brain_groq(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
     """Primary brain — streams text, runs tools, returns the final answer. The
     shared wrapper (_run_agent) handles emit, fillers, history, and recording."""
     client = _openai_mod.AsyncOpenAI(
@@ -1517,10 +1841,11 @@ async def _brain_groq(text: str, history: list[dict]) -> str:
         + [{"role": "user", "content": text}]
     )
 
+    use_tools = governor.agent_needs_tools(decision, device)
     final_answer = ""
     for _ in range(8):
         try:
-            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=True)
+            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools)
         except _openai_mod.RateLimitError:
             return "I've hit Groq's per-minute rate limit. Give me a few seconds and ask again."
         except _openai_mod.APIError:
@@ -1567,19 +1892,22 @@ async def _brain_groq(text: str, history: list[dict]) -> str:
 
 
 # ── Claude agent loop ───────────────────────────────────────────────────────────
-async def _brain_claude(text: str, history: list[dict]) -> str:
+async def _brain_claude(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
     client   = _AnthropicClient(api_key=ANTHROPIC_API_KEY)
     messages: list[dict] = list(history) + [{"role": "user", "content": text}]
 
+    use_tools = governor.agent_needs_tools(decision, device)
     final_answer = ""
     for _ in range(8):
-        response = await client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=1024,
-            system=_build_system_prompt(),
-            tools=CLAUDE_TOOLS,
-            messages=messages,
-        )
+        req: dict = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": 1024,
+            "system": _build_system_prompt(),
+            "messages": messages,
+        }
+        if use_tools:
+            req["tools"] = CLAUDE_TOOLS
+        response = await client.messages.create(**req)
 
         if response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
@@ -1606,8 +1934,17 @@ async def _brain_claude(text: str, history: list[dict]) -> str:
 
 
 # ── Ollama agent loop (fallback) ────────────────────────────────────────────────
-async def _brain_ollama(text: str, history: list[dict], model: str = OLLAMA_MODEL) -> str:
+async def _brain_ollama(
+    text: str,
+    history: list[dict],
+    model: str,
+    *,
+    decision: dict,
+    device: dict,
+) -> str:
     import ollama
+    if not model:
+        raise RuntimeError("No local model selected — start Ollama or set OLLAMA_MODEL.")
     client   = ollama.AsyncClient()
     messages: list[dict] = (
         [{"role": "system", "content": _build_system_prompt()}]
@@ -1615,9 +1952,15 @@ async def _brain_ollama(text: str, history: list[dict], model: str = OLLAMA_MODE
         + [{"role": "user", "content": text}]
     )
 
+    use_tools = governor.agent_needs_tools(decision, device)
+    opts = _ollama_chat_options()
+    if not use_tools:
+        response = await client.chat(model=model, messages=messages, options=opts)
+        return (response.message.content or "").strip()
+
     final_answer = ""
     for _ in range(8):
-        response = await client.chat(model=model, messages=messages, tools=TOOLS)
+        response = await client.chat(model=model, messages=messages, tools=TOOLS, options=opts)
         msg = response.message
 
         if not msg.tool_calls:
@@ -1634,7 +1977,8 @@ async def _brain_ollama(text: str, history: list[dict], model: str = OLLAMA_MODE
         })
 
         for tc in msg.tool_calls:
-            obs = await _run_tool(tc.function.name, tc.function.arguments or {})
+            _raw_args = tc.function.arguments or {}
+            obs = await _run_tool(tc.function.name, _raw_args)
             messages.append({"role": "tool", "content": obs})
 
     return final_answer
@@ -1655,7 +1999,7 @@ def _detect_local_models() -> None:
     for m in inst:
         if not m.get("tools"):
             continue
-        ok, _ = models_advisor.model_allowed(dev, m["name"], lookup)
+        ok, _ = models_advisor.model_allowed(dev, m["name"], lookup, require_live=False)
         if ok:
             tool_models.append(m)
     if not tool_models:
@@ -1664,7 +2008,7 @@ def _detect_local_models() -> None:
     tool_models.sort(key=lambda m: m.get("gb") or 0)
     names = [m["name"] for m in tool_models]
     LOCAL_FAST, LOCAL_DEEP = names[0], names[-1]
-    pin = (_settings.get("local_model") or "").strip()
+    pin = (_settings.get("local_model") or OLLAMA_MODEL or "").strip()
     if pin:
         ok, _ = models_advisor.model_allowed(dev, pin, lookup)
         if not ok:
@@ -1736,10 +2080,12 @@ async def _run_agent(text: str) -> None:
     picks the cheapest brain that clears the difficulty bar within the current
     energy/latency budget, escalating only when the task is hard or the machine is
     healthy — then observes the outcome to adapt the policy to this machine."""
-    global _history, _last_device
+    global _history, _last_device, _turn_seq, _last_consolidated_turn
 
     if text.strip().lower().rstrip(".!") in RESET_PHRASES:
         _history = []
+        _turn_seq = 0
+        _last_consolidated_turn = 0
         _save_history()
         await _emit_final("Done — clean slate. What's on your mind?")
         return
@@ -1756,8 +2102,23 @@ async def _run_agent(text: str) -> None:
                           "Settings, or start Ollama for fully-local mode.")
         return
 
+    cloud_rungs = {"cloud_fast", "cloud_deep", "council"}
+    if not (avail & cloud_rungs) and (dev.get("ram_percent") or 0) >= 90:
+        await broadcast({
+            "type": "system",
+            "text": "Memory is nearly full and only local models are available — "
+                    "responses will be slow. Add a Groq key in Settings for cloud routing, "
+                    "or free RAM / unload unused Ollama models.",
+        })
+
     did = f"d{int(time.time() * 1000)}"
     decision = governor.decide(text, list(_history), dev, avail, _gov, did)
+    if decision["rung"] not in avail:
+        mode_hint = " Switch Governor mode to auto/cloud, or start Ollama for local."
+        if _gov.mode == "local":
+            mode_hint = " Local mode requires Ollama — start it and pull a model."
+        await _emit_final(f"No brain available for {_gov.mode} mode.{mode_hint}")
+        return
     await broadcast({"type": "governor_decision",
                      "decision": _public_decision(decision),
                      "homeostasis": _homeostasis(dev), "device": _device_brief(dev)})
@@ -1770,13 +2131,13 @@ async def _run_agent(text: str) -> None:
             _observe(decision, time.time() - t0, accepted=True)
             return
         elif rung == "cloud_deep":
-            answer = await _brain_claude(text, list(_history))
+            answer = await _brain_claude(text, list(_history), decision=decision, device=dev)
         elif rung == "cloud_fast":
-            answer = await _brain_groq(text, list(_history))
+            answer = await _brain_groq(text, list(_history), decision=decision, device=dev)
         elif rung == "local_deep":
-            answer = await _brain_ollama(text, list(_history), model=LOCAL_DEEP)
+            answer = await _brain_ollama(text, list(_history), LOCAL_DEEP, decision=decision, device=dev)
         else:
-            answer = await _brain_ollama(text, list(_history), model=LOCAL_FAST)
+            answer = await _brain_ollama(text, list(_history), LOCAL_FAST, decision=decision, device=dev)
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -1794,12 +2155,17 @@ async def _run_agent(text: str) -> None:
     _record_turn(text, answer)
     _observe(decision, latency, accepted=True)
 
+    if rung in ("local_fast", "local_deep") and (dev.get("ram_percent") or 0) >= OLLAMA_RELEASE_RAM_PCT:
+        used = LOCAL_DEEP if rung == "local_deep" else LOCAL_FAST
+        asyncio.create_task(_ollama_release(used))
+        asyncio.create_task(_broadcast_models_loaded())
+
 
 # ── Sleep / consolidation + model management ─────────────────────────────────────
 async def _run_sleep_cycle() -> None:
     """One consolidation cycle — compress episodic turns into durable memory. Prefers
     a local model so reflection stays on-device; falls back to Groq."""
-    global memories, _last_consolidated_len, _sleeping
+    global memories, _last_consolidated_turn, _sleeping
     if _sleeping:
         return
     _sleeping = True
@@ -1810,7 +2176,10 @@ async def _run_sleep_cycle() -> None:
             try:
                 import ollama
                 r = await ollama.AsyncClient().chat(
-                    model=LOCAL_FAST, messages=[{"role": "user", "content": prompt}])
+                    model=LOCAL_FAST,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"keep_alive": 0},
+                )
                 return r.message.content or ""
             except Exception:
                 pass
@@ -1829,7 +2198,7 @@ async def _run_sleep_cycle() -> None:
         result = await consolidation.consolidate(memories, _history, _llm)
         memories[:] = result["memories"]
         _save_memory(memories)
-        _last_consolidated_len = len(_history)
+        _last_consolidated_turn = _turn_seq
         await broadcast({"type": "sleep", "state": "done", "text": result["summary"],
                          "memory_count": len(memories)})
     except Exception:
@@ -1857,7 +2226,7 @@ async def _sleep_loop() -> None:
             on_ac = (_last_device or {}).get("power_state", "ac") == "ac"
             busy = _tts_playing or bool(_current_task and not _current_task.done())
             if (idle_min >= IDLE_SLEEP_MIN and on_ac and not busy and not _sleeping
-                    and consolidation.should_consolidate(_history, _last_consolidated_len)):
+                    and consolidation.should_consolidate(_turn_seq, _last_consolidated_turn)):
                 await _run_sleep_cycle()
         except asyncio.CancelledError:
             raise
@@ -1869,12 +2238,14 @@ async def _pull_model(model: str) -> None:
     if not model:
         return
     dev = await asyncio.to_thread(device.profile)
-    ok, reason = await asyncio.to_thread(models_advisor.model_allowed, dev, model)
+    ok, reason, kind = await asyncio.to_thread(models_advisor.pull_precheck, dev, model)
     if not ok:
         await broadcast({"type": "model_pull", "model": model, "status": "error",
                          "pct": 0, "error": reason})
         await broadcast({"type": "system", "text": reason})
         return
+    if kind == "custom" and reason:
+        await broadcast({"type": "system", "text": reason})
     await broadcast({"type": "model_pull", "model": model, "status": "starting", "pct": 0})
 
     def _cb(p):
@@ -1886,6 +2257,7 @@ async def _pull_model(model: str) -> None:
                      "status": "done" if res.get("ok") else "error",
                      "pct": 100, "error": res.get("error")})
     await asyncio.to_thread(_detect_local_models)
+    await _broadcast_models_loaded()
 
 
 async def _benchmark_model(model: str) -> None:
@@ -1894,6 +2266,7 @@ async def _benchmark_model(model: str) -> None:
     await broadcast({"type": "model_bench", "model": model, "status": "running"})
     res = await asyncio.to_thread(models_advisor.benchmark, model)
     await broadcast({"type": "model_bench", "status": "done", **res})
+    await _broadcast_models_loaded()
 
 
 async def _delete_model(model: str) -> None:
@@ -1910,6 +2283,7 @@ async def _delete_model(model: str) -> None:
     await broadcast({"type": "model_delete", "model": model,
                      "ok": bool(res.get("ok")), "error": res.get("error"),
                      "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK}})
+    await _broadcast_models_loaded()
 
 
 async def _set_local_model(model: str) -> None:
@@ -1930,6 +2304,7 @@ async def _set_local_model(model: str) -> None:
     if ok:
         _settings["local_model"] = resolved
         _save_settings()
+        models_advisor.invalidate_install_cache()
         await asyncio.to_thread(_detect_local_models)
     else:
         await broadcast({"type": "system", "text": reason or f"Can't use {model} on this device."})
@@ -1991,7 +2366,7 @@ async def _stop_speaking() -> None:
 async def dispatch_command(text: str) -> None:
     """Entry point for every command (voice or typed). Barges in on whatever is
     currently running — thinking OR speaking — so a new directive takes over."""
-    global _current_task
+    global _current_task, _turn_generation
     busy = (
         (_current_task and not _current_task.done())
         or (_speak_task and not _speak_task.done())
@@ -1999,6 +2374,7 @@ async def dispatch_command(text: str) -> None:
     )
     if busy:
         await _stop_speaking()
+    _turn_generation += 1
     _current_task = asyncio.create_task(handle_command(text))
 
 
@@ -2128,7 +2504,7 @@ async def handle_command(text: str) -> None:
     _last_activity = time.time()
     _filler_sent = False   # reset the slow-tool filler gate for this turn
     await _update_affect(text)
-    await broadcast({"type": "state", "status": "thinking", "text": "Processing directive..."})
+    await broadcast({"type": "state", "status": "thinking", "text": "Thinking…"})
 
     try:
         question = _deliberation_target(text)
@@ -2168,19 +2544,31 @@ def _voice_params(base_rate: str) -> tuple[str, str]:
     return rate, pitch
 
 
+async def _schedule_speak(text: str) -> None:
+    """Cancel any in-flight speech before starting new audio."""
+    global _speak_task
+    if _speak_task and not _speak_task.done():
+        _speak_task.cancel()
+        try:
+            await _speak_task
+        except asyncio.CancelledError:
+            pass
+    _speak_task = asyncio.create_task(_speak(text))
+
+
 async def _speak(text: str) -> None:
     global _speaking_text
     try:
         import edge_tts
     except ImportError:
+        await broadcast({"type": "tts_error",
+                         "text": "Speech unavailable — run: pip install edge-tts"})
         return
 
     clean = re.sub(r"[*_`#\[\]()]", "", text).strip()
     if not clean:
         return
 
-    # Record what we're about to say so the mic can tell JARVIS's own voice (echo)
-    # apart from the user. Cleared by the frontend's tts_end signal.
     _speaking_text = clean.lower()
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
@@ -2191,14 +2579,21 @@ async def _speak(text: str) -> None:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_bytes += chunk["data"]
-        if audio_bytes:
-            b64 = base64.b64encode(audio_bytes).decode()
-            await broadcast({"type": "tts_audio", "data": b64})
+        if not audio_bytes:
+            await broadcast({"type": "tts_error",
+                             "text": "Speech failed — Edge TTS returned no audio. Check internet."})
+            _speaking_text = ""
+            await broadcast({"type": "state", "status": "idle"})
+            return
+        b64 = base64.b64encode(audio_bytes).decode()
+        await broadcast({"type": "tts_audio", "data": b64})
     except asyncio.CancelledError:
         _speaking_text = ""
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        _speaking_text = ""
+        await broadcast({"type": "tts_error",
+                         "text": f"Speech failed: {exc}"})
     await broadcast({"type": "state", "status": "idle"})
 
 
@@ -2346,6 +2741,7 @@ def _voice_worker() -> None:
             recording = False
             utterance: list = []
             silence_cnt = 0
+            level_tick = 0
 
             while _listening:
                 try:
@@ -2357,7 +2753,9 @@ def _voice_worker() -> None:
                 # barge in with the wake word. Self-talk is prevented by the
                 # wake-word gate + echo guard in _flush(), not by muting.
                 energy = int(np.abs(chunk).mean())
-                broadcast_from_thread({"type": "audio_level", "level": min(energy * 5, 32767)})
+                level_tick += 1
+                if level_tick % 4 == 0:
+                    broadcast_from_thread({"type": "audio_level", "level": min(energy * 5, 32767)})
 
                 if not recording:
                     if energy > SPEECH_THRESH:
@@ -2394,8 +2792,10 @@ async def agent_status() -> dict:
     disk = psutil.disk_usage(_disk_root())
     return {
         "brain": {
-            "primary_llm":          _active_model(),
-            "local_model":          OLLAMA_MODEL,
+            "primary_llm":          _routing_label(),
+            "configured_default":   _active_model(),
+            "last_rung":            (_last_decision or {}).get("rung"),
+            "local_model":          (_settings.get("local_model") or LOCAL_DEEP or LOCAL_FAST or None),
             "reasoning":            GROQ_REASONING if "gpt-oss" in GROQ_MODEL else "—",
             "max_agent_steps":      8,
         },
@@ -2409,6 +2809,10 @@ async def agent_status() -> dict:
         "voice": {
             "current": _tts_voice,
             "options": VOICE_OPTIONS,
+            "tts": True,
+            "stt": bool(USE_GROQ and _HAS_GROQ),
+            "stt_hint": None if (USE_GROQ and _HAS_GROQ) else
+                        "Mic input needs a free Groq API key (Whisper). Speech output does not.",
         },
         "user": {
             "name":      _user_name(),
@@ -2482,21 +2886,39 @@ async def models_endpoint() -> dict:
         up, ver = models_advisor.ollama_up()
         dev = device.profile()
         budget = models_advisor.model_budget(dev)
+        ranked = models_advisor.ranked_for_device(dev, set())
         if not up:
             return {"ollama": False, "tier": dev.get("tier"), "budget": budget,
                     "recommended": models_advisor.recommend_for_device(dev, set()),
+                    "ranked": ranked,
+                    "benchmarks": models_advisor.load_benchmarks(),
                     "allowed_count": len(models_advisor.allowed_models(dev))}
         inst = models_advisor.annotate_installed(dev, models_advisor.installed(with_caps=True))
         names = {m["name"] for m in inst}
+        ranked = models_advisor.ranked_for_device(dev, names)
         out = {"ollama": True, "version": ver, "tier": dev.get("tier"),
                 "installed": inst, "running": models_advisor.running(),
                 "recommended": models_advisor.recommend_for_device(dev, names),
+                "ranked": ranked,
+                "benchmarks": models_advisor.load_benchmarks(),
                 "budget": budget,
                 "allowed_count": len(models_advisor.allowed_models(dev)),
                 "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK},
                 "pinned": _settings.get("local_model")}
         return out
     return await asyncio.to_thread(_gather)
+
+
+@app.get("/api/models/loaded")
+async def models_loaded_endpoint() -> dict:
+    """Live snapshot of models Ollama currently has in memory (poll-friendly)."""
+    running = await asyncio.to_thread(models_advisor.running)
+    return {"running": running, "ts": time.time()}
+
+
+async def _broadcast_models_loaded() -> None:
+    running = await asyncio.to_thread(models_advisor.running)
+    await broadcast({"type": "models_loaded", "running": running, "ts": time.time()})
 
 
 @app.get("/api/governor")

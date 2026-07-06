@@ -3,9 +3,9 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
-import isDev from "electron-is-dev";
 
-const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage } = electron;
+const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage, screen, dialog } = electron;
+const isDev = !app.isPackaged;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uiRoot  = path.resolve(__dirname, "..");
@@ -29,6 +29,20 @@ let tradingProcs = [];
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
 app.commandLine.appendSwitch("ignore-gpu-blocklist");
+
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
+
+let appIsQuitting = false;
 
 // ── Secure API-key storage ──────────────────────────────────────────────────
 // Keys are encrypted with the OS keychain (DPAPI on Windows, Keychain on macOS,
@@ -188,10 +202,50 @@ async function startPythonBackend() {
   return waitForBackend();
 }
 
+// Remember window position/size/maximized-state across launches — a native
+// app doesn't reset itself to a hardcoded size every time you open it.
+const windowStatePath = () => path.join(app.getPath("userData"), "window-state.json");
+
+function loadWindowState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(windowStatePath(), "utf-8"));
+    const { width, height, x, y, isMaximized } = raw;
+    if (typeof width !== "number" || typeof height !== "number") return null;
+    if (typeof x === "number" && typeof y === "number") {
+      // Discard a saved position that's no longer on any connected display
+      // (e.g. an external monitor was unplugged) — recenter instead of
+      // risking an unreachable off-screen window.
+      const onScreen = screen.getAllDisplays().some((d) => {
+        const a = d.workArea;
+        return x >= a.x - width && x <= a.x + a.width && y >= a.y - height && y <= a.y + a.height;
+      });
+      if (onScreen) return { width, height, x, y, isMaximized: Boolean(isMaximized) };
+    }
+    return { width, height, isMaximized: Boolean(isMaximized) };
+  } catch {
+    return null;
+  }
+}
+
+function saveWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  try {
+    const isMaximized = mainWindow.isMaximized();
+    // getBounds() while maximized returns the maximized size — save the
+    // pre-maximize (normal) bounds so un-maximizing restores the right size.
+    const bounds = isMaximized ? mainWindow.getNormalBounds() : mainWindow.getBounds();
+    fs.writeFileSync(windowStatePath(), JSON.stringify({ ...bounds, isMaximized }), "utf-8");
+  } catch {
+    /* best-effort — a failed save just means next launch uses defaults */
+  }
+}
+
 function createWindow() {
+  const saved = loadWindowState();
   mainWindow = new BrowserWindow({
-    width: 1360,
-    height: 860,
+    width: saved?.width ?? 1360,
+    height: saved?.height ?? 860,
+    ...(saved?.x !== undefined && saved?.y !== undefined ? { x: saved.x, y: saved.y } : {}),
     minWidth: 1100,
     minHeight: 720,
     frame: false,
@@ -209,6 +263,8 @@ function createWindow() {
     },
   });
 
+  if (saved?.isMaximized) mainWindow.maximize();
+
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: "deny" };
@@ -219,8 +275,16 @@ function createWindow() {
     mainWindow.focus();
   });
 
+  mainWindow.on("hide", () => {
+    mainWindow?.webContents.setBackgroundThrottling(true);
+  });
+
+  mainWindow.on("show", () => {
+    mainWindow?.webContents.setBackgroundThrottling(false);
+  });
+
   mainWindow.on("close", (event) => {
-    if (!app.isQuitting) {
+    if (!appIsQuitting) {
       event.preventDefault();
       mainWindow.hide();
     }
@@ -231,8 +295,17 @@ function createWindow() {
   });
 
   // Notify the renderer so the maximize/restore button shows the right icon.
-  mainWindow.on("maximize", () => mainWindow?.webContents.send("window-maximized", true));
-  mainWindow.on("unmaximize", () => mainWindow?.webContents.send("window-maximized", false));
+  mainWindow.on("maximize", () => { mainWindow?.webContents.send("window-maximized", true); saveWindowState(); });
+  mainWindow.on("unmaximize", () => { mainWindow?.webContents.send("window-maximized", false); saveWindowState(); });
+
+  // Debounced — resize/move fire continuously while dragging.
+  let boundsSaveTimer;
+  const scheduleBoundsSave = () => {
+    clearTimeout(boundsSaveTimer);
+    boundsSaveTimer = setTimeout(saveWindowState, 500);
+  };
+  mainWindow.on("resize", scheduleBoundsSave);
+  mainWindow.on("move", scheduleBoundsSave);
 }
 
 async function loadApp() {
@@ -269,7 +342,7 @@ function createTray() {
     {
       label: "Quit",
       click: () => {
-        app.isQuitting = true;
+        appIsQuitting = true;
         app.quit();
       },
     },
@@ -283,26 +356,76 @@ function createTray() {
 }
 
 async function restartBackend() {
-  stopPythonBackend();
+  await stopPythonBackend();
   await startPythonBackend();
   await mainWindow?.loadURL(backendUrl);
 }
 
+// A real application menu — mainly for its keyboard accelerators (Ctrl+R,
+// Ctrl+Q, etc.). The window is frameless, so no bar is ever drawn; this is
+// purely what makes native-feeling shortcuts actually work.
+function createAppMenu() {
+  const template = [
+    {
+      label: "JARVIS",
+      submenu: [
+        { label: "Restart Backend", accelerator: "CmdOrCtrl+Shift+R", click: () => restartBackend() },
+        { type: "separator" },
+        { label: "About JARVIS", click: () => showAboutDialog() },
+        { type: "separator" },
+        { label: "Quit", accelerator: "CmdOrCtrl+Q", click: () => { appIsQuitting = true; app.quit(); } },
+      ],
+    },
+    { label: "View", submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }] },
+    { label: "Window", submenu: [{ role: "minimize" }, { role: "close" }] },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function showAboutDialog() {
+  dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: "About JARVIS",
+    message: "JARVIS",
+    detail: `Version ${app.getVersion()}\nA personal, compute-elastic AI assistant.`,
+    buttons: ["OK"],
+  });
+}
+
+// Returns a promise that resolves once the old process has actually exited (or
+// after a 5s safety timeout), so restartBackend() can't spawn a new backend —
+// and have startPythonBackend()'s isBackendReady() falsely "reuse" the still-
+// dying old one — while the previous process is still holding the port.
 function stopPythonBackend() {
-  if (!pythonProcess || !ownsBackend) return;
+  if (!pythonProcess || !ownsBackend) return Promise.resolve();
   console.log("[Electron] Terminating Python backend...");
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", pythonProcess.pid, "/f", "/t"]);
-  } else {
-    pythonProcess.kill();
-  }
+  const proc = pythonProcess;
   pythonProcess = undefined;
   ownsBackend = false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(); } };
+    proc.once("exit", done);
+    setTimeout(done, 5000); // don't let a stuck kill hang the restart forever
+    try {
+      if (process.platform === "win32") {
+        spawn("taskkill", ["/pid", String(proc.pid), "/f", "/t"], { windowsHide: true });
+      } else {
+        proc.kill("SIGTERM");
+      }
+    } catch (err) {
+      console.error("[Electron] Failed to stop Python backend:", err);
+      done();
+    }
+  });
 }
 
 // ── Trading terminal (c0mr4des) — launched in its own window ──────────────────
 async function isUrlReady(url) {
-  try { const r = await fetch(url); return r.ok || r.status < 500; } catch { return false; }
+  // r.ok (2xx) only — a transient 404/other 4xx while a dev server is mid-boot
+  // must not be treated as "ready", or the caller loads a broken page and stops
+  // polling instead of waiting for the real response.
+  try { const r = await fetch(url); return r.ok; } catch { return false; }
 }
 
 function spawnAndLog(cmd, args, opts, tag) {
@@ -333,7 +456,13 @@ async function openTradingTerminal() {
   tradingWindow = new BrowserWindow({
     width: 1500, height: 920, backgroundColor: "#0a0705",
     title: "JARVIS · Trading Terminal", autoHideMenuBar: true,
-    webPreferences: { nodeIntegration: false, contextIsolation: true },
+    webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true },
+  });
+  // Same popup/navigation hardening as mainWindow — this window loads content
+  // from a sibling repo (c0mr4des_terminal) not reviewed by this codebase.
+  tradingWindow.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: "deny" };
   });
   tradingWindow.on("closed", () => { tradingWindow = undefined; });
   tradingWindow.loadURL(LOADING_HTML("⟳ Spinning up the trading terminal…"));
@@ -397,7 +526,7 @@ ipcMain.handle("keys:status", () => apiKeyStatus());
 ipcMain.handle("keys:set", async (_event, keys) => {
   saveEncryptedKeys(keys || {});
   // Restart the Python backend so it picks up the new keys from its environment.
-  stopPythonBackend();
+  await stopPythonBackend();
   await startPythonBackend();
   return apiKeyStatus();
 });
@@ -405,34 +534,42 @@ ipcMain.on("open-external", (_event, url) => {
   if (typeof url === "string" && /^https:\/\//i.test(url)) shell.openExternal(url);
 });
 
-app.whenReady().then(async () => {
-  createWindow();
-  createTray();
-  await loadApp();
+if (gotSingleInstanceLock) {
+  app.whenReady().then(async () => {
+    createWindow();
+    createTray();
+    createAppMenu();
+    await loadApp();
 
-  globalShortcut.register("Alt+Space", () => {
-    if (!mainWindow) return;
-    if (mainWindow.isVisible()) {
-      mainWindow.hide();
-    } else {
-      mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+    globalShortcut.register("Alt+Space", () => {
+      if (!mainWindow) return;
+      if (mainWindow.isVisible()) {
+        mainWindow.hide();
+      } else {
+        mainWindow.show();
+        mainWindow.focus();
+      }
+    });
 
-  app.on("activate", async () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-      await loadApp();
-    }
+    app.on("activate", async () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+        await loadApp();
+      }
+    });
   });
-});
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-app.on("before-quit", () => { stopPythonBackend(); stopTrading(); });
+app.on("before-quit", () => {
+  appIsQuitting = true;
+  saveWindowState();
+  stopPythonBackend();
+  stopTrading();
+});
 
 app.on("will-quit", () => {
   globalShortcut.unregisterAll();

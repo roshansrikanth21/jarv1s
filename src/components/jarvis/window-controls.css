@@ -1,0 +1,40 @@
+.winctl {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
+}
+
+.winctl--minimal {
+  padding-left: 8px;
+  margin-left: 4px;
+  border-left: 1px solid color-mix(in srgb, var(--winctl-accent, #888) 28%, transparent);
+}
+
+.winctl-btn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: none;
+  background: transparent;
+  color: color-mix(in srgb, var(--winctl-accent, #888) 55%, #666);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: color 150ms, background 150ms;
+}
+
+.winctl-btn:hover {
+  color: var(--winctl-accent, #ccc);
+  background: color-mix(in srgb, var(--winctl-accent, #888) 12%, transparent);
+}
+
+.winctl-btn--close:hover {
+  color: #ff6b6b;
+  background: color-mix(in srgb, #ff6b6b 14%, transparent);
+}
+
+.winctl-btn:focus-visible {
+  outline: 1px solid var(--winctl-accent, #888);
+  outline-offset: 2px;
+}

@@ -29,6 +29,7 @@
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "tailwindcss": "^4.2.1",
+    "three": "^0.185.1",
     "tw-animate-css": "^1.3.4",
     "vite-tsconfig-paths": "^6.0.2"
   },
@@ -38,6 +39,7 @@
     "@types/node": "^22.16.5",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@types/three": "^0.185.0",
     "@vitejs/plugin-react": "^5.0.4",
     "concurrently": "^9.2.1",
     "electron": "^42.0.1",
@@ -68,25 +70,9 @@
     ],
     "extraResources": [
       {
-        "from": "../dist-python/jarvis_backend",
+        "from": "dist-python/jarvis_backend",
         "to": "jarvis_backend",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "dist",
-        "to": "ui/dist",
-        "filter": [
-          "**/*"
-        ]
-      },
-      {
-        "from": "../prompts",
-        "to": "prompts",
-        "filter": [
-          "**/*"
-        ]
+        "filter": ["**/*"]
       }
     ],
     "win": {

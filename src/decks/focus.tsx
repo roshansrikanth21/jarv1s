@@ -4,15 +4,16 @@
 // useJarvisSocket hook — this file is view-only and re-implements no protocol.
 // Rendered by src/routes/index.tsx as a plain component.
 import { useEffect, useRef, useState } from "react";
+import { WindowControls } from "@/components/jarvis/WindowControls";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
 const ACCENT = "oklch(0.74 0.13 205)";   // cool cyan — distinct from the amber decks
 const BG = "#070b0e";
 
 export default function FocusDeck() {
-  const { connected, listening, speaking, lines, stream, mood, level, send, toggleMic } =
+  const { connected, listening, speaking, lines, stream, mood, level, send, toggleMic, showReconnectHint } =
     useJarvisSocket("JARVIS online. Ask, or tap the orb to speak.");
-  const [input, setInput]   = useState("");
+  const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -30,25 +31,41 @@ export default function FocusDeck() {
       fontFamily: "JetBrains Mono, ui-monospace, monospace",
       display: "flex", flexDirection: "column", alignItems: "center",
     }}>
-      {/* top bar (className="drag" makes the frameless window movable here) */}
-      <div className="drag" style={{
-        width: "100%", maxWidth: 760, display: "flex", alignItems: "center",
-        justifyContent: "space-between", padding: "16px 20px", gap: 12,
-      }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-          <span style={{ width: 8, height: 8, borderRadius: "50%", background: connected ? ACCENT : "#555",
-            boxShadow: connected ? `0 0 8px ${ACCENT}` : "none" }} />
-          <span style={{ fontSize: 13, letterSpacing: "0.32em", fontWeight: 600 }}>JARVIS</span>
-          <span style={{ fontSize: 9, opacity: 0.4, letterSpacing: "0.2em", textTransform: "uppercase" }}>focus</span>
-        </div>
-        {mood?.enabled && (
-          <div style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 10, opacity: 0.7 }}>
-            <span style={{ width: 6, height: 6, borderRadius: "50%", background: ACCENT,
-              opacity: 0.5 + (mood.intensity ?? 0) * 0.5 }} />
-            <span style={{ textTransform: "lowercase", letterSpacing: "0.08em" }}>{mood.emotion}</span>
+      {/* full-width header — controls pinned to window top-right */}
+      <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>
+        <div className="drag" style={{
+          width: "100%", display: "flex", alignItems: "center",
+          justifyContent: "center", padding: "16px 52px 16px 20px", gap: 12,
+        }}>
+          <div style={{ width: "100%", maxWidth: 760, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: connected ? ACCENT : "#555",
+                boxShadow: connected ? `0 0 8px ${ACCENT}` : "none" }} />
+              <span style={{ fontSize: 13, letterSpacing: "0.32em", fontWeight: 600 }}>JARVIS</span>
+              <span style={{ fontSize: 9, color: "rgba(232, 238, 242, 0.55)", letterSpacing: "0.2em", textTransform: "uppercase" }}>focus</span>
+            </div>
+            {mood?.enabled && (
+              <div className="no-drag" style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 10, opacity: 0.7 }}>
+                <span style={{ width: 6, height: 6, borderRadius: "50%", background: ACCENT,
+                  opacity: 0.5 + (mood.intensity ?? 0) * 0.5 }} />
+                <span style={{ textTransform: "lowercase", letterSpacing: "0.08em" }}>{mood.emotion}</span>
+              </div>
+            )}
           </div>
-        )}
+        </div>
+        <div className="no-drag" style={{ position: "absolute", top: 12, right: 10, zIndex: 2 }}>
+          <WindowControls accent={ACCENT} />
+        </div>
       </div>
+
+      {!connected && showReconnectHint && (
+        <div className="no-drag" style={{
+          width: "100%", maxWidth: 760, padding: "0 20px 8px",
+          fontSize: 10, color: "rgba(232, 238, 242, 0.55)", letterSpacing: "0.06em",
+        }}>
+          Waking up…
+        </div>
+      )}
 
       {/* conversation */}
       <div ref={scrollRef} style={{

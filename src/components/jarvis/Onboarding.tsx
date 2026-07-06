@@ -61,7 +61,7 @@ export function Onboarding({ onComplete }: { onComplete: (name: string) => void 
     fetch("/api/device").then(r => r.json()).then(setDevice).catch(() => {});
     if (hasElectron) window.electronAPI!.getApiKeyStatus!().then(setKeyStatus).catch(() => {});
 
-    const ws = new WebSocket(`ws://${window.location.host}/ws`);
+    const ws = new WebSocket(`${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`);
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       try {

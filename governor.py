@@ -51,6 +51,11 @@ RUNG_BY_ID = {r["id"]: r for r in RUNGS}
 
 MODES = ("auto", "eco", "local", "cloud")   # local = privacy/offline, cloud = max quality
 
+# Below this difficulty score, agent loops run chat-only (no tool schema round-trips).
+TOOLING_MIN_DIFFICULTY = 0.22
+# Under memory pressure, raise the bar so local CPU doesn't hammer tool loops.
+TOOLING_RAM_PRESSURE_PCT = 85
+
 # Context-vector dimension (LinUCB). Order is fixed — see _feature_vector.
 _CTX_DIM = 10
 _MU = 0.15            # latency weight
@@ -230,7 +235,7 @@ class GovernorState:
         r = RUNG_BY_ID[rid]
         if latency_s > 0:
             self.counts[rid] = self.counts.get(rid, 0) + 1
-            lat_norm = min(1.0, latency_s / 12.0)
+            lat_norm = min(1.0, latency_s / 60.0)
             self.lat_ewma[rid] = round(0.7 * self.lat_ewma.get(rid, lat_norm) + 0.3 * lat_norm, 3)
         else:
             lat_norm = self.lat_ewma.get(rid, 0.5)
@@ -270,15 +275,38 @@ def decide(text: str, history: list[dict] | None, device: dict,
     diff = estimate_difficulty(text, history)
     feas = feasible_rungs(available, device, mode)
     if not feas:
-        feas = [RUNG_BY_ID[r] for r in RUNGS if r["id"] in available] or [RUNGS[0]]
+        pool = RUNGS
+        if mode == "local":
+            pool = [r for r in RUNGS if r["local"]]
+        elif mode == "cloud":
+            pool = [r for r in RUNGS if not r["local"]]
+        feas = [RUNG_BY_ID[r["id"]] for r in pool if r["id"] in available]
+        if not feas and mode == "auto":
+            feas = [RUNG_BY_ID[r["id"]] for r in RUNGS if r["id"] in available]
+        if not feas and mode != "local":
+            feas = [RUNG_BY_ID[r["id"]] for r in RUNGS if r["id"] in available]
+        if not feas:
+            if mode == "local":
+                pick = next((r["id"] for r in RUNGS if r["local"] and r["id"] in available),
+                            next((r["id"] for r in RUNGS if r["local"]), "local_fast"))
+                feas = [RUNG_BY_ID[pick]]
+            elif mode == "cloud":
+                pick = next((r["id"] for r in RUNGS if not r["local"] and r["id"] in available),
+                            next((r["id"] for r in RUNGS if not r["local"]), "cloud_fast"))
+                feas = [RUNG_BY_ID[pick]]
+            else:
+                rid = next(iter(available), "local_fast")
+                feas = [RUNG_BY_ID.get(rid, RUNGS[0])]
 
     lam = lambda_eff(device, mode)
     x = _feature_vector(diff["score"], device)
     min_q = 0.35 + 0.60 * diff["score"]       # quality bar implied by difficulty
 
     def _cost(r: dict) -> float:
-        # energy + latency budget, minus what the bandit has learned to favor here
-        return lam * r["energy"] + _MU * r["latency"] - state._bonus(r["id"], x)
+        # Energy + learned latency (EWMA from this machine), minus bandit bonus.
+        learned = state.lat_ewma.get(r["id"])
+        lat = learned if learned is not None else r["latency"]
+        return lam * r["energy"] + _MU * lat - state._bonus(r["id"], x)
 
     adequate = [r for r in feas if r["quality"] >= min_q]
     if mode == "cloud":
@@ -323,3 +351,27 @@ def decide(text: str, history: list[dict] | None, device: dict,
     state.log.append({k: decision[k] for k in ("id", "rung", "difficulty", "lambda_eff", "ts")})
     state.log[:] = state.log[-60:]
     return decision
+
+
+def agent_needs_tools(decision: dict, device: dict | None = None) -> bool:
+    """Whether this turn should run the tool-calling agent loop.
+
+    Derived from the same difficulty estimator the Governor already uses — not
+    hardcoded phrase lists. Tool intent in the message, multistep/code/math
+    work, or high difficulty all enable tools; casual chat does not."""
+    factors = decision.get("factors") or {}
+    if factors.get("tool", 0) >= 1.0:
+        return True
+    if factors.get("multistep", 0) >= 0.5:
+        return True
+    if factors.get("code", 0) >= 1.0 or factors.get("math", 0) >= 1.0:
+        return True
+    if factors.get("hard", 0) >= 0.5:
+        return True
+
+    threshold = TOOLING_MIN_DIFFICULTY
+    ram_pct = (device or {}).get("ram_percent")
+    if isinstance(ram_pct, (int, float)) and ram_pct >= TOOLING_RAM_PRESSURE_PCT:
+        threshold = max(threshold, 0.35)
+
+    return float(decision.get("difficulty") or 0) >= threshold

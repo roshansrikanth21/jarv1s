@@ -34,3 +34,7 @@ desktop.ini
 
 # Electron builder
 out/
+
+# Local tool output/scratch
+graphify-out/
+scratch_nib2_*.png
