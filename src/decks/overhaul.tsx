@@ -35,6 +35,8 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
+import { HudAmbient } from "@/components/jarvis/HudAmbient";
+import { ShaderBackdrop } from "@/components/jarvis/ShaderBackdrop";
 import { notifyNative } from "@/lib/utils";
 
 // Rendered as a UI preset by src/routes/index.tsx (not a standalone route).
@@ -632,9 +634,14 @@ function CommandDeck() {
 
   return (
     <div className="hud-root">
-      {/* Background layers */}
+      {/* Background layers (deepest first): living shader wash → grid → reactive motes */}
       <div className="hud-bg" aria-hidden>
+        <ShaderBackdrop state={speaking ? "speaking" : listening ? "listening" : "idle"} />
         <div className="hud-bg-grid" />
+        <HudAmbient
+          state={speaking ? "speaking" : listening ? "listening" : "idle"}
+          intensity={agentStatus.emotion?.enabled ? (agentStatus.emotion.intensity ?? 0.5) : 0.4}
+        />
         <div className="hud-bg-scanline" />
         <motion.div
           className="hud-scan-sweep"

@@ -100,6 +100,18 @@ html, body {
   background-size: 100% 100%, 52px 52px, 52px 52px;
   background-position: center, -1px -1px, -1px -1px;
   opacity: 0.65;
+  /* Slow diagonal parallax — the deck feels alive without pulling the eye. */
+  animation: hudGridDrift 90s linear infinite;
+}
+@keyframes hudGridDrift {
+  to { background-position: center, 51px 51px, 51px 51px; }
+}
+/* Cinematic vignette + top aura — pushes the panels forward, deepens the void. */
+.hud-bg::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background:
+    radial-gradient(120% 80% at 50% 40%, transparent 58%, oklch(0.05 0.01 28 / 0.55) 100%),
+    radial-gradient(ellipse 60% 30% at 50% 0%, oklch(0.68 0.22 38 / 0.06), transparent 70%);
 }
 .hud-bg-scanline {
   position: absolute; inset: 0;
@@ -108,11 +120,20 @@ html, body {
     transparent 0, transparent 3px,
     oklch(1 0 0 / 0.014) 3px, oklch(1 0 0 / 0.014) 4px
   );
+  animation: hudScanlineFlicker 5.5s ease-in-out infinite;
+}
+@keyframes hudScanlineFlicker {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.72; }
 }
 .hud-scan-sweep {
   position: absolute; left: 0; right: 0; height: 2px;
   background: linear-gradient(90deg, transparent, oklch(0.68 0.22 38 / 0.35), transparent);
+  box-shadow: 0 0 12px oklch(0.68 0.22 38 / 0.25);
   pointer-events: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .hud-bg-grid, .hud-bg-scanline { animation: none; }
 }
 
 /* ── Header ──────────────────────────────────────────────── */
@@ -145,10 +166,27 @@ html, body {
 .hud-corner-box::after  { bottom: -4px; right: -4px; border-left: 0; border-top: 0; }
 
 .hud-logo-name {
-  font-size: 11px; font-weight: 600;
+  font-size: 11px; font-weight: 700;
   letter-spacing: 0.35em; text-transform: uppercase;
-  color: var(--c-amber);
-  text-shadow: 0 0 12px oklch(0.68 0.22 38 / 0.6);
+  /* Liquid-metal wordmark: a molten copper→chrome→gold sheen flows across the letters. */
+  background: linear-gradient(
+    100deg,
+    oklch(0.52 0.15 42) 0%,
+    oklch(0.80 0.15 78) 22%,
+    oklch(0.98 0.02 92) 40%,   /* chrome specular highlight */
+    oklch(0.70 0.21 40) 58%,
+    oklch(0.90 0.14 80) 76%,
+    oklch(0.52 0.15 42) 100%
+  );
+  background-size: 250% 100%;
+  -webkit-background-clip: text; background-clip: text;
+  -webkit-text-fill-color: transparent; color: transparent;
+  filter: drop-shadow(0 0 10px oklch(0.68 0.22 38 / 0.5));
+  animation: liquidMetalSweep 6.5s linear infinite;
+}
+@keyframes liquidMetalSweep { to { background-position: 250% 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .hud-logo-name { animation: none; background-position: 40% 0; }
 }
 .hud-logo-sub {
   font-size: 7.5px; letter-spacing: 0.18em; text-transform: uppercase;
