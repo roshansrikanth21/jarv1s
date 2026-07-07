@@ -27,7 +27,7 @@ from typing import Any
 
 import psutil
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,6 +53,7 @@ log = logging.getLogger("jarvis")
 BASE_DIR     = Path(__file__).parent
 MEMORY_FILE   = BASE_DIR / "memory" / "jarvis_memory.json"
 HISTORY_FILE  = BASE_DIR / "memory" / "jarvis_history.json"
+OVERHEARD_FILE = BASE_DIR / "memory" / "jarvis_overheard.json"  # rolling ambient speech log
 TASKS_FILE    = BASE_DIR / "memory" / "jarvis_tasks.json"
 SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
 GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
@@ -99,33 +100,62 @@ GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard ca
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 
+# ── Browser automation (browser-harness, isolated venv → Chrome via CDP) ─────────
+# Isolated so browser-harness's pinned deps (websockets 15) never clash with JARVIS's
+# (16). JARVIS talks to a debug Chrome on the CDP port: if one is already there (e.g.
+# you enabled remote debugging on your own browser via chrome://inspect) it drives that;
+# otherwise it launches a dedicated-profile Chrome. CDP is reached via `localhost` —
+# newer Chrome blocks the /json endpoints when addressed as 127.0.0.1.
+BH_CLI      = os.environ.get("JARVIS_BH_CLI", str(BASE_DIR.parent / "bh-venv" / "Scripts" / "browser-harness.exe"))
+BH_PORT     = int(os.environ.get("JARVIS_BH_PORT", "9222"))
+BH_CDP_URL  = os.environ.get("JARVIS_BH_CDP_URL", f"http://localhost:{BH_PORT}")
+BH_CHROME   = os.environ.get("JARVIS_CHROME", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+BH_PROFILE  = os.environ.get("JARVIS_BH_PROFILE", str(BASE_DIR.parent / "bh-chrome-profile"))
+BH_HEADLESS = os.environ.get("JARVIS_BH_HEADLESS", "0") != "0"   # default: visible, so you can watch it work
+BH_TIMEOUT  = int(os.environ.get("JARVIS_BH_TIMEOUT", "150"))
+
 # Wake word: voice commands only fire when prefixed with one of these. Includes
 # common Whisper mis-hears of "jarvis". Set JARVIS_WAKE_REQUIRED=0 to disable.
 WAKE_WORDS = [w.strip().lower() for w in os.environ.get(
     "JARVIS_WAKE_WORDS", "jarvis,jarvis.,jervis,javis,jarvus,jarvi,travis,charvis,jarvix"
 ).split(",") if w.strip()]
 WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
+# After a bare "jarvis" (wake word with no command), stay armed this many seconds and
+# take the NEXT thing you say as the command — so "Jarvis…" [pause] "what's the weather"
+# works like any real assistant, not just "jarvis what's the weather" in one breath.
+WAKE_WINDOW = float(os.environ.get("JARVIS_WAKE_WINDOW", "8"))
+WAKE_ACKS = ["Yes?", "Go ahead.", "I'm listening.", "Mm-hm?", "Sir?"]
+# Always-on ears: auto-start the mic when a client connects, so JARVIS is listening
+# without a button press. It still only ACTS on utterances addressed with the wake word.
+ALWAYS_LISTEN = os.environ.get("JARVIS_ALWAYS_LISTEN", "1") != "0"
+# Ambient memory: store EVERYTHING transcribed (wake word or not) as a rolling log JARVIS
+# can relate to later. Set JARVIS_STORE_OVERHEARD=0 to only ever transcribe/keep commands.
+STORE_OVERHEARD = os.environ.get("JARVIS_STORE_OVERHEARD", "1") != "0"
+OVERHEARD_MAX = int(os.environ.get("JARVIS_OVERHEARD_MAX", "200"))
 STOP_WORDS = {"stop", "stop talking", "shut up", "be quiet", "quiet", "cancel",
               "enough", "shut up jarvis", "nevermind", "never mind"}
 RESET_PHRASES = {"new conversation", "start over", "start fresh", "reset",
                  "forget that", "forget all that", "clear context", "let's start over"}
 
-# Voice tuning (Microsoft Edge neural TTS). Ryan = British male, JARVIS-like.
-# A slight rate bump reads more like natural speech than the plodding default.
-TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-GB-RyanNeural")
-TTS_RATE  = os.environ.get("JARVIS_TTS_RATE", "+8%")
+# Voice (Microsoft Edge neural TTS). Default is the newest "Multilingual" conversation
+# voice — markedly more natural/human than the older neural voices. Andrew is warm and
+# confident; the British Ryan/Thomas remain a click away for the classic butler feel.
+TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "en-US-AndrewMultilingualNeural")
+TTS_RATE  = os.environ.get("JARVIS_TTS_RATE", "+3%")   # multilingual voices read best near natural pace
 TTS_PITCH = os.environ.get("JARVIS_TTS_PITCH", "+0Hz")
 
 # Voices the user can pick from at runtime (curated subset of Edge neural voices).
+# The Multilingual "Conversation" voices are the most natural-sounding — listed first.
 VOICE_OPTIONS = [
-    {"id": "en-GB-RyanNeural",        "label": "Ryan · British male (JARVIS)"},
+    {"id": "en-US-AndrewMultilingualNeural", "label": "Andrew · natural, warm (default)"},
+    {"id": "en-US-BrianMultilingualNeural",  "label": "Brian · natural, casual"},
+    {"id": "en-US-AvaMultilingualNeural",    "label": "Ava · natural female"},
+    {"id": "en-GB-RyanNeural",        "label": "Ryan · British male (classic JARVIS)"},
     {"id": "en-GB-ThomasNeural",      "label": "Thomas · British male, warm"},
     {"id": "en-US-GuyNeural",         "label": "Guy · US male, deep"},
-    {"id": "en-US-ChristopherNeural", "label": "Christopher · US male"},
     {"id": "en-US-EricNeural",        "label": "Eric · US male, calm"},
     {"id": "en-AU-WilliamNeural",     "label": "William · Australian male"},
     {"id": "en-GB-SoniaNeural",       "label": "Sonia · British female"},
-    {"id": "en-US-AriaNeural",        "label": "Aria · US female"},
     {"id": "en-US-JennyNeural",       "label": "Jenny · US female, friendly"},
 ]
 
@@ -134,7 +164,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -249,8 +279,11 @@ active_connections: list[WebSocket] = []
 task_list:   list[dict] = []
 agent_trace: list[dict] = []
 memories:    list[dict] = []
+_overheard:  list[dict] = []   # rolling log of everything heard (ambient memory)
+_overheard_dirty = 0           # utterances since last persist (throttles disk writes)
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
+_awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _listen_thread: threading.Thread | None = None
 _tts_playing = False          # frontend reports the exact playback window
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
@@ -369,6 +402,7 @@ def _user_name() -> str:
 
 memories  = _load_memory()
 task_list = _load_json(TASKS_FILE, [])
+_overheard = _load_json(OVERHEARD_FILE, [])[-OVERHEARD_MAX:]
 _history  = _load_json(HISTORY_FILE, [])[-CONV_TURNS:]
 _turn_seq = len(_history) // 2
 _settings = _load_json(SETTINGS_FILE, {})
@@ -535,6 +569,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # has no business being user-facing.
     await websocket.send_json({"type": "state", "status": "connected"})
     _maybe_run_briefing()
+    # Always-on ears: start listening the moment a client is present (no button press).
+    # The wake-word gate means it still only responds when addressed as "jarvis".
+    if ALWAYS_LISTEN and not _listening:
+        asyncio.create_task(_start_voice())
     try:
         while True:
             data = await websocket.receive_json()
@@ -636,6 +674,8 @@ TOOLS: list[dict] = [
                             "personal | preference | fact | security | task"
                         ),
                     },
+                    "importance": {"type": "integer", "description": "1 (mundane) to 10 (identity-defining). Default 5."},
+                    "namespace": {"type": "string", "description": "Scope, e.g. personal | ctf | work. Default personal."},
                 },
                 "required": ["content"],
             },
@@ -645,13 +685,46 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "recall_memory",
-            "description": "Search saved memories to recall information about the user.",
+            "description": "Search saved memories to recall information about the user. Semantic — matches by meaning, not just keywords.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search term or topic"},
+                    "k": {"type": "integer", "description": "How many memories to return. Default 6."},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browse",
+            "description": (
+                "Drive a REAL Chrome browser to open sites, click, fill forms, log in, or "
+                "extract live page content — for anything a plain web search can't do "
+                "(interacting with a page, logged-in sites, multi-step navigation, reading "
+                "JS-rendered content). You WRITE a short Python snippet using these "
+                "pre-imported helpers, then print() what you want back:\n"
+                "  new_tab(url) — open URL in a new tab (use for first navigation)\n"
+                "  goto_url(url) — navigate the current tab\n"
+                "  wait_for_load() — wait until the page finishes loading\n"
+                "  page_info() — returns {url, title, w, h, ...}\n"
+                "  js(code) — run JavaScript in the page and RETURN its value; use this to "
+                "read text/DOM, e.g. js(\"document.body.innerText\") or "
+                "js(\"[...document.querySelectorAll('h3')].map(e=>e.innerText)\")\n"
+                "  click_at_xy(x, y) — click at pixel coordinates\n"
+                "  capture_screenshot() — screenshot the viewport\n"
+                "Always print() results. Example: new_tab('https://news.ycombinator.com'); "
+                "wait_for_load(); print(js(\"[...document.querySelectorAll('.titleline a')]"
+                ".slice(0,5).map(a=>a.innerText)\"))"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python snippet using the browser helpers; print() what to return."},
+                },
+                "required": ["code"],
             },
         },
     },
@@ -921,6 +994,72 @@ CLAUDE_TOOLS = [
 ]
 
 
+# ── Browser automation helpers ───────────────────────────────────────────────────
+def _cdp_up() -> bool:
+    """True if a Chrome CDP endpoint is answering on the debug port (via localhost)."""
+    try:
+        with urllib.request.urlopen(f"http://localhost:{BH_PORT}/json/version", timeout=2) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def _ensure_debug_chrome() -> str | None:
+    """Make sure a Chrome with remote debugging is reachable. Uses an existing one on the
+    port if present (e.g. your own browser via chrome://inspect); else launches a
+    dedicated-profile instance. Returns an error string, or None on success."""
+    if _cdp_up():
+        return None
+    if not os.path.exists(BH_CHROME):
+        return f"Chrome not found at {BH_CHROME}. Set JARVIS_CHROME to chrome.exe."
+    args = [BH_CHROME, f"--remote-debugging-port={BH_PORT}",
+            f"--user-data-dir={BH_PROFILE}", "--no-first-run", "--no-default-browser-check"]
+    if BH_HEADLESS:
+        args += ["--headless=new", "--disable-gpu"]
+    try:
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
+        return f"could not launch Chrome: {exc}"
+    for _ in range(24):                       # ~12s for CDP to come up
+        time.sleep(0.5)
+        if _cdp_up():
+            return None
+    return "Chrome launched but its debug port never responded."
+
+
+def _browser_run(code: str) -> str:
+    """Run a browser-harness Python snippet against the debug Chrome and return its output.
+    browser-harness lives in its own venv (isolated deps); we shell out to its CLI."""
+    code = (code or "").strip()
+    if not code:
+        return "browse needs a `code` snippet using the browser helpers."
+    if not os.path.exists(BH_CLI):
+        return ("Browser support isn't installed. Set up the isolated env once:\n"
+                "  python -m venv C:\\Users\\rosha\\bh-venv\n"
+                "  C:\\Users\\rosha\\bh-venv\\Scripts\\pip install browser-harness")
+    err = _ensure_debug_chrome()
+    if err:
+        return f"Browser unavailable — {err}"
+    # Force UTF-8 both ways: pages return unicode (emoji, accents) that Windows' default
+    # cp1252 can't decode, which would otherwise lose all output.
+    env = {**os.environ, "BU_CDP_URL": BH_CDP_URL, "PYTHONIOENCODING": "utf-8"}
+    try:
+        proc = subprocess.run([BH_CLI], input=code, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=BH_TIMEOUT, env=env)
+    except subprocess.TimeoutExpired:
+        return f"Browser task timed out after {BH_TIMEOUT}s."
+    except Exception as exc:
+        return f"Browser task failed to run: {exc}"
+    out = (proc.stdout or "").strip()
+    errout = (proc.stderr or "").strip()
+    if proc.returncode != 0 and not out:
+        return f"Browser task error:\n{errout[:1500]}"
+    result = out or "(the snippet produced no output — remember to print() what you want back)"
+    if errout and errout not in result:
+        result += f"\n[stderr] {errout[:400]}"
+    return result[:4000]
+
+
 # ── Tool executor ──────────────────────────────────────────────────────────────
 def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str:
     global memories, task_list, _pending_content_panel
@@ -934,13 +1073,22 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return err
 
     if name == "remember":
+        now = time.time()
         entry = {
             "id": _next_id(memories),
             "content": args["content"],
             "category": _norm_memory_category(args.get("category", "fact")),
+            "importance": int(args.get("importance") or
+                              (6 if _norm_memory_category(args.get("category", "")) == "personal" else 5)),
+            "namespace": args.get("namespace", "personal"),
+            "private": bool(args.get("private", False)),
+            "source_model": args.get("source_model", "jarvis"),
             "timestamp": datetime.now().isoformat(),
+            # consolidation/decay + recall bookkeeping (so explicit memories age correctly)
+            "ts": now,
+            "last_access": now,
+            "access_count": 0,
             "source": "manual",
-            "importance": 6 if _norm_memory_category(args.get("category", "")) == "personal" else 5,
         }
         memories.append(entry)
         _save_memory(memories)
@@ -948,13 +1096,21 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return f"Stored: {args['content']}"
 
     if name == "recall_memory":
-        query = args["query"].lower()
-        hits = [m for m in memories if query in m["content"].lower()]
-        if not hits:
-            return "No memories matching that query."
-        return "\n".join(
-            f"[{m.get('category', 'general')}] {m['content']}" for m in hits[-10:]
+        import mem_recall
+        hits = mem_recall.recall(
+            args["query"], memories,
+            k=int(args.get("k", 6)),
+            namespace=args.get("namespace"),
         )
+        if hits:
+            _save_memory(memories)  # persist access reinforcement from recall
+            return "\n".join(
+                f"[{m.get('category', 'general')}] {m['content']}" for m in hits
+            )
+        return "No memories matching that query."
+
+    if name == "browse":
+        return _browser_run(args.get("code", ""))
 
     if name == "search_web":
         try:
@@ -1734,6 +1890,11 @@ def _build_system_prompt() -> str:
             for m in _top_memories(20)
         )
         lines.append(f"\nWhat you know about {nm}:\n{mem_lines}")
+    # Ambient memory — things recently overheard nearby. May or may not be addressed to
+    # you; use as context only if relevant, and don't assume it was said to you.
+    if _overheard:
+        heard = "\n".join(f"  - {o['text']}" for o in _overheard[-8:])
+        lines.append(f"\nRecently overheard nearby (ambient — relate to it only if relevant):\n{heard}")
     return "\n".join(lines)
 
 
@@ -1824,6 +1985,27 @@ def _record_turn(user: str, assistant: str) -> None:
         {"role": "assistant", "content": assistant},
     ])[-CONV_TURNS:]
     _save_history()
+
+
+def _remember_overheard(text: str) -> None:
+    """Log an overheard utterance to the rolling ambient buffer so JARVIS can relate to
+    it later, even when it wasn't addressed with the wake word. Persists every few
+    utterances (not every one) to spare the disk. Echoes of JARVIS's own voice are
+    skipped so it doesn't 'remember' itself."""
+    global _overheard, _overheard_dirty
+    if not STORE_OVERHEARD:
+        return
+    t = text.strip()
+    if not t or _is_echo(t):
+        return
+    _overheard.append({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "text": t})
+    if len(_overheard) > OVERHEARD_MAX:
+        del _overheard[:-OVERHEARD_MAX]
+    broadcast_from_thread({"type": "overheard", "text": t, "count": len(_overheard)})
+    _overheard_dirty += 1
+    if _overheard_dirty >= 5:
+        _overheard_dirty = 0
+        _save_json(OVERHEARD_FILE, _overheard)
 
 
 async def _brain_groq(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
@@ -2195,7 +2377,11 @@ async def _run_sleep_cycle() -> None:
         return ""
 
     try:
-        result = await consolidation.consolidate(memories, _history, _llm)
+        # Fold recently-overheard speech into the reflection input so durable facts the
+        # user mentioned aloud (even without addressing JARVIS) can become memories.
+        heard_turns = [{"role": "user", "content": o["text"]} for o in _overheard[-20:]]
+        reflect_input = (_history + heard_turns)[-40:]
+        result = await consolidation.consolidate(memories, reflect_input, _llm)
         memories[:] = result["memories"]
         _save_memory(memories)
         _last_consolidated_turn = _turn_seq
@@ -2349,6 +2535,13 @@ def _is_echo(cmd: str) -> bool:
         return False
     hits = sum(1 for w in words if w in sp)
     return hits / len(words) >= 0.6
+
+
+async def _wake_ack() -> None:
+    """Heard a bare 'jarvis' — acknowledge and open the command window. Any speech mid-
+    reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
+    await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
+    await _schedule_speak(random.choice(WAKE_ACKS))
 
 
 async def _stop_speaking() -> None:
@@ -2697,7 +2890,7 @@ def _voice_worker() -> None:
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
     def _flush(utterance: list) -> None:
-        global _audio_arousal
+        global _audio_arousal, _awake_until
         if len(utterance) < MIN_UTTER_CHUNKS:
             return
         all_audio = np.concatenate(utterance, axis=0)
@@ -2715,23 +2908,58 @@ def _voice_worker() -> None:
         if not text:
             return
 
-        # Wake-word gate: ignore anything not addressed to JARVIS.
-        cmd = _match_wake_word(text) if WAKE_REQUIRED else text
-        if cmd is None:
-            return
-        cmd = cmd.strip()
+        # Ambient memory: log EVERYTHING heard first, so JARVIS can relate to it later.
+        # This is independent of the wake word — acting still requires it (below).
+        _remember_overheard(text)
 
-        # Echo guard: drop the case where the mic heard JARVIS's own voice.
-        if _is_echo(cmd):
+        now = time.time()
+
+        def _act(command: str) -> None:
+            global _awake_until
+            _awake_until = 0.0
+            broadcast_from_thread({"type": "transcription", "text": command})
+            _run(dispatch_command(command))
+
+        if not WAKE_REQUIRED:
+            if _is_echo(text) or _is_stt_noise(text):
+                return
+            if text.strip().lower() in STOP_WORDS:
+                _run(_stop_speaking())
+                return
+            _act(text.strip())
             return
 
-        # Bare wake word, or a "stop" — just interrupt whatever JARVIS is doing.
-        if not cmd or cmd.lower() in STOP_WORDS:
-            _run(_stop_speaking())
+        after = _match_wake_word(text)   # command text after "jarvis", "" if bare, None if absent
+
+        if after is not None:
+            # This utterance was addressed to JARVIS ("jarvis ..." or bare "jarvis").
+            cmd = after.strip()
+            if _is_echo(cmd):
+                return
+            if cmd.lower() in STOP_WORDS:
+                _awake_until = 0.0
+                _run(_stop_speaking())
+                return
+            if not cmd:
+                # Bare "jarvis" — arm the window and cue the user to say the command.
+                _awake_until = now + WAKE_WINDOW
+                _run(_wake_ack())
+                return
+            _act(cmd)                    # "jarvis <command>" in one breath
             return
 
-        broadcast_from_thread({"type": "transcription", "text": cmd})
-        _run(dispatch_command(cmd))
+        # No wake word here. If a bare "jarvis" just armed us, take this as the command —
+        # this is what makes "Jarvis…" [pause] "<command>" work like a real assistant.
+        if now < _awake_until:
+            cmd = text.strip()
+            if _is_echo(cmd) or _is_stt_noise(cmd):
+                return               # keep the window open through echoes/noise
+            if cmd.lower() in STOP_WORDS:
+                _awake_until = 0.0
+                _run(_stop_speaking())
+                return
+            _act(cmd)
+        # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
     try:
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
@@ -2941,6 +3169,156 @@ async def memory_endpoint() -> dict:
                           "importance": m.get("importance", 5),
                           "source": m.get("source", "manual")}
                          for m in memories[::-1][:60]]}
+
+
+# ── Attachment uploads — images/docs the UI drops into chat ────────────────────
+# The endpoint extracts a plain-text digest at upload time (vision for images,
+# text extraction for documents), so by the time the user hits send, the brain
+# receives ready-made context and can answer without the user explaining the file.
+UPLOADS_DIR = BASE_DIR / "uploads"
+_UPLOAD_MAX = 15 * 1024 * 1024          # 15 MB
+_DIGEST_CAP = 6000                      # chars of extracted content passed to the brain
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+_TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log",
+              ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".h", ".java",
+              ".go", ".rs", ".sh", ".ps1", ".html", ".css", ".sql", ".ini", ".toml"}
+
+
+def _extract_docx(path) -> str:
+    """DOCX body text via stdlib only — a .docx is a zip with word/document.xml."""
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml").decode("utf-8", "ignore")
+    paras = re.split(r"</w:p>", xml)
+    out = [re.sub(r"<[^>]+>", "", p).strip() for p in paras]
+    return "\n".join(p for p in out if p)
+
+
+def _extract_pdf(path) -> str:
+    from pypdf import PdfReader
+    reader = PdfReader(str(path))
+    chunks = []
+    total = 0
+    for page in reader.pages:
+        t = (page.extract_text() or "").strip()
+        if t:
+            chunks.append(t)
+            total += len(t)
+        if total > _DIGEST_CAP * 2:
+            break
+    return "\n\n".join(chunks)
+
+
+def _digest_upload(path, ext: str) -> tuple[str, str]:
+    """(kind, extracted text) for a saved upload. Runs in a worker thread."""
+    if ext in _IMAGE_EXTS:
+        desc = _analyze_image(str(path),
+                              "Describe this image thoroughly. Transcribe ALL visible "
+                              "text exactly as written. Note anything unusual or "
+                              "noteworthy — the user attached it for a reason.")
+        return "image", desc
+    if ext == ".pdf":
+        return "pdf", _extract_pdf(path)
+    if ext == ".docx":
+        return "docx", _extract_docx(path)
+    if ext in _TEXT_EXTS:
+        return "text", path.read_text(encoding="utf-8", errors="ignore")
+    return "binary", ""
+
+
+@app.post("/api/upload")
+async def upload_endpoint(request: Request) -> JSONResponse:
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    name = os.path.basename(str(body.get("name") or "file"))
+    try:
+        raw = base64.b64decode(body.get("data_b64") or "", validate=True)
+    except Exception:
+        return JSONResponse({"error": "data_b64 is not valid base64"}, status_code=400)
+    if not raw:
+        return JSONResponse({"error": "empty file"}, status_code=400)
+    if len(raw) > _UPLOAD_MAX:
+        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
+                            status_code=413)
+
+    UPLOADS_DIR.mkdir(exist_ok=True)
+    ext = Path(name).suffix.lower()
+    safe = f"{int(time.time())}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}"
+    dest = UPLOADS_DIR / safe
+    dest.write_bytes(raw)
+
+    try:
+        kind, text = await asyncio.to_thread(_digest_upload, dest, ext)
+    except Exception as exc:
+        return JSONResponse({"ok": True, "name": name, "kind": "binary", "path": str(dest),
+                             "digest": "", "note": f"saved, but couldn't read content: {exc}"})
+    digest = (text or "").strip()
+    truncated = len(digest) > _DIGEST_CAP
+    if truncated:
+        digest = digest[:_DIGEST_CAP] + "\n…[truncated]"
+    return JSONResponse({"ok": True, "name": name, "kind": kind, "path": str(dest),
+                         "digest": digest, "truncated": truncated})
+
+
+# ── Memory hub — cross-model remember/recall over HTTP ─────────────────────────
+# External models (Claude / ChatGPT / Gemini via the memory_mcp.py shim) read and
+# write the SAME store as JARVIS itself. JARVIS's process stays the single writer;
+# these endpoints reuse execute_tool so decay bookkeeping, category normalisation,
+# and broadcasts happen in exactly one place.
+MEMORY_HUB_TOKEN = os.environ.get("JARVIS_MEMORY_TOKEN", "")
+
+
+def _hub_authed(request: Request) -> bool:
+    if not MEMORY_HUB_TOKEN:
+        # No token configured → allow loopback only, never remote.
+        return (request.client is None) or request.client.host in ("127.0.0.1", "::1")
+    auth = request.headers.get("authorization", "")
+    return auth == f"Bearer {MEMORY_HUB_TOKEN}"
+
+
+@app.post("/api/memory/remember")
+async def hub_remember(request: Request) -> JSONResponse:
+    if not _hub_authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    content = (body.get("content") or "").strip()
+    if not content:
+        return JSONResponse({"error": "content is required"}, status_code=400)
+    args = {
+        "content": content,
+        "category": body.get("category", "fact"),
+        "importance": body.get("importance", 5),
+        "namespace": body.get("namespace", "personal"),
+        "private": bool(body.get("private", False)),
+        "source_model": body.get("source_model", "external"),
+    }
+    result = execute_tool("remember", args)
+    return JSONResponse({"ok": True, "result": result, "count": len(memories)})
+
+
+@app.get("/api/memory/recall")
+async def hub_recall(request: Request, q: str, k: int = 6,
+                     namespace: str | None = None) -> JSONResponse:
+    if not _hub_authed(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    import mem_recall
+    # External callers NEVER see private memories — that filter is not optional here.
+    hits = mem_recall.recall(q, memories, k=max(1, min(k, 20)),
+                             namespace=namespace, include_private=False)
+    if hits:
+        _save_memory(memories)  # persist access reinforcement
+    return JSONResponse({"count": len(hits), "memories": [
+        {"content": m.get("content"), "category": m.get("category", "fact"),
+         "importance": m.get("importance", 5),
+         "source_model": m.get("source_model", "jarvis"),
+         "namespace": m.get("namespace", "personal")}
+        for m in hits
+    ]})
 
 
 @app.get("/health")

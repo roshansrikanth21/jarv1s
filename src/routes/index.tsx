@@ -1,12 +1,13 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import ClassicDeck from "@/decks/classic";
 import OverhaulDeck from "@/decks/overhaul";
 import FocusDeck from "@/decks/focus";
 import TerminalDeck from "@/decks/terminal";
 import PrimeDeck from "@/decks/prime";
+import ChatDeck from "@/decks/chat";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
+import { BootIntro } from "@/components/jarvis/BootIntro";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -30,25 +31,29 @@ export const Route = createFileRoute("/")({
 });
 
 // UI designs, all wired to the same backend — pick one in the corner switcher.
+// One canonical amber HUD ("Command Deck" = the fine-tuned overhaul deck). The old
+// duplicate `classic` deck was retired; saved prefs pointing at it migrate below.
 const PRESETS = [
   { id: "prime", label: "Prime" },
-  { id: "classic", label: "Command Deck" },
-  { id: "overhaul", label: "Overhaul" },
+  { id: "overhaul", label: "Command Deck" },
   { id: "focus", label: "Focus" },
   { id: "terminal", label: "Terminal" },
+  { id: "chat", label: "Chat" },
 ];
 const DECKS = {
   prime: PrimeDeck,
-  classic: ClassicDeck,
   overhaul: OverhaulDeck,
   focus: FocusDeck,
   terminal: TerminalDeck,
+  chat: ChatDeck,
 } as const;
 
 function Page() {
   const [preset, setPreset] = useState<string>(() => {
     try {
-      return localStorage.getItem("jarvis_ui_preset") || "prime";
+      const saved = localStorage.getItem("jarvis_ui_preset");
+      // `classic` was folded into the single "Command Deck" (overhaul).
+      return saved === "classic" ? "overhaul" : saved || "prime";
     } catch {
       return "prime";
     }
@@ -60,6 +65,9 @@ function Page() {
       /* ignore */
     }
   }, [preset]);
+
+  // Launch-intro gate — the boot video plays over everything until it finishes.
+  const [introDone, setIntroDone] = useState(false);
 
   // First-run gate: does the backend already know the operator's name?
   const [phase, setPhase] = useState<"loading" | "onboarding" | "ready">("loading");
@@ -94,15 +102,23 @@ function Page() {
     };
   }, []);
 
-  if (phase === "loading") return <BootScreen />;
-  if (phase === "onboarding") return <Onboarding onComplete={() => setPhase("ready")} />;
-
   const Deck = DECKS[preset as keyof typeof DECKS] ?? PrimeDeck;
   return (
     <>
-      {/* key forces a clean remount on switch — no stale state bleeds across presets */}
-      <Deck key={preset} />
-      <PresetSwitcher value={preset} onChange={setPreset} docked={preset === "terminal" || preset === "focus"} />
+      {/* Cinematic launch video overlays everything, then fades to reveal the app.
+          Self-skips if the asset is missing / reduced-motion / already seen this launch. */}
+      {!introDone && <BootIntro onDone={() => setIntroDone(true)} />}
+      {phase === "loading" ? (
+        <BootScreen />
+      ) : phase === "onboarding" ? (
+        <Onboarding onComplete={() => setPhase("ready")} />
+      ) : (
+        <>
+          {/* key forces a clean remount on switch — no stale state bleeds across presets */}
+          <Deck key={preset} />
+          <PresetSwitcher value={preset} onChange={setPreset} docked={preset === "terminal" || preset === "focus"} />
+        </>
+      )}
     </>
   );
 }
@@ -135,10 +151,10 @@ function BootScreen() {
 
 const PRESET_ACCENT: Record<string, string> = {
   prime: "#c4a5ff",
-  classic: "#e8a045",
   overhaul: "#f0b060",
   focus: "#5ec8e8",
   terminal: "#41ff6e",
+  chat: "#10a37f",
 };
 
 function PresetSwitcher({ value, onChange, docked }: { value: string; onChange: (v: string) => void; docked?: boolean }) {
