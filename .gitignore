@@ -6,6 +6,12 @@ dist/
 dist-electron/
 release/
 
+# User-uploaded attachments (runtime data, not source)
+uploads/
+
+# Ambient speech log — everything the mic overheard (private, never commit)
+memory/jarvis_overheard.json
+
 # Python
 __pycache__/
 *.pyc

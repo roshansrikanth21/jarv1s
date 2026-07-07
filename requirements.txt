@@ -34,6 +34,12 @@ pandas
 opencv-python-headless
 yt-dlp
 
+# Document uploads — PDF text extraction (docx/text use stdlib only)
+pypdf
+
+# Cross-model memory hub — MCP server so Claude/ChatGPT/Gemini share JARVIS's store
+mcp
+
 # Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama
 
