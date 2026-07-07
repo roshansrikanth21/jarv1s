@@ -120,6 +120,11 @@ WAKE_WORDS = [w.strip().lower() for w in os.environ.get(
     "JARVIS_WAKE_WORDS", "jarvis,jarvis.,jervis,javis,jarvus,jarvi,travis,charvis,jarvix"
 ).split(",") if w.strip()]
 WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
+# After a bare "jarvis" (wake word with no command), stay armed this many seconds and
+# take the NEXT thing you say as the command — so "Jarvis…" [pause] "what's the weather"
+# works like any real assistant, not just "jarvis what's the weather" in one breath.
+WAKE_WINDOW = float(os.environ.get("JARVIS_WAKE_WINDOW", "8"))
+WAKE_ACKS = ["Yes?", "Go ahead.", "I'm listening.", "Mm-hm?", "Sir?"]
 # Always-on ears: auto-start the mic when a client connects, so JARVIS is listening
 # without a button press. It still only ACTS on utterances addressed with the wake word.
 ALWAYS_LISTEN = os.environ.get("JARVIS_ALWAYS_LISTEN", "1") != "0"
@@ -278,6 +283,7 @@ _overheard:  list[dict] = []   # rolling log of everything heard (ambient memory
 _overheard_dirty = 0           # utterances since last persist (throttles disk writes)
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
+_awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _listen_thread: threading.Thread | None = None
 _tts_playing = False          # frontend reports the exact playback window
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
@@ -2531,6 +2537,13 @@ def _is_echo(cmd: str) -> bool:
     return hits / len(words) >= 0.6
 
 
+async def _wake_ack() -> None:
+    """Heard a bare 'jarvis' — acknowledge and open the command window. Any speech mid-
+    reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
+    await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
+    await _schedule_speak(random.choice(WAKE_ACKS))
+
+
 async def _stop_speaking() -> None:
     """Cancel any in-flight response + TTS and tell the frontend to stop audio."""
     global _current_task, _speak_task, _speaking_text
@@ -2877,7 +2890,7 @@ def _voice_worker() -> None:
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
     def _flush(utterance: list) -> None:
-        global _audio_arousal
+        global _audio_arousal, _awake_until
         if len(utterance) < MIN_UTTER_CHUNKS:
             return
         all_audio = np.concatenate(utterance, axis=0)
@@ -2899,23 +2912,54 @@ def _voice_worker() -> None:
         # This is independent of the wake word — acting still requires it (below).
         _remember_overheard(text)
 
-        # Wake-word gate: only ACT on utterances addressed to JARVIS.
-        cmd = _match_wake_word(text) if WAKE_REQUIRED else text
-        if cmd is None:
-            return
-        cmd = cmd.strip()
+        now = time.time()
 
-        # Echo guard: drop the case where the mic heard JARVIS's own voice.
-        if _is_echo(cmd):
+        def _act(command: str) -> None:
+            global _awake_until
+            _awake_until = 0.0
+            broadcast_from_thread({"type": "transcription", "text": command})
+            _run(dispatch_command(command))
+
+        if not WAKE_REQUIRED:
+            if _is_echo(text) or _is_stt_noise(text):
+                return
+            if text.strip().lower() in STOP_WORDS:
+                _run(_stop_speaking())
+                return
+            _act(text.strip())
             return
 
-        # Bare wake word, or a "stop" — just interrupt whatever JARVIS is doing.
-        if not cmd or cmd.lower() in STOP_WORDS:
-            _run(_stop_speaking())
+        after = _match_wake_word(text)   # command text after "jarvis", "" if bare, None if absent
+
+        if after is not None:
+            # This utterance was addressed to JARVIS ("jarvis ..." or bare "jarvis").
+            cmd = after.strip()
+            if _is_echo(cmd):
+                return
+            if cmd.lower() in STOP_WORDS:
+                _awake_until = 0.0
+                _run(_stop_speaking())
+                return
+            if not cmd:
+                # Bare "jarvis" — arm the window and cue the user to say the command.
+                _awake_until = now + WAKE_WINDOW
+                _run(_wake_ack())
+                return
+            _act(cmd)                    # "jarvis <command>" in one breath
             return
 
-        broadcast_from_thread({"type": "transcription", "text": cmd})
-        _run(dispatch_command(cmd))
+        # No wake word here. If a bare "jarvis" just armed us, take this as the command —
+        # this is what makes "Jarvis…" [pause] "<command>" work like a real assistant.
+        if now < _awake_until:
+            cmd = text.strip()
+            if _is_echo(cmd) or _is_stt_noise(cmd):
+                return               # keep the window open through echoes/noise
+            if cmd.lower() in STOP_WORDS:
+                _awake_until = 0.0
+                _run(_stop_speaking())
+                return
+            _act(cmd)
+        # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
     try:
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
