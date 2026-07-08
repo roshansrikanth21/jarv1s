@@ -400,7 +400,14 @@
 }
 .pr-reticle {
   position: absolute;
-  inset: 8% 12%;
+  top: 50%;
+  left: 50%;
+  /* Square + centered → a TRUE circle. The old `inset: 8% 12%` stretched this to the
+     arena's non-square box, so border-radius:50% rendered a vertical ellipse. Width drives a
+     1:1 aspect box (the arena is taller than wide, so width is the fitting dimension). */
+  width: min(680px, 84%);
+  aspect-ratio: 1;
+  transform: translate(-50%, -50%);
   pointer-events: none;
   border: 1px solid var(--p-a15);
   border-radius: 50%;
