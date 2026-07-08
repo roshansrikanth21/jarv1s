@@ -247,6 +247,18 @@ async def _boot_probe():
         pass
 
 
+def _warm_memory() -> None:
+    """Pre-embed the memory store so the first recall isn't slow mid-conversation. No-op /
+    instant in keyword mode (also surfaces the one-time 'no embedding backend' notice early)."""
+    try:
+        import mem_recall
+        n = mem_recall.warm(memories)
+        if n:
+            log.info("mem_recall: pre-embedded %d memories", n)
+    except Exception:
+        pass
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     global _main_loop, _sleep_task, _ambient_task, _boot_task, _monitor_task
@@ -260,6 +272,9 @@ async def _lifespan(app: FastAPI):
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
+    # Pre-warm memory embeddings off the event loop so first recall isn't slow (instant in
+    # keyword mode; returns as soon as it finds no embedding backend).
+    asyncio.create_task(asyncio.to_thread(_warm_memory))
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
     spa_dir = BASE_DIR / "dist" / "client"
     if (spa_dir / "index.html").exists():
@@ -378,8 +393,35 @@ def _save_json(path: Path, data) -> None:
         log.warning("failed to save %s: %s", path.name, exc)
 
 
+def _migrate_memories(mems: list[dict]) -> list[dict]:
+    """Backfill schema on pre-migration memories. Without ts/last_access an old entry computes
+    days=0 forever (see mem_recall._strength / consolidation.decay_and_prune) — so it never
+    decays and always ranks as maximally recent. Derive the timestamps from the ISO
+    `timestamp` string when present, and fill the fields recall/decay rely on."""
+    for m in mems:
+        if not isinstance(m, dict):
+            continue
+        if "ts" not in m or "last_access" not in m:
+            base = None
+            iso = m.get("timestamp")
+            if isinstance(iso, str):
+                try:
+                    base = datetime.fromisoformat(iso).timestamp()
+                except Exception:
+                    base = None
+            if base is None:
+                base = time.time()
+            m.setdefault("ts", base)
+            m.setdefault("last_access", base)
+        m.setdefault("access_count", 0)
+        m.setdefault("importance", 5)
+        m.setdefault("namespace", "personal")
+        m.setdefault("source_model", "jarvis")
+    return mems
+
+
 def _load_memory() -> list[dict]:
-    return _load_json(MEMORY_FILE, [])
+    return _migrate_memories(_load_json(MEMORY_FILE, []))
 
 
 # One reentrant lock guards every mutate-and-save of the global `memories` list. Writers
@@ -708,6 +750,7 @@ TOOLS: list[dict] = [
                     },
                     "importance": {"type": "integer", "description": "1 (mundane) to 10 (identity-defining). Default 5."},
                     "namespace": {"type": "string", "description": "Scope, e.g. personal | ctf | work. Default personal."},
+                    "private": {"type": "boolean", "description": "If true, this memory stays private to JARVIS and is never surfaced to other models via the memory hub. Use for sensitive/secret facts. Default false."},
                 },
                 "required": ["content"],
             },
@@ -723,6 +766,7 @@ TOOLS: list[dict] = [
                 "properties": {
                     "query": {"type": "string", "description": "Search term or topic"},
                     "k": {"type": "integer", "description": "How many memories to return. Default 6."},
+                    "namespace": {"type": "string", "description": "Restrict the search to a namespace, e.g. personal | ctf | work. Optional."},
                 },
                 "required": ["query"],
             },
@@ -1005,6 +1049,29 @@ def _top_memories(limit: int = 20) -> list[dict]:
             str(m.get("last_access") or m.get("timestamp") or ""),
         ),
     )[:limit]
+
+
+def _relevant_memories(query: str, limit: int = 20) -> list[dict]:
+    """Memories to inject into JARVIS's own prompt: a few always-on high-importance facts,
+    PLUS the ones most relevant to the CURRENT message (semantic recall). Falls back to pure
+    importance ordering when there's no query or the store is small enough to inject whole —
+    so the injected context stays pertinent as the store grows past `limit` entries."""
+    if not (query or "").strip() or len(memories) <= limit:
+        return _top_memories(limit)
+    try:
+        import mem_recall
+        pinned = _top_memories(6)                     # identity-level facts are always present
+        seen = {id(m) for m in pinned}
+        out = list(pinned)
+        # reinforce=False: building the prompt must not inflate access counts — only the
+        # recall_memory tool should reinforce what it deliberately surfaces.
+        for m in mem_recall.recall(query, memories, k=limit, include_private=True, reinforce=False):
+            if id(m) not in seen and len(out) < limit:
+                out.append(m)
+                seen.add(id(m))
+        return out
+    except Exception:
+        return _top_memories(limit)
 
 
 def _validate_tool_args(name: str, args: dict) -> str | None:
@@ -1302,6 +1369,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             args["query"], memories,
             k=int(args.get("k", 6)),
             namespace=args.get("namespace"),
+            include_private=True,   # JARVIS's own recall sees private memories; the HTTP hub does not
         )
         if hits:
             with _mem_lock:
@@ -2061,7 +2129,7 @@ You are in a live spoken conversation — your replies are read aloud and you re
 You have tools — memory, web search, system info, app launch, tasks, screen capture, shell, market scans, and opening the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings, small talk, or anything you can answer from what you already know, just reply directly — never call a tool for "hi"."""
 
 
-def _build_system_prompt() -> str:
+def _build_system_prompt(query: str = "") -> str:
     nm = _user_name() or "the user"
     base = _BASE_PROMPT.replace("__USER__", nm)
     lines = [base]
@@ -2089,7 +2157,7 @@ def _build_system_prompt() -> str:
     if memories:
         mem_lines = "\n".join(
             f"  - [{m.get('category', 'general')}] {m['content']}"
-            for m in _top_memories(20)
+            for m in _relevant_memories(query, 20)
         )
         lines.append(f"\nWhat you know about {nm}:\n{mem_lines}")
     # Ambient memory — things recently overheard nearby. May or may not be addressed to
@@ -2220,7 +2288,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     )
     # System prompt + recent conversation + this turn = multi-turn context.
     messages: list[dict] = (
-        [{"role": "system", "content": _build_system_prompt()}]
+        [{"role": "system", "content": _build_system_prompt(text)}]
         + history
         + [{"role": "user", "content": text}]
     )
@@ -2286,7 +2354,7 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
         req: dict = {
             "model": CLAUDE_MODEL,
             "max_tokens": 1024,
-            "system": _build_system_prompt(),
+            "system": _build_system_prompt(text),
             "messages": messages,
         }
         if use_tools:
@@ -2331,7 +2399,7 @@ async def _brain_ollama(
         raise RuntimeError("No local model selected — start Ollama or set OLLAMA_MODEL.")
     client   = ollama.AsyncClient()
     messages: list[dict] = (
-        [{"role": "system", "content": _build_system_prompt()}]
+        [{"role": "system", "content": _build_system_prompt(text)}]
         + history
         + [{"role": "user", "content": text}]
     )
@@ -2459,6 +2527,27 @@ def _observe(decision: dict, latency: float, accepted: bool, escalated: bool = F
 _REASK_RE = re.compile(r"\b(no,|that'?s wrong|try again|not what|rephrase|wrong answer|incorrect|do it again)\b", re.I)
 
 
+async def _run_rung(rung: str, text: str, dev: dict, decision: dict) -> str:
+    """Run one lattice rung and return its answer. `council` is handled separately in
+    _run_agent (it emits + records itself)."""
+    if rung == "cloud_deep":
+        return await _brain_claude(text, list(_history), decision=decision, device=dev)
+    if rung == "cloud_fast":
+        return await _brain_groq(text, list(_history), decision=decision, device=dev)
+    if rung == "local_deep":
+        return await _brain_ollama(text, list(_history), LOCAL_DEEP, decision=decision, device=dev)
+    return await _brain_ollama(text, list(_history), LOCAL_FAST, decision=decision, device=dev)
+
+
+def _fallback_rung(failed: str, avail: set[str]) -> str | None:
+    """The next rung to try when `failed` produced nothing: the best available alternative.
+    Never auto-escalates into council (heavy + self-emitting) — that stays an explicit choice."""
+    for r in ("cloud_deep", "cloud_fast", "local_deep", "local_fast"):
+        if r != failed and r in avail:
+            return r
+    return None
+
+
 async def _run_agent(text: str) -> None:
     """Route the request through the Governor, then run the chosen rung. The Governor
     picks the cheapest brain that clears the difficulty bar within the current
@@ -2509,35 +2598,57 @@ async def _run_agent(text: str) -> None:
 
     rung = decision["rung"]
     t0 = time.time()
-    try:
-        if rung == "council":
+
+    if rung == "council":
+        try:
             await _deliberate(text)                 # emits + records itself
             _observe(decision, time.time() - t0, accepted=True)
-            return
-        elif rung == "cloud_deep":
-            answer = await _brain_claude(text, list(_history), decision=decision, device=dev)
-        elif rung == "cloud_fast":
-            answer = await _brain_groq(text, list(_history), decision=decision, device=dev)
-        elif rung == "local_deep":
-            answer = await _brain_ollama(text, list(_history), LOCAL_DEEP, decision=decision, device=dev)
-        else:
-            answer = await _brain_ollama(text, list(_history), LOCAL_FAST, decision=decision, device=dev)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await _emit_final(f"The council couldn't convene ({exc}). Try again, or switch mode in Settings.")
+            _observe(decision, time.time() - t0, accepted=False)
+        return
+
+    answer = ""
+    try:
+        answer = (await _run_rung(rung, text, dev, decision) or "").strip()
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        answer = f"That rung failed ({exc}). Try again, or switch mode in Settings."
+    except Exception:
+        answer = ""
 
-    answer = (answer or "").strip()
+    # Escalation-on-failure: the lattice exists so a task that stumps the cheap rung can climb
+    # it. If the chosen rung produced nothing (error or empty), try one better available rung
+    # before giving up — instead of handing the user a dead-end "that rung failed".
+    escalated = False
+    if not answer:
+        fb = _fallback_rung(rung, avail)
+        if fb:
+            escalated = True
+            await broadcast({"type": "system",
+                             "text": f"Escalating to {governor.RUNG_BY_ID.get(fb, {}).get('label', fb)}…"})
+            try:
+                answer = (await _run_rung(fb, text, dev, decision) or "").strip()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                answer = ""
+            if answer:
+                rung = fb                            # the rung that actually answered
+
     latency = time.time() - t0
     if not answer:
-        await _emit_final("I didn't get a usable response that time — try rephrasing, "
+        await _emit_final("I couldn't get a usable response that time — try rephrasing, "
                           "or wait a moment if the model is busy.")
-        _observe(decision, latency, accepted=False)
+        _observe(decision, latency, accepted=False, escalated=escalated)
         return
 
     await _emit_final(answer)
     _record_turn(text, answer)
-    _observe(decision, latency, accepted=True)
+    # Credit the chosen rung only if IT answered; if we had to escalate, mark it escalated so
+    # the bandit learns this rung was inadequate for this kind of request.
+    _observe(decision, latency, accepted=not escalated, escalated=escalated)
 
     if rung in ("local_fast", "local_deep") and (dev.get("ram_percent") or 0) >= OLLAMA_RELEASE_RAM_PCT:
         used = LOCAL_DEEP if rung == "local_deep" else LOCAL_FAST
