@@ -8,6 +8,7 @@ import ChatDeck from "@/decks/chat";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { BootIntro } from "@/components/jarvis/BootIntro";
+import { SettingsPanel } from "@/components/jarvis/SettingsPanel";
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -69,6 +70,26 @@ function Page() {
   // Launch-intro gate — the boot video plays over everything until it finishes.
   const [introDone, setIntroDone] = useState(false);
 
+  // Global Settings — ONE panel, identical on every deck. Opened by the gear in the
+  // preset switcher, by Ctrl+, anywhere, or by a `jarvis:open-settings` event any deck
+  // (e.g. Prime/Command Deck) fires so their in-chrome gear opens this same panel.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  useEffect(() => {
+    const openIt = () => setSettingsOpen(true);
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === ",") {
+        e.preventDefault();
+        setSettingsOpen((v) => !v);
+      }
+    };
+    window.addEventListener("jarvis:open-settings", openIt);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("jarvis:open-settings", openIt);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
   // First-run gate: does the backend already know the operator's name?
   const [phase, setPhase] = useState<"loading" | "onboarding" | "ready">("loading");
   useEffect(() => {
@@ -116,7 +137,18 @@ function Page() {
         <>
           {/* key forces a clean remount on switch — no stale state bleeds across presets */}
           <Deck key={preset} />
-          <PresetSwitcher value={preset} onChange={setPreset} docked={preset === "terminal" || preset === "focus"} />
+          <PresetSwitcher
+            value={preset}
+            onChange={setPreset}
+            docked={preset === "terminal" || preset === "focus"}
+            onSettings={() => setSettingsOpen(true)}
+          />
+          {/* The one global settings surface — same on every deck, themed to its accent. */}
+          <SettingsPanel
+            open={settingsOpen}
+            accent={PRESET_ACCENT[preset] ?? "#c4a5ff"}
+            onClose={() => setSettingsOpen(false)}
+          />
         </>
       )}
     </>
@@ -157,7 +189,7 @@ const PRESET_ACCENT: Record<string, string> = {
   chat: "#10a37f",
 };
 
-function PresetSwitcher({ value, onChange, docked }: { value: string; onChange: (v: string) => void; docked?: boolean }) {
+function PresetSwitcher({ value, onChange, docked, onSettings }: { value: string; onChange: (v: string) => void; docked?: boolean; onSettings?: () => void }) {
   return (
     <div
       className="no-drag"
@@ -213,6 +245,32 @@ function PresetSwitcher({ value, onChange, docked }: { value: string; onChange: 
           </button>
         );
       })}
+      {/* Global settings entry — same gear on every deck, opens the one shared panel. */}
+      {onSettings && (
+        <>
+          <span style={{ width: 1, alignSelf: "stretch", background: "rgba(255,255,255,0.12)", margin: "3px 3px" }} />
+          <button
+            onClick={onSettings}
+            title="Settings (Ctrl+,)"
+            aria-label="Settings"
+            style={{
+              border: "none",
+              cursor: "pointer",
+              borderRadius: 999,
+              padding: "4px 9px",
+              fontSize: 12,
+              lineHeight: 1,
+              background: "transparent",
+              color: "rgba(232, 236, 240, 0.7)",
+              transition: "color 0.15s",
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "#fff"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(232, 236, 240, 0.7)"; }}
+          >
+            ⚙
+          </button>
+        </>
+      )}
     </div>
   );
 }

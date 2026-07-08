@@ -258,7 +258,13 @@ export default function PrimeDeck() {
   const [mktLoading, setMktLoading] = useState(false);
   const [watching, setWatching] = useState(false);
   const [pulseKey, setPulseKey] = useState(0);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  // Settings is now ONE global panel (see routes/index.tsx) so it's identical on every
+  // deck. Every in-deck "open settings" request routes there; the old in-deck SettingsModal
+  // below is retired — it only ever renders with open=false, so it's inert.
+  const settingsOpen = false;
+  const setSettingsOpen = (v: boolean) => {
+    if (v) window.dispatchEvent(new CustomEvent("jarvis:open-settings"));
+  };
   const [sendErr, setSendErr] = useState<string | null>(null);
   const [contentPanel, setContentPanel] = useState<ContentPanelData | null>(null);
 
@@ -920,7 +926,7 @@ export default function PrimeDeck() {
 
               {!cloudOn && localOn && (
                 <p className="pr-pane-hint">
-                  Only local models are active. Add a Groq key (Overhaul → Settings) for much faster replies.
+                  Only local models are active. Add a Groq key in Settings (Ctrl+,) for much faster replies.
                 </p>
               )}
             </div>
