@@ -402,10 +402,10 @@
   position: absolute;
   top: 50%;
   left: 50%;
-  /* Square + centered → a TRUE circle. The old `inset: 8% 12%` stretched this to the
-     arena's non-square box, so border-radius:50% rendered a vertical ellipse. Width drives a
-     1:1 aspect box (the arena is taller than wide, so width is the fitting dimension). */
-  width: min(680px, 84%);
+  /* Square + centered on the orb-stage → a TRUE circle, concentric with the orb. (The old
+     `inset: 8% 12%` stretched it to the column's non-square box → a vertical ellipse.)
+     111% makes it a touch larger than the orb so it frames it. */
+  width: 111%;
   aspect-ratio: 1;
   transform: translate(-50%, -50%);
   pointer-events: none;

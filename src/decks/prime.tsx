@@ -806,13 +806,16 @@ export default function PrimeDeck() {
 
         {/* ═══ center — 3D core + live coordinates ═══ */}
         <main className="pr-arena">
-          <div className="pr-reticle" aria-hidden />
           <button
             type="button"
             className="pr-orb-stage no-drag"
             onClick={toggleMic}
             title={listening ? "Stop listening" : "Tap core — speak"}
           >
+            {/* Reticle lives INSIDE the stage so it's always concentric with the orb — as a
+                sibling it centered on the column and drifted above the orb (the caption below
+                pushed the orb up). pointer-events:none keeps the whole stage clickable. */}
+            <div className="pr-reticle" aria-hidden />
             {pulseKey > 0 && <span key={pulseKey} className="pr-orb-flash" aria-hidden />}
             <Suspense fallback={<div className="pr-orb-canvas pr-orb-canvas--loading" aria-hidden />}>
               <CoreOrb3D state={jstate} audioLevel={micLevel} />
