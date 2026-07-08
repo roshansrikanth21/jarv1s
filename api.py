@@ -433,6 +433,12 @@ _gov = governor.GovernorState(_load_json(GOVERNOR_FILE, {}))
 _persona = persona_mod.Persona.load(PERSONA_FILE)
 if _settings.get("voice") in {v["id"] for v in VOICE_OPTIONS}:
     _tts_voice = _settings["voice"]
+# Privacy prefs are runtime-settable (Settings panel) and persist across restarts; env is
+# only the first-run default. A saved value wins over the env default.
+if isinstance(_settings.get("always_listen"), bool):
+    ALWAYS_LISTEN = _settings["always_listen"]
+if isinstance(_settings.get("store_overheard"), bool):
+    STORE_OVERHEARD = _settings["store_overheard"]
 
 
 def _ollama_chat_options(**extra) -> dict:
@@ -3333,6 +3339,65 @@ async def command_endpoint(body: dict) -> dict:
 async def ict_endpoint(symbol: str = "nifty", interval: str = "15m") -> dict:
     """Structured ICT read for the Markets panel."""
     return await asyncio.to_thread(_ict_analyze, symbol, interval)
+
+
+# ── Global settings (the shared Settings panel talks to these; keys are separate,
+#    handled by Electron safeStorage — never sent here) ──────────────────────────
+@app.get("/api/settings")
+async def get_settings() -> dict:
+    return {
+        "user_name":       _user_name(),
+        "voice":           _tts_voice,
+        "voice_options":   VOICE_OPTIONS,
+        "mode":            _gov.mode,
+        "modes":           list(governor.MODES),
+        "always_listen":   ALWAYS_LISTEN,
+        "store_overheard": STORE_OVERHEARD,
+        "stt":             bool(USE_GROQ and _HAS_GROQ),
+    }
+
+
+@app.post("/api/settings")
+async def post_settings(request: Request) -> JSONResponse:
+    """Apply a subset of non-secret prefs and broadcast changes so every connected deck
+    stays in sync. API keys are NOT accepted here — they go through Electron safeStorage."""
+    global _tts_voice, ALWAYS_LISTEN, STORE_OVERHEARD
+    if not _origin_allowed(request.headers.get("origin")):
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    if "name" in body:
+        nm = (str(body.get("name") or "")).strip()[:40]
+        if nm:
+            _settings["user_name"] = nm
+            await broadcast({"type": "name_changed", "name": nm})
+    if "voice" in body:
+        vid = body.get("voice", "")
+        if vid in {v["id"] for v in VOICE_OPTIONS}:
+            _tts_voice = vid
+            _settings["voice"] = vid
+            await broadcast({"type": "voice_changed", "voice": vid})
+    if "mode" in body:
+        mode = (str(body.get("mode") or "")).strip()
+        if mode in governor.MODES:
+            _gov.mode = mode
+            _save_json(GOVERNOR_FILE, _gov.to_dict())
+            await broadcast({"type": "governor_mode", "mode": mode})
+    if "always_listen" in body:
+        ALWAYS_LISTEN = bool(body["always_listen"])
+        _settings["always_listen"] = ALWAYS_LISTEN
+        if not ALWAYS_LISTEN and _listening:
+            _stop_voice()                      # honor "off" immediately
+        elif ALWAYS_LISTEN and not _listening and active_connections:
+            asyncio.create_task(_start_voice())
+    if "store_overheard" in body:
+        STORE_OVERHEARD = bool(body["store_overheard"])
+        _settings["store_overheard"] = STORE_OVERHEARD
+    _save_settings()
+    return JSONResponse({"ok": True})
 
 
 # ── Device / Models / Governor / Memory APIs ─────────────────────────────────────

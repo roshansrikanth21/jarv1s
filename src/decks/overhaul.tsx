@@ -218,7 +218,13 @@ function CommandDeck() {
   const [maximized, setMaximized]   = useState(false);
   const [council, setCouncil]       = useState<CouncilState>({ active: false, panel: [], proposals: [], verdict: "" });
   const [voiceId, setVoiceId]       = useState("");
-  const [settingsOpen, setSettingsOpen]         = useState(false);
+  // Settings is now ONE global panel (see routes/index.tsx) so it's identical on every
+  // deck. Every in-deck "open settings" request routes there; the old in-deck SettingsModal
+  // below is retired — it only ever renders with open=false, so it's inert.
+  const settingsOpen = false;
+  const setSettingsOpen = (v: boolean) => {
+    if (v) window.dispatchEvent(new CustomEvent("jarvis:open-settings"));
+  };
   const [helpOpen, setHelpOpen]                 = useState(false);
   const [mktSymbol, setMktSymbol]   = useState("nifty");
   const [mktData, setMktData]       = useState<IctRead | null>(null);
