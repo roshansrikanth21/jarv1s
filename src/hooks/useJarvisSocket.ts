@@ -175,6 +175,10 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
             })
             .catch(() => addRef.current("system", "Could not open the trading terminal."));
         }
+        // Authoritative mic state from the backend — the single source of truth. Fixes the
+        // ALWAYS_LISTEN desync (UI showing "tap to speak" while the mic was already hot) and
+        // reconciles the optimistic toggle below if it ever guessed wrong.
+        if (d.type === "mic") setListening(Boolean(d.listening));
         if (d.type === "audio_level") setLevel(Number(d.level) || 0);
         if (d.type === "system_alert" && txt.trim()) notifyNative("JARVIS", txt);
         tapsRef.current.forEach(fn => { try { fn(d); } catch { /* tap error is not ours */ } });
