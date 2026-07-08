@@ -101,12 +101,17 @@ def recall(query: str, memories: list[dict], k: int = 6,
     outrank a stale exact match. Reinforces access_count/last_access on the memories it
     returns (the caller is responsible for persisting). Falls back to substring match
     when embeddings are unavailable."""
+    # Snapshot once: the store can be appended to concurrently (tool threads, the sleep
+    # cycle), and embedding each candidate is slow — iterating the live list would risk
+    # "list changed size during iteration". The dict objects are shared, so reinforcement
+    # below still writes through to the real memories.
+    snapshot = list(memories)
     qv = embed(query)
     if qv is None:
-        return _substring(query, memories, k, namespace, include_private)
+        return _substring(query, snapshot, k, namespace, include_private)
 
     scored: list[tuple[float, dict]] = []
-    for m in memories:
+    for m in snapshot:
         if not _visible(m, namespace, include_private):
             continue
         mv = embed(m.get("content", ""))
@@ -119,7 +124,7 @@ def recall(query: str, memories: list[dict], k: int = 6,
         scored.append((score, m))
 
     if not scored:
-        return _substring(query, memories, k, namespace, include_private)
+        return _substring(query, snapshot, k, namespace, include_private)
 
     scored.sort(key=lambda t: t[0], reverse=True)
     top = [m for _, m in scored[:k]]

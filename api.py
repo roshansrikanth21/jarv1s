@@ -8,8 +8,10 @@ Run: python api.py
 """
 
 import asyncio
+import atexit
 import base64
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -102,9 +105,9 @@ GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scou
 
 # ── Browser automation (browser-harness, isolated venv → Chrome via CDP) ─────────
 # Isolated so browser-harness's pinned deps (websockets 15) never clash with JARVIS's
-# (16). JARVIS talks to a debug Chrome on the CDP port: if one is already there (e.g.
-# you enabled remote debugging on your own browser via chrome://inspect) it drives that;
-# otherwise it launches a dedicated-profile Chrome. CDP is reached via `localhost` —
+# (16). JARVIS launches and OWNS a dedicated-profile debug Chrome; it will NOT silently
+# drive a foreign Chrome already on the port (that could be your personal, logged-in
+# browser) unless you opt in with JARVIS_BH_ATTACH=1. CDP is reached via `localhost` —
 # newer Chrome blocks the /json endpoints when addressed as 127.0.0.1.
 BH_CLI      = os.environ.get("JARVIS_BH_CLI", str(BASE_DIR.parent / "bh-venv" / "Scripts" / "browser-harness.exe"))
 BH_PORT     = int(os.environ.get("JARVIS_BH_PORT", "9222"))
@@ -113,11 +116,19 @@ BH_CHROME   = os.environ.get("JARVIS_CHROME", r"C:\Program Files\Google\Chrome\A
 BH_PROFILE  = os.environ.get("JARVIS_BH_PROFILE", str(BASE_DIR.parent / "bh-chrome-profile"))
 BH_HEADLESS = os.environ.get("JARVIS_BH_HEADLESS", "0") != "0"   # default: visible, so you can watch it work
 BH_TIMEOUT  = int(os.environ.get("JARVIS_BH_TIMEOUT", "150"))
+# Opt-in ONLY: drive a Chrome already listening on the debug port. Off by default so JARVIS
+# never silently attaches to (and acts inside) your personal, logged-in browser.
+BH_ATTACH   = os.environ.get("JARVIS_BH_ATTACH", "0") != "0"
+# Optional comma-separated host allowlist for browse(); when set, navigation is restricted
+# to these hosts (and their subdomains). Empty = any public host (private/loopback always blocked).
+BH_ALLOWLIST = {h.strip().lower() for h in os.environ.get("JARVIS_BROWSE_ALLOWLIST", "").split(",") if h.strip()}
 
-# Wake word: voice commands only fire when prefixed with one of these. Includes
-# common Whisper mis-hears of "jarvis". Set JARVIS_WAKE_REQUIRED=0 to disable.
+# Wake word: voice commands only fire when the utterance STARTS with one of these
+# (prefix-anchored in _match_wake_word). Includes a few common Whisper mis-hears of
+# "jarvis" but NOT collision-prone tokens like "travis"/"jarvi"/"javis" that fire on
+# ordinary speech. Set JARVIS_WAKE_REQUIRED=0 to disable.
 WAKE_WORDS = [w.strip().lower() for w in os.environ.get(
-    "JARVIS_WAKE_WORDS", "jarvis,jarvis.,jervis,javis,jarvus,jarvi,travis,charvis,jarvix"
+    "JARVIS_WAKE_WORDS", "jarvis,jervis,jarvus,charvis,jarvix"
 ).split(",") if w.strip()]
 WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
 # After a bare "jarvis" (wake word with no command), stay armed this many seconds and
@@ -285,6 +296,7 @@ _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
 _awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _listen_thread: threading.Thread | None = None
+_voice_lock = threading.Lock() # serializes mic start/stop so they can't spawn two InputStreams
 _tts_playing = False          # frontend reports the exact playback window
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
@@ -370,8 +382,19 @@ def _load_memory() -> list[dict]:
     return _load_json(MEMORY_FILE, [])
 
 
+# One reentrant lock guards every mutate-and-save of the global `memories` list. Writers
+# live in three places — the event loop (hub endpoints), tool worker threads (remember/
+# recall via asyncio.to_thread), and the sleep-cycle coroutine — so without this they race
+# and silently drop each other's writes (last-writer-wins on the whole-file rewrite).
+_mem_lock = threading.RLock()
+
+
 def _save_memory(mems: list[dict]) -> None:
-    _save_json(MEMORY_FILE, mems)
+    # Snapshot under the lock so json serialization can't trip over a concurrent append,
+    # and so two writers can't interleave partial states onto disk.
+    with _mem_lock:
+        snapshot = list(mems)
+    _save_json(MEMORY_FILE, snapshot)
 
 
 def _save_history() -> None:
@@ -568,6 +591,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # duplicate it with server/network language ("uplink established") that
     # has no business being user-facing.
     await websocket.send_json({"type": "state", "status": "connected"})
+    # Tell this client the real mic state up front so its UI doesn't guess (a fresh client
+    # showing "tap to speak" while the mic is already hot under ALWAYS_LISTEN was the desync).
+    await websocket.send_json({"type": "mic", "listening": _listening})
     _maybe_run_briefing()
     # Always-on ears: start listening the moment a client is present (no button press).
     # The wake-word gate means it still only responds when addressed as "jarvis".
@@ -701,30 +727,42 @@ TOOLS: list[dict] = [
         "function": {
             "name": "browse",
             "description": (
-                "Drive a REAL Chrome browser to open sites, click, fill forms, log in, or "
-                "extract live page content — for anything a plain web search can't do "
-                "(interacting with a page, logged-in sites, multi-step navigation, reading "
-                "JS-rendered content). You WRITE a short Python snippet using these "
-                "pre-imported helpers, then print() what you want back:\n"
-                "  new_tab(url) — open URL in a new tab (use for first navigation)\n"
-                "  goto_url(url) — navigate the current tab\n"
-                "  wait_for_load() — wait until the page finishes loading\n"
-                "  page_info() — returns {url, title, w, h, ...}\n"
-                "  js(code) — run JavaScript in the page and RETURN its value; use this to "
-                "read text/DOM, e.g. js(\"document.body.innerText\") or "
-                "js(\"[...document.querySelectorAll('h3')].map(e=>e.innerText)\")\n"
-                "  click_at_xy(x, y) — click at pixel coordinates\n"
-                "  capture_screenshot() — screenshot the viewport\n"
-                "Always print() results. Example: new_tab('https://news.ycombinator.com'); "
-                "wait_for_load(); print(js(\"[...document.querySelectorAll('.titleline a')]"
-                ".slice(0,5).map(a=>a.innerText)\"))"
+                "Drive a REAL Chrome browser to open sites, read live page content, click, "
+                "type, and screenshot — for anything a plain web search can't do (interacting "
+                "with a page, reading JS-rendered content, multi-step navigation). Provide an "
+                "ordered list of `actions`; JARVIS runs them in sequence and returns what each "
+                "read/page_info produced. Available actions (op + params):\n"
+                "  {\"op\":\"navigate\",\"url\":\"https://…\"} — open/go to a URL (http/https only)\n"
+                "  {\"op\":\"read\",\"selector\":\"h3\"} — return innerText of the first match "
+                "(omit selector to read the whole page)\n"
+                "  {\"op\":\"read_all\",\"selector\":\".titleline a\"} — innerText of EVERY match\n"
+                "  {\"op\":\"click\",\"selector\":\"button.login\"} — click the first match\n"
+                "  {\"op\":\"type\",\"selector\":\"input[name=q]\",\"text\":\"hello\"} — type into a field\n"
+                "  {\"op\":\"screenshot\"} — capture the viewport\n"
+                "  {\"op\":\"page_info\"} — return {url, title, ...}\n"
+                "Example: [{\"op\":\"navigate\",\"url\":\"https://news.ycombinator.com\"},"
+                "{\"op\":\"read_all\",\"selector\":\".titleline a\"}]"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Python snippet using the browser helpers; print() what to return."},
+                    "actions": {
+                        "type": "array",
+                        "description": "Ordered browser actions to perform, each an object with an 'op'.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": {"type": "string",
+                                       "enum": ["navigate", "read", "read_all", "click", "type", "screenshot", "page_info"]},
+                                "url": {"type": "string", "description": "For navigate: the http(s) URL."},
+                                "selector": {"type": "string", "description": "CSS selector for read/read_all/click/type."},
+                                "text": {"type": "string", "description": "For type: the text to enter."},
+                            },
+                            "required": ["op"],
+                        },
+                    },
                 },
-                "required": ["code"],
+                "required": ["actions"],
             },
         },
     },
@@ -1004,12 +1042,130 @@ def _cdp_up() -> bool:
         return False
 
 
+# The dedicated-profile Chrome WE launch (never a foreign one). Tracked so we can kill it.
+_bh_chrome_proc = None   # subprocess.Popen | None
+
+_BROWSE_BLOCK_SCHEMES = {"file", "about", "data", "javascript", "chrome", "chrome-extension",
+                         "view-source", "ftp", "blob", "ws", "wss"}
+
+
+def _browse_allowed(url: str) -> str | None:
+    """Gate a navigation URL: http/https only, never loopback/private/link-local hosts (SSRF
+    against the user's own machine, incl. the JARVIS backend), plus an optional host
+    allowlist. Returns an error string, or None if the URL is allowed."""
+    u = (url or "").strip()
+    if not u:
+        return "navigate needs a 'url'."
+    try:
+        parsed = urllib.parse.urlparse(u)
+    except Exception:
+        return f"Could not parse URL: {url!r}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme in _BROWSE_BLOCK_SCHEMES:
+        return f"Blocked URL scheme '{scheme}:' for safety."
+    if scheme not in ("http", "https"):
+        return "Only http:// and https:// URLs can be browsed."
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return "URL has no host."
+    if host == "localhost" or host.endswith(".localhost") or host == "localhost.localdomain":
+        return "Blocked navigation to localhost."
+    try:
+        ip = ipaddress.ip_address(host)
+        if (ip.is_loopback or ip.is_private or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return "Blocked navigation to a private/loopback address."
+    except ValueError:
+        pass  # a hostname, not a bare IP — fall through to the allowlist check
+    if BH_ALLOWLIST and not any(host == a or host.endswith("." + a) for a in BH_ALLOWLIST):
+        return f"'{host}' is not in the browse allowlist (JARVIS_BROWSE_ALLOWLIST)."
+    return None
+
+
+def _bh_build_script(actions: list[dict]) -> tuple[str | None, str | None]:
+    """Compile a list of STRUCTURED actions into a browser-harness Python snippet. Every
+    model-supplied value is JSON-encoded at both the Python and the JavaScript quoting levels,
+    so nothing the model provides can escape its string literal into executable code — this is
+    what removes the arbitrary-Python / API-key-exfil RCE of the old free-`code` design.
+    Returns (script, error)."""
+    if not isinstance(actions, list) or not actions:
+        return None, "browse needs a non-empty `actions` list (see the tool description)."
+    if len(actions) > 20:
+        return None, "Too many actions (20 max per browse call)."
+
+    def js_lit(s) -> str:                 # a safe JS string literal from any model value
+        return json.dumps("" if s is None else str(s))
+
+    def py_print_js(js_source: str) -> str:   # `print(js(<js_source as a python str literal>))`
+        return f"print(js({json.dumps(js_source)}))"
+
+    lines = ["# auto-generated by JARVIS from structured actions - NOT model-authored code"]
+    opened = False
+    for i, step in enumerate(actions):
+        if not isinstance(step, dict):
+            return None, f"action {i} must be an object with an 'op'."
+        op = str(step.get("op", "")).strip().lower()
+        sel = step.get("selector")
+        if op == "navigate":
+            err = _browse_allowed(step.get("url", ""))
+            if err:
+                return None, err
+            url = str(step.get("url"))
+            lines.append(f"{'new_tab' if not opened else 'goto_url'}({json.dumps(url)})")
+            lines.append("wait_for_load()")
+            opened = True
+        elif op == "read":
+            expr = (f"(document.querySelector({js_lit(sel)})||document.body).innerText"
+                    if sel else "document.body.innerText")
+            lines.append(f'print("[read #{i}]")')
+            lines.append(py_print_js(expr))
+        elif op == "read_all":
+            if not sel:
+                return None, f"action {i} (read_all) needs a 'selector'."
+            expr = (f"JSON.stringify([...document.querySelectorAll({js_lit(sel)})]"
+                    f".map(function(e){{return e.innerText}}))")
+            lines.append(f'print("[read_all #{i}]")')
+            lines.append(py_print_js(expr))
+        elif op == "click":
+            if not sel:
+                return None, f"action {i} (click) needs a 'selector'."
+            expr = (f"(function(){{var e=document.querySelector({js_lit(sel)});"
+                    f"if(e){{e.click();return 'clicked';}}return 'no element matched';}})()")
+            lines.append(f'print("[click #{i}]")')
+            lines.append(py_print_js(expr))
+        elif op == "type":
+            if not sel:
+                return None, f"action {i} (type) needs a 'selector'."
+            expr = (f"(function(){{var e=document.querySelector({js_lit(sel)});"
+                    f"if(!e)return 'no element matched';e.focus();e.value={js_lit(step.get('text',''))};"
+                    f"e.dispatchEvent(new Event('input',{{bubbles:true}}));"
+                    f"e.dispatchEvent(new Event('change',{{bubbles:true}}));return 'typed';}})()")
+            lines.append(f'print("[type #{i}]")')
+            lines.append(py_print_js(expr))
+        elif op == "screenshot":
+            lines.append("capture_screenshot()")
+            lines.append(f'print("[screenshot #{i} captured]")')
+        elif op == "page_info":
+            lines.append(f'print("[page_info #{i}]")')
+            lines.append("print(page_info())")
+        else:
+            return None, f"action {i}: unknown op {op!r}."
+    return "\n".join(lines), None
+
+
 def _ensure_debug_chrome() -> str | None:
-    """Make sure a Chrome with remote debugging is reachable. Uses an existing one on the
-    port if present (e.g. your own browser via chrome://inspect); else launches a
-    dedicated-profile instance. Returns an error string, or None on success."""
+    """Ensure a debug Chrome WE control is reachable. Reuses the dedicated-profile instance we
+    launched; refuses to silently drive a foreign Chrome already on the port unless the user
+    explicitly opts in (JARVIS_BH_ATTACH=1). Returns an error string, or None on success."""
+    global _bh_chrome_proc
+    if _bh_chrome_proc is not None and _bh_chrome_proc.poll() is None and _cdp_up():
+        return None                              # our own instance is up
     if _cdp_up():
-        return None
+        if BH_ATTACH:
+            return None                          # user opted in to drive whatever's there
+        return ("A Chrome is already using the debug port. Attaching to it is disabled by "
+                "default (it may be your personal, logged-in browser). Close it so JARVIS can "
+                "launch its own isolated Chrome, or set JARVIS_BH_ATTACH=1 to allow attaching.")
     if not os.path.exists(BH_CHROME):
         return f"Chrome not found at {BH_CHROME}. Set JARVIS_CHROME to chrome.exe."
     args = [BH_CHROME, f"--remote-debugging-port={BH_PORT}",
@@ -1017,34 +1173,60 @@ def _ensure_debug_chrome() -> str | None:
     if BH_HEADLESS:
         args += ["--headless=new", "--disable-gpu"]
     try:
-        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _bh_chrome_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
         return f"could not launch Chrome: {exc}"
-    for _ in range(24):                       # ~12s for CDP to come up
+    for _ in range(24):                          # ~12s for CDP to come up
         time.sleep(0.5)
         if _cdp_up():
             return None
     return "Chrome launched but its debug port never responded."
 
 
-def _browser_run(code: str) -> str:
-    """Run a browser-harness Python snippet against the debug Chrome and return its output.
-    browser-harness lives in its own venv (isolated deps); we shell out to its CLI."""
-    code = (code or "").strip()
-    if not code:
-        return "browse needs a `code` snippet using the browser helpers."
+def _shutdown_browser() -> None:
+    """Terminate the dedicated-profile Chrome we launched, so it isn't orphaned (leaving a
+    standing, unauthenticated debug port) after JARVIS exits."""
+    global _bh_chrome_proc
+    proc = _bh_chrome_proc
+    _bh_chrome_proc = None
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+atexit.register(_shutdown_browser)
+
+
+def _browser_run(script: str) -> str:
+    """Run a JARVIS-generated browser-harness snippet against the debug Chrome and return its
+    output. browser-harness lives in its own venv (isolated deps); we shell out to its CLI.
+    The subprocess env is MINIMAL — the decrypted API keys in os.environ are never passed in."""
     if not os.path.exists(BH_CLI):
+        venv = BASE_DIR.parent / "bh-venv"
         return ("Browser support isn't installed. Set up the isolated env once:\n"
-                "  python -m venv C:\\Users\\rosha\\bh-venv\n"
-                "  C:\\Users\\rosha\\bh-venv\\Scripts\\pip install browser-harness")
+                f"  python -m venv {venv}\n"
+                f"  {venv / 'Scripts' / 'pip'} install browser-harness")
     err = _ensure_debug_chrome()
     if err:
         return f"Browser unavailable — {err}"
-    # Force UTF-8 both ways: pages return unicode (emoji, accents) that Windows' default
-    # cp1252 can't decode, which would otherwise lose all output.
-    env = {**os.environ, "BU_CDP_URL": BH_CDP_URL, "PYTHONIOENCODING": "utf-8"}
+    # Minimal env: only what the harness needs. NOT **os.environ — that would hand the
+    # decrypted GROQ/ANTHROPIC keys to the subprocess. Force UTF-8 so unicode pages survive.
+    env = {
+        "BU_CDP_URL": BH_CDP_URL,
+        "PYTHONIOENCODING": "utf-8",
+        "PATH": os.environ.get("PATH", ""),
+        "SystemRoot": os.environ.get("SystemRoot", ""),
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+    }
     try:
-        proc = subprocess.run([BH_CLI], input=code, capture_output=True, text=True,
+        proc = subprocess.run([BH_CLI], input=script, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=BH_TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         return f"Browser task timed out after {BH_TIMEOUT}s."
@@ -1054,10 +1236,21 @@ def _browser_run(code: str) -> str:
     errout = (proc.stderr or "").strip()
     if proc.returncode != 0 and not out:
         return f"Browser task error:\n{errout[:1500]}"
-    result = out or "(the snippet produced no output — remember to print() what you want back)"
+    result = out or "(the actions produced no readable output)"
     if errout and errout not in result:
         result += f"\n[stderr] {errout[:400]}"
     return result[:4000]
+
+
+def _browse(actions) -> str:
+    """The single entry point for the `browse` tool: validate + compile structured actions,
+    then run them. The model supplies only structured steps, never executable code."""
+    if isinstance(actions, dict):
+        actions = [actions]
+    script, err = _bh_build_script(actions if isinstance(actions, list) else [])
+    if err:
+        return err
+    return _browser_run(script)
 
 
 # ── Tool executor ──────────────────────────────────────────────────────────────
@@ -1090,8 +1283,10 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             "access_count": 0,
             "source": "manual",
         }
-        memories.append(entry)
-        _save_memory(memories)
+        with _mem_lock:
+            entry["id"] = _next_id(memories)   # assign id under the lock so it can't collide
+            memories.append(entry)
+            _save_memory(memories)
         broadcast_from_thread({"type": "memory_update", "count": len(memories)})
         return f"Stored: {args['content']}"
 
@@ -1103,14 +1298,15 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             namespace=args.get("namespace"),
         )
         if hits:
-            _save_memory(memories)  # persist access reinforcement from recall
+            with _mem_lock:
+                _save_memory(memories)  # persist access reinforcement from recall
             return "\n".join(
                 f"[{m.get('category', 'general')}] {m['content']}" for m in hits
             )
         return "No memories matching that query."
 
     if name == "browse":
-        return _browser_run(args.get("code", ""))
+        return _browse(args.get("actions"))
 
     if name == "search_web":
         try:
@@ -2381,9 +2577,20 @@ async def _run_sleep_cycle() -> None:
         # user mentioned aloud (even without addressing JARVIS) can become memories.
         heard_turns = [{"role": "user", "content": o["text"]} for o in _overheard[-20:]]
         reflect_input = (_history + heard_turns)[-40:]
+        pre_ids = {str(m.get("id")) for m in memories}   # what existed before the (slow) LLM merge
         result = await consolidation.consolidate(memories, reflect_input, _llm)
-        memories[:] = result["memories"]
-        _save_memory(memories)
+        with _mem_lock:
+            merged = list(result["memories"])
+            merged_ids = {str(m.get("id")) for m in merged}
+            # A `remember` can land while consolidation's LLM call is in flight; those new
+            # memories aren't in `result` (built from the pre-snapshot). Re-append them so the
+            # writeback doesn't silently drop a concurrent write.
+            for m in memories:
+                mid = str(m.get("id"))
+                if mid not in pre_ids and mid not in merged_ids:
+                    merged.append(m)
+            memories[:] = merged
+            _save_memory(memories)
         _last_consolidated_turn = _turn_seq
         await broadcast({"type": "sleep", "state": "done", "text": result["summary"],
                          "memory_count": len(memories)})
@@ -2502,26 +2709,33 @@ async def _set_local_model(model: str) -> None:
 
 def _forget_memory(mid) -> None:
     global memories
-    before = len(memories)
-    memories[:] = [m for m in memories if str(m.get("id")) != str(mid)]
-    if len(memories) != before:
-        _save_memory(memories)
+    with _mem_lock:
+        before = len(memories)
+        memories[:] = [m for m in memories if str(m.get("id")) != str(mid)]
+        changed = len(memories) != before
+        if changed:
+            _save_memory(memories)
+    if changed:
         broadcast_from_thread({"type": "memory_update", "count": len(memories)})
 
 
 # ── Wake word + barge-in ─────────────────────────────────────────────────────────
 def _match_wake_word(text: str):
-    """Return the command after the wake word, '' if only the wake word was said,
-    or None if no wake word is present."""
-    t = text.lower().strip()
-    best = None
+    """Return the command after the wake word, '' if only the wake word was said, or None if
+    the utterance doesn't START with a wake word. Prefix-anchored (after optional leading
+    fillers like 'hey'/'ok') and boundary-checked, so ordinary speech that merely CONTAINS a
+    wake-ish word ('we saw Travis yesterday') no longer fires a spurious command."""
+    t = text.lower().strip().lstrip("\"'.,!?;:- ")
+    for filler in ("hey ", "ok ", "okay ", "yo "):
+        if t.startswith(filler):
+            t = t[len(filler):].lstrip()
+            break
     for w in WAKE_WORDS:
-        idx = t.find(w)
-        if idx != -1 and (best is None or idx < best[0]):
-            best = (idx, w)
-    if best is None:
-        return None
-    return t[best[0] + len(best[1]):].lstrip(" ,.!?:;-'\"")
+        if t.startswith(w):
+            nxt = t[len(w):len(w) + 1]
+            if nxt == "" or not nxt.isalnum():   # word boundary — not "jarvis" inside a longer word
+                return t[len(w):].lstrip(" ,.!?:;-'\"")
+    return None
 
 
 def _is_echo(cmd: str) -> bool:
@@ -2793,21 +3007,31 @@ async def _speak(text: str) -> None:
 # ── STT ────────────────────────────────────────────────────────────────────────
 async def _start_voice() -> None:
     global _listening, _listen_thread, _tts_playing, _speaking_text
-    if _listening:
-        return
-    _tts_playing = False
-    _speaking_text = ""
-    _listening = True
+    with _voice_lock:
+        if _listening:
+            return
+        # If a previous worker is still winding down (it exits ~0.3s after _listening went
+        # False), wait for it to fully release the mic device before opening a new stream —
+        # otherwise a quick stop→start races two InputStreams onto one device ("device busy").
+        old = _listen_thread
+        if old is not None and old.is_alive():
+            old.join(timeout=2.0)
+        _tts_playing = False
+        _speaking_text = ""
+        _listening = True
+        _listen_thread = threading.Thread(target=_voice_worker, daemon=True)
+        _listen_thread.start()
     hint = f"Listening — say \"{WAKE_WORDS[0]}\" to wake me." if WAKE_REQUIRED else "Listening..."
     await broadcast({"type": "state", "status": "listening", "text": hint})
-    _listen_thread = threading.Thread(target=_voice_worker, daemon=True)
-    _listen_thread.start()
+    await broadcast({"type": "mic", "listening": True})   # authoritative — UI mirrors this
 
 
 def _stop_voice() -> None:
     global _listening
-    _listening = False
+    with _voice_lock:
+        _listening = False
     broadcast_from_thread({"type": "state", "status": "idle", "text": "Mic off."})
+    broadcast_from_thread({"type": "mic", "listening": False})
 
 
 # Whisper hallucinates these stock phrases on silence/noise — drop them.
@@ -2855,6 +3079,16 @@ def _transcribe(wav_bytes: bytes) -> str:
         return ""
 
 
+def _voice_stopped() -> None:
+    """Mark the mic authoritatively OFF (thread context). Called on EVERY _voice_worker exit,
+    including the early-return failure paths — so one transient mic/dep/key error can't leave
+    _listening stuck True and wedge voice (with the UI still claiming it's on) for the session."""
+    global _listening
+    _listening = False
+    broadcast_from_thread({"type": "mic", "listening": False})
+    broadcast_from_thread({"type": "audio_level", "level": 0})
+
+
 def _voice_worker() -> None:
     import queue as Q
     import wave
@@ -2867,10 +3101,12 @@ def _voice_worker() -> None:
             "type": "system",
             "text": f"Voice deps missing: {exc}. Run: pip install sounddevice numpy",
         })
+        _voice_stopped()
         return
 
     if not (USE_GROQ and _HAS_GROQ):
         broadcast_from_thread({"type": "system", "text": "Voice input needs a GROQ_API_KEY for Whisper transcription."})
+        _voice_stopped()
         return
 
     RATE = 16000
@@ -3009,7 +3245,9 @@ def _voice_worker() -> None:
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Voice error: {exc}"})
 
-    broadcast_from_thread({"type": "audio_level", "level": 0})
+    # Any exit — normal stop, mic/stream error, or GROQ hiccup — resets the flag so the mic
+    # can always be restarted (and so ALWAYS_LISTEN's auto-restart isn't permanently blocked).
+    _voice_stopped()
 
 
 # ── HTTP API ───────────────────────────────────────────────────────────────────
@@ -3209,32 +3447,53 @@ def _extract_pdf(path) -> str:
     return "\n\n".join(chunks)
 
 
-def _digest_upload(path, ext: str) -> tuple[str, str]:
-    """(kind, extracted text) for a saved upload. Runs in a worker thread."""
+def _digest_upload(path, ext: str) -> tuple[str, str, bool]:
+    """(kind, extracted text, extracted?) for a saved upload. Runs in a worker thread.
+    `extracted` is False when we couldn't get real content — unsupported type, empty file,
+    or image vision unavailable — so the caller flags it instead of feeding the brain a stub
+    (e.g. the 'Vision needs a Groq API key.' sentence) as if it were the file's content."""
     if ext in _IMAGE_EXTS:
+        if not USE_GROQ:
+            return "image", "", False        # no vision backend — don't pass a stub off as content
         desc = _analyze_image(str(path),
                               "Describe this image thoroughly. Transcribe ALL visible "
                               "text exactly as written. Note anything unusual or "
                               "noteworthy — the user attached it for a reason.")
-        return "image", desc
+        return "image", desc, bool((desc or "").strip())
     if ext == ".pdf":
-        return "pdf", _extract_pdf(path)
+        t = _extract_pdf(path)
+        return "pdf", t, bool(t.strip())
     if ext == ".docx":
-        return "docx", _extract_docx(path)
+        t = _extract_docx(path)
+        return "docx", t, bool(t.strip())
     if ext in _TEXT_EXTS:
-        return "text", path.read_text(encoding="utf-8", errors="ignore")
-    return "binary", ""
+        t = path.read_text(encoding="utf-8", errors="ignore")
+        return "text", t, bool(t.strip())
+    return "binary", "", False
 
 
 @app.post("/api/upload")
 async def upload_endpoint(request: Request) -> JSONResponse:
+    # Same origin/loopback gate the websocket uses — this is the one endpoint that writes
+    # files to disk + triggers cloud vision, so it must not be the least-protected surface.
+    if not _origin_allowed(request.headers.get("origin")):
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
+    # Reject oversize BEFORE buffering + base64-decoding the whole body into memory (DoS guard).
+    clen = request.headers.get("content-length")
+    if clen and clen.isdigit() and int(clen) > _UPLOAD_MAX * 2:
+        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
+                            status_code=413)
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     name = os.path.basename(str(body.get("name") or "file"))
+    b64 = body.get("data_b64") or ""
+    if not isinstance(b64, str) or len(b64) > _UPLOAD_MAX * 4 // 3 + 1024:   # b64 ≈ 4/3 of raw
+        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
+                            status_code=413)
     try:
-        raw = base64.b64decode(body.get("data_b64") or "", validate=True)
+        raw = base64.b64decode(b64, validate=True)
     except Exception:
         return JSONResponse({"error": "data_b64 is not valid base64"}, status_code=400)
     if not raw:
@@ -3245,21 +3504,34 @@ async def upload_endpoint(request: Request) -> JSONResponse:
 
     UPLOADS_DIR.mkdir(exist_ok=True)
     ext = Path(name).suffix.lower()
-    safe = f"{int(time.time())}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}"
+    # uuid prefix: unique per upload so near-simultaneous drops never collide/overwrite.
+    safe = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}"
     dest = UPLOADS_DIR / safe
     dest.write_bytes(raw)
 
+    # Only the extracted digest is ever used again — never the file itself — so delete it
+    # after extraction (in a finally) to keep uploads/ from growing without bound.
     try:
-        kind, text = await asyncio.to_thread(_digest_upload, dest, ext)
+        kind, text, extracted = await asyncio.to_thread(_digest_upload, dest, ext)
     except Exception as exc:
-        return JSONResponse({"ok": True, "name": name, "kind": "binary", "path": str(dest),
-                             "digest": "", "note": f"saved, but couldn't read content: {exc}"})
+        return JSONResponse({"ok": True, "name": name, "kind": "binary", "digest": "",
+                             "extracted": False,
+                             "note": f"attached, but its content couldn't be read: {exc}"})
+    finally:
+        try:
+            dest.unlink(missing_ok=True)
+        except Exception:
+            pass
     digest = (text or "").strip()
     truncated = len(digest) > _DIGEST_CAP
     if truncated:
         digest = digest[:_DIGEST_CAP] + "\n…[truncated]"
-    return JSONResponse({"ok": True, "name": name, "kind": kind, "path": str(dest),
-                         "digest": digest, "truncated": truncated})
+    note = None
+    if not extracted:
+        note = ("image vision unavailable — add a Groq key in Settings"
+                if kind == "image" else "no readable content could be extracted")
+    return JSONResponse({"ok": True, "name": name, "kind": kind, "digest": digest,
+                         "extracted": extracted, "truncated": truncated, "note": note})
 
 
 # ── Memory hub — cross-model remember/recall over HTTP ─────────────────────────
@@ -3297,7 +3569,8 @@ async def hub_remember(request: Request) -> JSONResponse:
         "private": bool(body.get("private", False)),
         "source_model": body.get("source_model", "external"),
     }
-    result = execute_tool("remember", args)
+    # execute_tool does blocking disk I/O under the memory lock — run it off the event loop.
+    result = await asyncio.to_thread(execute_tool, "remember", args)
     return JSONResponse({"ok": True, "result": result, "count": len(memories)})
 
 
@@ -3307,11 +3580,19 @@ async def hub_recall(request: Request, q: str, k: int = 6,
     if not _hub_authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
     import mem_recall
-    # External callers NEVER see private memories — that filter is not optional here.
-    hits = mem_recall.recall(q, memories, k=max(1, min(k, 20)),
-                             namespace=namespace, include_private=False)
-    if hits:
-        _save_memory(memories)  # persist access reinforcement
+
+    # Embedding every candidate + the disk write are blocking — run the whole recall off the
+    # event loop so it can't stall other websocket turns / HTTP requests.
+    def _do_recall():
+        # External callers NEVER see private memories — that filter is not optional here.
+        found = mem_recall.recall(q, memories, k=max(1, min(k, 20)),
+                                  namespace=namespace, include_private=False)
+        if found:
+            with _mem_lock:
+                _save_memory(memories)  # persist access reinforcement
+        return found
+
+    hits = await asyncio.to_thread(_do_recall)
     return JSONResponse({"count": len(hits), "memories": [
         {"content": m.get("content"), "category": m.get("category", "fact"),
          "importance": m.get("importance", 5),
