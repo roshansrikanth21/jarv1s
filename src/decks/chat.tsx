@@ -15,12 +15,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { WindowControls } from "@/components/jarvis/WindowControls";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
-const SIDEBAR_BG = "#171717";
-const MAIN_BG = "#212121";
-const BUBBLE_BG = "#2f2f2f";
+// Pitch-black chat theme — keeps the familiar ChatGPT layout, but on a true-black (AMOLED)
+// canvas. The only lifted surfaces are the user bubble, the composer, and attachment chips,
+// so the conversation floats on the void. Teal accent kept for the familiar chatbot identity.
+const SIDEBAR_BG = "#0a0a0a";   // pitch-black side panel, a hair lifted so it reads as a panel
+const MAIN_BG = "#000000";      // true pitch black
+const BUBBLE_BG = "#191919";    // the only raised surface: user bubble / composer / chips
 const TEXT = "#ececec";
-const TEXT_DIM = "#9b9b9b";
-const BORDER = "#3a3a3a";
+const TEXT_DIM = "#8a8a8a";
+const BORDER = "#242424";
 const FONT = "ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
 
 type Attachment = {
@@ -277,7 +280,11 @@ export default function ChatDeck() {
             <div style={{
               display: "flex", alignItems: "flex-end", gap: 6, background: BUBBLE_BG,
               border: `1px solid ${dragging ? "#10a37f" : BORDER}`, borderRadius: 26, padding: "8px 10px 8px 14px",
-              transition: "border-color 0.15s",
+              // Subtle elevation so the composer reads as a floating focal point on the pure-black void.
+              boxShadow: dragging
+                ? "0 0 0 1px #10a37f, 0 8px 30px rgba(16,163,127,0.15)"
+                : "0 0 0 1px rgba(255,255,255,0.03), 0 6px 24px rgba(0,0,0,0.5)",
+              transition: "border-color 0.15s, box-shadow 0.15s",
             }}>
               <button onClick={() => fileRef.current?.click()} title="Attach files" style={iconBtn}>
                 <ClipIcon />
