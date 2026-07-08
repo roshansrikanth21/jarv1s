@@ -35,6 +35,7 @@ export default function TerminalDeck() {
       position: "fixed", inset: 0, background: BG, color: GREEN,
       fontFamily: "JetBrains Mono, ui-monospace, monospace", fontSize: 13,
       display: "flex", flexDirection: "column", overflow: "hidden",
+      paddingBottom: 48,   // reserve room for the global UI switcher docked at the bottom
     }}>
       {/* title line (drag region for the frameless window) */}
       <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>

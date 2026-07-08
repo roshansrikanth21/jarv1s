@@ -639,7 +639,7 @@ function CommandDeck() {
     : cloudOn ? "cloud + local AI" : localOn ? `local AI · ${shortModel(agentStatus.local?.fast ?? "model")}` : "no AI configured yet";
 
   return (
-    <div className="hud-root">
+    <div className="hud-root" style={{ paddingBottom: 48 }}>
       {/* Background layers (deepest first): living shader wash → grid → reactive motes */}
       <div className="hud-bg" aria-hidden>
         <ShaderBackdrop state={speaking ? "speaking" : listening ? "listening" : "idle"} />

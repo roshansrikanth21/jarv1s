@@ -166,7 +166,7 @@ export default function ChatDeck() {
 
   return (
     <div
-      style={{ position: "fixed", inset: 0, display: "flex", background: MAIN_BG, color: TEXT, fontFamily: FONT }}
+      style={{ position: "fixed", inset: 0, display: "flex", background: MAIN_BG, color: TEXT, fontFamily: FONT, paddingBottom: 48 }}
       onDragOver={e => { e.preventDefault(); setDragging(true); }}
       onDragLeave={e => { if (e.target === e.currentTarget) setDragging(false); }}
       onDrop={e => { e.preventDefault(); setDragging(false); onFiles(e.dataTransfer?.files ?? null); }}

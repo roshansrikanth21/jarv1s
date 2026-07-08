@@ -30,6 +30,7 @@ export default function FocusDeck() {
       position: "fixed", inset: 0, background: BG, color: "#e8eef2",
       fontFamily: "JetBrains Mono, ui-monospace, monospace",
       display: "flex", flexDirection: "column", alignItems: "center",
+      paddingBottom: 48,   // reserve room for the global UI switcher docked at the bottom
     }}>
       {/* full-width header — controls pinned to window top-right */}
       <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>
