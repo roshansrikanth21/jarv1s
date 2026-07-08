@@ -140,7 +140,6 @@ function Page() {
           <PresetSwitcher
             value={preset}
             onChange={setPreset}
-            docked={preset === "terminal" || preset === "focus"}
             onSettings={() => setSettingsOpen(true)}
           />
           {/* The one global settings surface — same on every deck, themed to its accent. */}
@@ -189,13 +188,15 @@ const PRESET_ACCENT: Record<string, string> = {
   chat: "#10a37f",
 };
 
-function PresetSwitcher({ value, onChange, docked, onSettings }: { value: string; onChange: (v: string) => void; docked?: boolean; onSettings?: () => void }) {
+function PresetSwitcher({ value, onChange, onSettings }: { value: string; onChange: (v: string) => void; onSettings?: () => void }) {
   return (
     <div
       className="no-drag"
       style={{
         position: "fixed",
-        ...(docked ? { top: 10, bottom: "auto" } : { bottom: 10, top: "auto" }),
+        // Always docked to the very bottom, on every deck — each deck reserves a matching
+        // bottom band (paddingBottom) so this sits cleanly BELOW the input, never over it.
+        bottom: 10,
         left: "50%",
         transform: "translateX(-50%)",
         zIndex: 99999,

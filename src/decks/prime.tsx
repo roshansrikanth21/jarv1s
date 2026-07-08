@@ -694,7 +694,7 @@ export default function PrimeDeck() {
   const agentCaption = stream || (lastAgent && lastAgent.kind === "agent" ? lastAgent.text : "");
 
   return (
-    <div className="pr-root" data-jstate={jstate}>
+    <div className="pr-root" data-jstate={jstate} style={{ paddingBottom: 48 }}>
       {/* ═══ header ═══ */}
       <header className="pr-header drag">
         <div className="no-drag" style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
