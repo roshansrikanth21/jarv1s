@@ -21,7 +21,7 @@ import logging
 from typing import Optional
 
 from . import (dreaming, embeddings, emotion, extract, migrate, paths,
-               prompt as _prompt, router, store, vectors)
+               prompt as _prompt, router, store, sync_mem0, vectors)
 from .prompt import PromptHooks, build_system_prompt
 
 log = logging.getLogger("jarvis.cortex")
@@ -75,13 +75,22 @@ def recall(query: str, k: int = 6, namespace: Optional[str] = None,
 def remember(text: str, *, category: str = "preference", confidence: float = 0.85,
              namespace: str = "personal", source_model: str = "jarvis",
              private: bool = False, importance: int = 5) -> str:
-    """Write a durable fact directly (used by explicit `remember` tool + hub endpoints)."""
+    """Write a durable fact directly (used by explicit `remember` tool + hub endpoints).
+    Optionally mirrors the fact to Mem0 when JARVIS_MEM0_WRITETHROUGH=1 is set (off
+    by default — nightly dreaming batches to Mem0 either way)."""
     init()
     fid = store.add_fact(text, category=category, confidence=confidence,
                          namespace=namespace, source_model=source_model,
                          private=private, importance=importance)
     if fid:
-        vectors.index_fact(store.get_fact(fid) or {})
+        fact_obj = store.get_fact(fid) or {}
+        vectors.index_fact(fact_obj)
+        # Opt-in mirror to Mem0 on every write. Private facts are refused inside sync_mem0.
+        if sync_mem0.WRITETHROUGH:
+            try:
+                sync_mem0.sync_fact(fact_obj)
+            except Exception as exc:
+                log.info("cortex.remember: mem0 writethrough skipped (%s)", exc)
     return fid
 
 
@@ -104,5 +113,5 @@ __all__ = [
     "PromptHooks", "build_system_prompt",
     "init", "record_turn", "recall", "remember", "forget", "stats",
     "dreaming", "embeddings", "emotion", "extract", "migrate", "paths",
-    "router", "store", "vectors",
+    "router", "store", "sync_mem0", "vectors",
 ]

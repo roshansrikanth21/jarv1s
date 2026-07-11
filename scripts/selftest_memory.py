@@ -188,6 +188,27 @@ def run() -> int:
     start, end = dreaming._window_utc("2026-07-10")
     ok("window is a 24h span", start.startswith("2026-07-10") and end.startswith("2026-07-11"))
 
+    section("cortex.sync_mem0 — fail-soft when disabled (no MEM0_API_KEY / no network)")
+    # Force a clean state, then guarantee the key is unset for this section.
+    from cortex import sync_mem0
+    _prev_key = os.environ.pop("MEM0_API_KEY", None)
+    sync_mem0.reset_for_tests()
+    ok("enabled() is False with no key", sync_mem0.enabled() is False)
+    ok("status().enabled is False", sync_mem0.status().get("enabled") is False)
+    ok("sync_fact returns False (no crash)",
+       sync_mem0.sync_fact({"text": "dummy", "category": "preference"}) is False)
+    ok("sync_dreaming_result returns disabled report (no crash)",
+       sync_mem0.sync_dreaming_result({"summary": "x", "summary_episode_id": "y"}, added_facts=[])
+       == {"enabled": False, "summary": 0, "facts": 0})
+    ok("sync_all_facts returns disabled report",
+       sync_mem0.sync_all_facts().get("enabled") is False)
+    ok("restore_from_mem0 returns disabled report",
+       sync_mem0.restore_from_mem0().get("enabled") is False)
+    # Restore the env for callers.
+    if _prev_key is not None:
+        os.environ["MEM0_API_KEY"] = _prev_key
+    sync_mem0.reset_for_tests()
+
     # ── report ─────────────────────────────────────────────────────────────────
     passed = sum(1 for _, c, _ in _checks if c)
     total = len(_checks)

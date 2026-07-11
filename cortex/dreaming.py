@@ -91,6 +91,7 @@ async def run_once(day: Optional[str] = None, min_turns: int = 4) -> dict:
     vectors.index_episode(ep_obj)
 
     added_facts, added_prospective = 0, 0
+    added_fact_objs: list[dict] = []
     for f in parsed.get("facts") or []:
         text = (f.get("text") or "").strip()
         if not text:
@@ -101,7 +102,9 @@ async def run_once(day: Optional[str] = None, min_turns: int = 4) -> dict:
                              source_episode_id=summary_id,
                              namespace="personal", source_model="jarvis")
         if fid:
-            vectors.index_fact(store.get_fact(fid) or {})
+            fact_obj = store.get_fact(fid) or {}
+            vectors.index_fact(fact_obj)
+            added_fact_objs.append(fact_obj)
             added_facts += 1
 
     for p in parsed.get("prospective_items") or []:
@@ -116,7 +119,7 @@ async def run_once(day: Optional[str] = None, min_turns: int = 4) -> dict:
         if pid:
             added_prospective += 1
 
-    return {
+    result = {
         "status": "ok",
         "window": [start, end],
         "raw_turns": len(raw),
@@ -125,6 +128,16 @@ async def run_once(day: Optional[str] = None, min_turns: int = 4) -> dict:
         "prospective_added": added_prospective,
         "summary_episode_id": summary_id,
     }
+
+    # Cloud mirror to Mem0 — the summary + newly-added facts. No-op if MEM0_API_KEY
+    # isn't set or mem0ai isn't installed. Private facts are refused inside sync_mem0.
+    try:
+        from . import sync_mem0
+        result["mem0"] = sync_mem0.sync_dreaming_result(result, added_facts=added_fact_objs)
+    except Exception as exc:
+        log.info("dreaming: mem0 mirror skipped (%s)", exc)
+
+    return result
 
 
 def main() -> None:
