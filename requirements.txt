@@ -40,6 +40,15 @@ pypdf
 # Cross-model memory hub — MCP server so Claude/ChatGPT/Gemini share JARVIS's store
 mcp
 
+# Cortex vector index — semantic recall over facts + episodes. Falls back to a
+# pure-Python in-RAM cosine index if this is missing, so JARVIS still boots.
+chromadb
+
+# Optional cortex cloud mirror — pushes durable facts + nightly dreaming summaries
+# to Mem0 so other devices/apps read the same memory. Gated on MEM0_API_KEY;
+# without the key or this package installed, cortex simply skips the sync.
+mem0ai
+
 # Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama
 

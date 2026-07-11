@@ -35,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import consolidation
 import device
 import governor
 import models_advisor
@@ -46,6 +45,8 @@ import perception
 import persona as persona_mod
 import system_monitor
 import web_search as websearch_mod
+
+import cortex
 
 logging.basicConfig(
     level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
@@ -247,18 +248,6 @@ async def _boot_probe():
         pass
 
 
-def _warm_memory() -> None:
-    """Pre-embed the memory store so the first recall isn't slow mid-conversation. No-op /
-    instant in keyword mode (also surfaces the one-time 'no embedding backend' notice early)."""
-    try:
-        import mem_recall
-        n = mem_recall.warm(memories)
-        if n:
-            log.info("mem_recall: pre-embedded %d memories", n)
-    except Exception:
-        pass
-
-
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     global _main_loop, _sleep_task, _ambient_task, _boot_task, _monitor_task
@@ -267,14 +256,21 @@ async def _lifespan(app: FastAPI):
     print(f"[JARVIS] Online — cloud: {_active_model()} ({brain})")
     print(f"[JARVIS] Memory: {len(memories)} | Tasks: {len(task_list)} | Tools: {len(TOOLS)}")
     print(f"[JARVIS] Affect: emotion={'on' if persona_mod.ENABLED else 'off'} ({persona_mod.SARCASM}) | ambient awareness on")
+    # Cortex: SQLite (WAL) + Chroma-or-RAM vector index. First boot migrates any
+    # legacy jarvis_memory.json / jarvis_history.json into the new store.
+    try:
+        _cortex_stats = await asyncio.to_thread(cortex.init)
+        print(f"[JARVIS] Cortex: {_cortex_stats}")
+        cortex.emotion.sync_from_persona(_persona)
+    except Exception as _exc:
+        log.warning("cortex init failed: %s", _exc)
     # Background tasks (don't block serving): hardware probe, sleep cycle, ambient.
     _boot_task = asyncio.create_task(_boot_probe())
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
-    # Pre-warm memory embeddings off the event loop so first recall isn't slow (instant in
-    # keyword mode; returns as soon as it finds no embedding backend).
-    asyncio.create_task(asyncio.to_thread(_warm_memory))
+    # (Cortex init above already embedded every fact + episode via vectors._bootstrap_from_store,
+    #  so first recall is warm without a separate task.)
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
     spa_dir = BASE_DIR / "dist" / "client"
     if (spa_dir / "index.html").exists():
@@ -394,10 +390,9 @@ def _save_json(path: Path, data) -> None:
 
 
 def _migrate_memories(mems: list[dict]) -> list[dict]:
-    """Backfill schema on pre-migration memories. Without ts/last_access an old entry computes
-    days=0 forever (see mem_recall._strength / consolidation.decay_and_prune) — so it never
-    decays and always ranks as maximally recent. Derive the timestamps from the ISO
-    `timestamp` string when present, and fill the fields recall/decay rely on."""
+    """Backfill schema on pre-migration memories in the legacy JSON mirror. Derive the
+    timestamps from the ISO `timestamp` string when present, and fill the bookkeeping
+    fields any legacy path expects. (Cortex owns the authoritative store now.)"""
     for m in mems:
         if not isinstance(m, dict):
             continue
@@ -1040,40 +1035,6 @@ def _next_id(items: list[dict]) -> int:
     return max((int(i.get("id", 0)) for i in items), default=0) + 1
 
 
-def _top_memories(limit: int = 20) -> list[dict]:
-    return sorted(
-        memories,
-        key=lambda m: (
-            -(m.get("importance") or 5),
-            -(m.get("access_count") or 0),
-            str(m.get("last_access") or m.get("timestamp") or ""),
-        ),
-    )[:limit]
-
-
-def _relevant_memories(query: str, limit: int = 20) -> list[dict]:
-    """Memories to inject into JARVIS's own prompt: a few always-on high-importance facts,
-    PLUS the ones most relevant to the CURRENT message (semantic recall). Falls back to pure
-    importance ordering when there's no query or the store is small enough to inject whole —
-    so the injected context stays pertinent as the store grows past `limit` entries."""
-    if not (query or "").strip() or len(memories) <= limit:
-        return _top_memories(limit)
-    try:
-        import mem_recall
-        pinned = _top_memories(6)                     # identity-level facts are always present
-        seen = {id(m) for m in pinned}
-        out = list(pinned)
-        # reinforce=False: building the prompt must not inflate access counts — only the
-        # recall_memory tool should reinforce what it deliberately surfaces.
-        for m in mem_recall.recall(query, memories, k=limit, include_private=True, reinforce=False):
-            if id(m) not in seen and len(out) < limit:
-                out.append(m)
-                seen.add(id(m))
-        return out
-    except Exception:
-        return _top_memories(limit)
-
-
 def _validate_tool_args(name: str, args: dict) -> str | None:
     for key in _TOOL_REQUIRED.get(name, []):
         val = args.get(key)
@@ -1339,43 +1300,68 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return err
 
     if name == "remember":
+        # Persist via cortex (SQLite + vector index). Legacy `memories` mirror is kept
+        # so anything still reading it (UI counts, health endpoint) keeps working.
+        raw_cat = _norm_memory_category(args.get("category", "fact"))
+        # Cortex categories: preference | situation | person | identity | skill.
+        _CAT_MAP = {"fact": "preference", "general": "preference", "task": "situation",
+                    "project": "situation", "security": "identity", "personal": "identity"}
+        cortex_cat = _CAT_MAP.get(raw_cat, raw_cat if raw_cat in
+                                  {"preference", "situation", "person", "identity", "skill"}
+                                  else "preference")
+        try:
+            cortex.remember(
+                args["content"],
+                category=cortex_cat,
+                confidence=0.9,   # explicit user-driven remembers are high-trust
+                namespace=args.get("namespace", "personal"),
+                source_model=args.get("source_model", "jarvis"),
+                private=bool(args.get("private", False)),
+                importance=int(args.get("importance") or
+                               (6 if raw_cat == "personal" else 5)),
+            )
+        except Exception as _exc:
+            log.info("cortex.remember failed, falling back to legacy JSON only: %s", _exc)
+        # Legacy mirror (drives /api/memory count + UI badge until the panel migrates).
         now = time.time()
         entry = {
             "id": _next_id(memories),
             "content": args["content"],
-            "category": _norm_memory_category(args.get("category", "fact")),
+            "category": raw_cat,
             "importance": int(args.get("importance") or
-                              (6 if _norm_memory_category(args.get("category", "")) == "personal" else 5)),
+                              (6 if raw_cat == "personal" else 5)),
             "namespace": args.get("namespace", "personal"),
             "private": bool(args.get("private", False)),
             "source_model": args.get("source_model", "jarvis"),
             "timestamp": datetime.now().isoformat(),
-            # consolidation/decay + recall bookkeeping (so explicit memories age correctly)
             "ts": now,
             "last_access": now,
             "access_count": 0,
             "source": "manual",
         }
         with _mem_lock:
-            entry["id"] = _next_id(memories)   # assign id under the lock so it can't collide
+            entry["id"] = _next_id(memories)
             memories.append(entry)
             _save_memory(memories)
         broadcast_from_thread({"type": "memory_update", "count": len(memories)})
         return f"Stored: {args['content']}"
 
     if name == "recall_memory":
-        import mem_recall
-        hits = mem_recall.recall(
-            args["query"], memories,
-            k=int(args.get("k", 6)),
-            namespace=args.get("namespace"),
-            include_private=True,   # JARVIS's own recall sees private memories; the HTTP hub does not
-        )
+        # Semantic recall via cortex. Reinforcement is handled inside cortex.recall.
+        try:
+            hits = cortex.recall(
+                args["query"],
+                k=int(args.get("k", 6)),
+                namespace=args.get("namespace"),
+                include_private=True,   # JARVIS sees private; the HTTP hub does not
+            )
+        except Exception as _exc:
+            log.info("cortex.recall failed, falling back to legacy JSON: %s", _exc)
+            hits = []
         if hits:
-            with _mem_lock:
-                _save_memory(memories)  # persist access reinforcement from recall
             return "\n".join(
-                f"[{m.get('category', 'general')}] {m['content']}" for m in hits
+                f"[{m.get('category', 'preference')}] {m.get('text', '')}"
+                for m in hits
             )
         return "No memories matching that query."
 
@@ -2130,42 +2116,70 @@ You have tools — memory, web search, system info, app launch, tasks, screen ca
 
 
 def _build_system_prompt(query: str = "") -> str:
+    """Assemble the system message via cortex.
+
+    Persona, ambient, homeostasis, and the overheard buffer stay owned by api.py
+    (they see live device/user state) — cortex takes them via PromptHooks and
+    injects semantically-recalled facts + episodes on top, with a token-budgeted
+    trim (episodes drop first, then low-confidence facts). Persona/emotion never
+    trim — they're what keep JARVIS himself.
+    """
     nm = _user_name() or "the user"
     base = _BASE_PROMPT.replace("__USER__", nm)
-    lines = [base]
-    # Surroundings: time of day, location, weather (non-blocking, cached).
+
     try:
-        lines.append("\n" + ambient.prompt_fragment())
+        ambient_frag = ambient.prompt_fragment() or ""
     except Exception:
-        lines.append(f"\nToday: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}")
-    # Affect: persona + live PAD mood + how to read the user this turn.
+        ambient_frag = f"Today: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"
+
+    persona_block = ""
     if persona_mod.ENABLED:
         try:
             us = _last_read.user_state if _last_read else "neutral"
             gd = _last_read.guidance if _last_read else ""
             sup = bool(_last_read.suppress_sarcasm) if _last_read else False
-            blk = _persona.style_block(nm, user_state=us, guidance=gd, suppress_sarcasm=sup)
-            if blk:
-                lines.append("\n" + blk)
+            persona_block = _persona.style_block(nm, user_state=us, guidance=gd,
+                                                 suppress_sarcasm=sup) or ""
         except Exception:
-            pass
+            persona_block = ""
+
+    homeo_line = ""
     if _last_device:
         h = _homeostasis(_last_device)
         if h["energy"] <= 0.33:
-            lines.append("\nYou're on battery and low on energy — keep replies especially "
-                         "short and skip anything non-essential.")
-    if memories:
-        mem_lines = "\n".join(
-            f"  - [{m.get('category', 'general')}] {m['content']}"
-            for m in _relevant_memories(query, 20)
-        )
-        lines.append(f"\nWhat you know about {nm}:\n{mem_lines}")
-    # Ambient memory — things recently overheard nearby. May or may not be addressed to
-    # you; use as context only if relevant, and don't assume it was said to you.
-    if _overheard:
-        heard = "\n".join(f"  - {o['text']}" for o in _overheard[-8:])
-        lines.append(f"\nRecently overheard nearby (ambient — relate to it only if relevant):\n{heard}")
-    return "\n".join(lines)
+            homeo_line = ("You're on battery and low on energy — keep replies "
+                          "especially short and skip anything non-essential.")
+
+    # Mirror persona's live PAD into the cortex emotion_state so the [Emotion] line
+    # cortex writes stays in sync with what persona is doing this very turn.
+    try:
+        cortex.emotion.sync_from_persona(_persona)
+    except Exception:
+        pass
+
+    hooks = cortex.PromptHooks(
+        base_prompt=base,
+        user_name=nm,
+        ambient_fragment=ambient_frag,
+        persona_block=persona_block,
+        homeostasis_line=homeo_line,
+        overheard=list(_overheard),
+        namespace="personal",
+        include_private=True,   # in-process JARVIS sees private facts; the HTTP hub does not
+    )
+    try:
+        return cortex.build_system_prompt(query, hooks)
+    except Exception as exc:
+        # Never let the memory layer fail a reply — degrade to persona + ambient only.
+        log.warning("cortex.build_system_prompt failed: %s", exc)
+        parts = [base]
+        if ambient_frag:
+            parts.append("\n" + ambient_frag)
+        if persona_block:
+            parts.append("\n" + persona_block)
+        if homeo_line:
+            parts.append("\n" + homeo_line)
+        return "\n".join(parts)
 
 
 # ── Shared tool runner ──────────────────────────────────────────────────────────
@@ -2247,7 +2261,8 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool):
 
 
 def _record_turn(user: str, assistant: str) -> None:
-    """Keep a short rolling window of the conversation for multi-turn context."""
+    """Keep a short rolling window of the conversation for multi-turn context, AND
+    persist the exchange to cortex (episode + fire-and-forget extraction)."""
     global _history, _turn_seq
     _turn_seq += 1
     _history = (_history + [
@@ -2255,6 +2270,12 @@ def _record_turn(user: str, assistant: str) -> None:
         {"role": "assistant", "content": assistant},
     ])[-CONV_TURNS:]
     _save_history()
+    # Cortex write: never blocks the reply, never raises. Runs on the event loop as a
+    # scheduled task so extraction can await router calls.
+    try:
+        cortex.record_turn(user, assistant, source="chat", namespace="personal")
+    except Exception as _exc:
+        log.info("cortex.record_turn: %s", _exc)
 
 
 def _remember_overheard(text: str) -> None:
@@ -2658,60 +2679,26 @@ async def _run_agent(text: str) -> None:
 
 # ── Sleep / consolidation + model management ─────────────────────────────────────
 async def _run_sleep_cycle() -> None:
-    """One consolidation cycle — compress episodic turns into durable memory. Prefers
-    a local model so reflection stays on-device; falls back to Groq."""
-    global memories, _last_consolidated_turn, _sleeping
+    """One consolidation cycle — cortex.dreaming compresses today's raw episodes
+    into a durable narrative + facts + prospective items. The heavy LLM call goes
+    through cortex.router (task_type='consolidation'), which prefers a long-context
+    brain (Groq gpt-oss-120b > Claude > local deep)."""
+    global _last_consolidated_turn, _sleeping
     if _sleeping:
         return
     _sleeping = True
     await broadcast({"type": "sleep", "state": "start", "text": "Consolidating memory…"})
-
-    async def _llm(prompt: str) -> str:
-        if _LOCAL_OK:
-            try:
-                import ollama
-                r = await ollama.AsyncClient().chat(
-                    model=LOCAL_FAST,
-                    messages=[{"role": "user", "content": prompt}],
-                    options={"keep_alive": 0},
-                )
-                return r.message.content or ""
-            except Exception:
-                pass
-        if USE_GROQ and _HAS_GROQ:
-            try:
-                c = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY,
-                                            base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
-                r = await c.chat.completions.create(
-                    model=GROQ_MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800)
-                return r.choices[0].message.content or ""
-            except Exception:
-                pass
-        return ""
-
     try:
-        # Fold recently-overheard speech into the reflection input so durable facts the
-        # user mentioned aloud (even without addressing JARVIS) can become memories.
-        heard_turns = [{"role": "user", "content": o["text"]} for o in _overheard[-20:]]
-        reflect_input = (_history + heard_turns)[-40:]
-        pre_ids = {str(m.get("id")) for m in memories}   # what existed before the (slow) LLM merge
-        result = await consolidation.consolidate(memories, reflect_input, _llm)
-        with _mem_lock:
-            merged = list(result["memories"])
-            merged_ids = {str(m.get("id")) for m in merged}
-            # A `remember` can land while consolidation's LLM call is in flight; those new
-            # memories aren't in `result` (built from the pre-snapshot). Re-append them so the
-            # writeback doesn't silently drop a concurrent write.
-            for m in memories:
-                mid = str(m.get("id"))
-                if mid not in pre_ids and mid not in merged_ids:
-                    merged.append(m)
-            memories[:] = merged
-            _save_memory(memories)
+        result = await cortex.dreaming.run_once()
         _last_consolidated_turn = _turn_seq
-        await broadcast({"type": "sleep", "state": "done", "text": result["summary"],
-                         "memory_count": len(memories)})
-    except Exception:
+        text = ("nothing new to learn" if result.get("status") != "ok"
+                else f"consolidated · +{result.get('facts_added', 0)} facts · "
+                     f"+{result.get('prospective_added', 0)} pending items")
+        st = cortex.stats()
+        await broadcast({"type": "sleep", "state": "done", "text": text,
+                         "memory_count": st.get("facts", 0)})
+    except Exception as exc:
+        log.info("dreaming failed: %s", exc)
         await broadcast({"type": "sleep", "state": "done", "text": "rest interrupted"})
     finally:
         _sleeping = False
@@ -2735,8 +2722,10 @@ async def _sleep_loop() -> None:
             idle_min = (time.time() - _last_activity) / 60.0
             on_ac = (_last_device or {}).get("power_state", "ac") == "ac"
             busy = _tts_playing or bool(_current_task and not _current_task.done())
+            # Cheap gate: at least 6 new turns since the last consolidation, and 4 total.
+            enough_new = (_turn_seq - _last_consolidated_turn) >= 6 and _turn_seq >= 4
             if (idle_min >= IDLE_SLEEP_MIN and on_ac and not busy and not _sleeping
-                    and consolidation.should_consolidate(_turn_seq, _last_consolidated_turn)):
+                    and enough_new):
                 await _run_sleep_cycle()
         except asyncio.CancelledError:
             raise
@@ -3745,7 +3734,8 @@ async def hub_remember(request: Request) -> JSONResponse:
         "private": bool(body.get("private", False)),
         "source_model": body.get("source_model", "external"),
     }
-    # execute_tool does blocking disk I/O under the memory lock — run it off the event loop.
+    # execute_tool writes to cortex (SQLite + vector) and the legacy JSON mirror.
+    # It does blocking disk I/O — run it off the event loop.
     result = await asyncio.to_thread(execute_tool, "remember", args)
     return JSONResponse({"ok": True, "result": result, "count": len(memories)})
 
@@ -3755,23 +3745,17 @@ async def hub_recall(request: Request, q: str, k: int = 6,
                      namespace: str | None = None) -> JSONResponse:
     if not _hub_authed(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-    import mem_recall
 
-    # Embedding every candidate + the disk write are blocking — run the whole recall off the
-    # event loop so it can't stall other websocket turns / HTTP requests.
     def _do_recall():
         # External callers NEVER see private memories — that filter is not optional here.
-        found = mem_recall.recall(q, memories, k=max(1, min(k, 20)),
-                                  namespace=namespace, include_private=False)
-        if found:
-            with _mem_lock:
-                _save_memory(memories)  # persist access reinforcement
-        return found
+        return cortex.recall(q, k=max(1, min(k, 20)),
+                             namespace=namespace, include_private=False)
 
     hits = await asyncio.to_thread(_do_recall)
     return JSONResponse({"count": len(hits), "memories": [
-        {"content": m.get("content"), "category": m.get("category", "fact"),
+        {"content": m.get("text"), "category": m.get("category", "preference"),
          "importance": m.get("importance", 5),
+         "confidence": m.get("confidence", 0.7),
          "source_model": m.get("source_model", "jarvis"),
          "namespace": m.get("namespace", "personal")}
         for m in hits
