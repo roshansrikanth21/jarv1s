@@ -35,7 +35,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-import consolidation
 import device
 import governor
 import models_advisor
@@ -249,18 +248,6 @@ async def _boot_probe():
         pass
 
 
-def _warm_memory() -> None:
-    """Pre-embed the memory store so the first recall isn't slow mid-conversation. No-op /
-    instant in keyword mode (also surfaces the one-time 'no embedding backend' notice early)."""
-    try:
-        import mem_recall
-        n = mem_recall.warm(memories)
-        if n:
-            log.info("mem_recall: pre-embedded %d memories", n)
-    except Exception:
-        pass
-
-
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     global _main_loop, _sleep_task, _ambient_task, _boot_task, _monitor_task
@@ -282,9 +269,8 @@ async def _lifespan(app: FastAPI):
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
-    # Pre-warm memory embeddings off the event loop so first recall isn't slow (instant in
-    # keyword mode; returns as soon as it finds no embedding backend).
-    asyncio.create_task(asyncio.to_thread(_warm_memory))
+    # (Cortex init above already embedded every fact + episode via vectors._bootstrap_from_store,
+    #  so first recall is warm without a separate task.)
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
     spa_dir = BASE_DIR / "dist" / "client"
     if (spa_dir / "index.html").exists():
@@ -404,10 +390,9 @@ def _save_json(path: Path, data) -> None:
 
 
 def _migrate_memories(mems: list[dict]) -> list[dict]:
-    """Backfill schema on pre-migration memories. Without ts/last_access an old entry computes
-    days=0 forever (see mem_recall._strength / consolidation.decay_and_prune) — so it never
-    decays and always ranks as maximally recent. Derive the timestamps from the ISO
-    `timestamp` string when present, and fill the fields recall/decay rely on."""
+    """Backfill schema on pre-migration memories in the legacy JSON mirror. Derive the
+    timestamps from the ISO `timestamp` string when present, and fill the bookkeeping
+    fields any legacy path expects. (Cortex owns the authoritative store now.)"""
     for m in mems:
         if not isinstance(m, dict):
             continue
@@ -1048,40 +1033,6 @@ _LAUNCH_ALLOWLIST = {
 
 def _next_id(items: list[dict]) -> int:
     return max((int(i.get("id", 0)) for i in items), default=0) + 1
-
-
-def _top_memories(limit: int = 20) -> list[dict]:
-    return sorted(
-        memories,
-        key=lambda m: (
-            -(m.get("importance") or 5),
-            -(m.get("access_count") or 0),
-            str(m.get("last_access") or m.get("timestamp") or ""),
-        ),
-    )[:limit]
-
-
-def _relevant_memories(query: str, limit: int = 20) -> list[dict]:
-    """Memories to inject into JARVIS's own prompt: a few always-on high-importance facts,
-    PLUS the ones most relevant to the CURRENT message (semantic recall). Falls back to pure
-    importance ordering when there's no query or the store is small enough to inject whole —
-    so the injected context stays pertinent as the store grows past `limit` entries."""
-    if not (query or "").strip() or len(memories) <= limit:
-        return _top_memories(limit)
-    try:
-        import mem_recall
-        pinned = _top_memories(6)                     # identity-level facts are always present
-        seen = {id(m) for m in pinned}
-        out = list(pinned)
-        # reinforce=False: building the prompt must not inflate access counts — only the
-        # recall_memory tool should reinforce what it deliberately surfaces.
-        for m in mem_recall.recall(query, memories, k=limit, include_private=True, reinforce=False):
-            if id(m) not in seen and len(out) < limit:
-                out.append(m)
-                seen.add(id(m))
-        return out
-    except Exception:
-        return _top_memories(limit)
 
 
 def _validate_tool_args(name: str, args: dict) -> str | None:
@@ -2771,8 +2722,10 @@ async def _sleep_loop() -> None:
             idle_min = (time.time() - _last_activity) / 60.0
             on_ac = (_last_device or {}).get("power_state", "ac") == "ac"
             busy = _tts_playing or bool(_current_task and not _current_task.done())
+            # Cheap gate: at least 6 new turns since the last consolidation, and 4 total.
+            enough_new = (_turn_seq - _last_consolidated_turn) >= 6 and _turn_seq >= 4
             if (idle_min >= IDLE_SLEEP_MIN and on_ac and not busy and not _sleeping
-                    and consolidation.should_consolidate(_turn_seq, _last_consolidated_turn)):
+                    and enough_new):
                 await _run_sleep_cycle()
         except asyncio.CancelledError:
             raise
