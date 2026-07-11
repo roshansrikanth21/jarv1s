@@ -160,3 +160,31 @@ See `.env.example` → *Cortex* block. Highlights:
 - `JARVIS_EMBED_MODEL` — Ollama embed model (default `nomic-embed-text`)
 - `JARVIS_FORCE_WORDHASH=1` — offline embedder, for tests
 - `JARVIS_ROUTER_EXTRACT` · `JARVIS_ROUTER_CONSOL` — per-task model overrides
+
+## Optional: Mem0 cloud mirror
+
+The local SQLite store is the source of truth. `cortex.sync_mem0` optionally
+mirrors durable facts + nightly dreaming summaries to [Mem0](https://mem0.ai) so
+other devices / apps (or a phone-side JARVIS) can read the same memory. Fail-soft:
+without a `MEM0_API_KEY`, or without `mem0ai` installed, every entry point is a
+no-op — cortex works exactly as before.
+
+**Enable it:** put `MEM0_API_KEY=m0-...` in your `.env` (the file is gitignored,
+so keys never touch git). Optionally set `MEM0_USER_ID` (per-user segment inside
+Mem0, default `jarvis`) and `JARVIS_MEM0_WRITETHROUGH=1` (mirror every `remember()`
+instead of just batching at dreaming time).
+
+**What gets pushed:**
+- One entry per newly-added fact — with metadata `{category, confidence, importance,
+  namespace, source_model, cortex_id}`.
+- One entry per nightly dreaming summary — `[Daily summary] …` with metadata
+  `{kind: "dreaming-summary", timestamp, cortex_id}`.
+- **Private facts (`private=True`) are refused inside `sync_mem0`** — they never
+  leave the machine, even under writethrough.
+
+**CLI:**
+```
+python -m cortex.sync_mem0                  # status: is it enabled?
+python -m cortex.sync_mem0 --all            # backfill: push every non-private fact
+python -m cortex.sync_mem0 --restore        # pull memories from Mem0 into cortex
+```
