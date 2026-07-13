@@ -30,11 +30,22 @@ _cache: dict[str, list[float]] = {}
 _word_re = re.compile(r"[a-z0-9']+")
 
 
+def _normalize_tok(w: str) -> str:
+    """Strip a trailing possessive `'s` (and any stray trailing apostrophe) so "user's"
+    and "user" hash to the SAME token. Facts are routinely phrased "User's dog is …" while
+    queries say "the user's …" or just "the user …" — without this, those two forms share
+    zero tokens and a real fact can score as unrelated to an obviously-relevant query."""
+    if w.endswith("'s") and len(w) > 2:
+        return w[:-2]
+    return w.rstrip("'")
+
+
 def _wordhash_embed(text: str, dim: int = WORDHASH_DIM) -> list[float]:
     """Deterministic hashed-word bag-of-tokens embedding. Cheap and offline.
     Two texts that share content-words end up with similar vectors under cosine."""
     vec = [0.0] * dim
-    tokens = [w for w in _word_re.findall((text or "").lower()) if len(w) > 1]
+    tokens = [_normalize_tok(w) for w in _word_re.findall((text or "").lower())]
+    tokens = [w for w in tokens if len(w) > 1]
     if not tokens:
         vec[0] = 1e-6
         return vec

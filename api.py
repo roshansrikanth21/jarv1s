@@ -2814,12 +2814,20 @@ async def _set_local_model(model: str) -> None:
 
 
 def _forget_memory(mid) -> None:
+    """Delete one memory. `mid` is a cortex fact id (UUID) since /api/memory now reads from
+    cortex; the legacy JSON mirror is also purged as a harmless fallback (a no-op if the id
+    doesn't match anything there, e.g. every id post-migration is a cortex UUID)."""
     global memories
+    changed = False
+    try:
+        changed = cortex.forget(str(mid))
+    except Exception as exc:
+        log.info("cortex.forget failed for %s: %s", mid, exc)
     with _mem_lock:
         before = len(memories)
         memories[:] = [m for m in memories if str(m.get("id")) != str(mid)]
-        changed = len(memories) != before
-        if changed:
+        if len(memories) != before:
+            changed = True
             _save_memory(memories)
     if changed:
         broadcast_from_thread({"type": "memory_update", "count": len(memories)})
@@ -3398,7 +3406,7 @@ async def agent_status() -> dict:
         },
         "memory": {
             "available": True,
-            "count":     len(memories),
+            "count":     cortex.stats().get("facts", 0),
         },
         "governor": {
             "mode":      _gov.mode,
@@ -3565,13 +3573,17 @@ async def governor_endpoint() -> dict:
 
 @app.get("/api/memory")
 async def memory_endpoint() -> dict:
-    """The inspectable self-model — durable memories, newest first."""
-    return {"count": len(memories),
-            "memories": [{"id": m.get("id"), "content": m.get("content"),
-                          "category": m.get("category", "fact"),
-                          "importance": m.get("importance", 5),
-                          "source": m.get("source", "manual")}
-                         for m in memories[::-1][:60]]}
+    """The inspectable self-model — durable memories, newest first. Reads cortex (the real
+    store both explicit `remember` calls AND automatic post-turn extraction write to) rather
+    than the legacy JSON mirror, which only ever saw explicit `remember`s."""
+    all_f = cortex.store.all_facts()
+    ordered = sorted(all_f, key=lambda f: f.get("created_at") or "", reverse=True)
+    return {"count": len(all_f),
+            "memories": [{"id": f.get("id"), "content": f.get("text"),
+                          "category": f.get("category", "preference"),
+                          "importance": f.get("importance", 5),
+                          "source": "extracted" if f.get("source_episode_id") else "manual"}
+                         for f in ordered[:60]]}
 
 
 # ── Attachment uploads — images/docs the UI drops into chat ────────────────────
@@ -3768,7 +3780,7 @@ async def health() -> dict:
         "status":   "ok",
         "model":    _active_model(),
         "time":     datetime.now().isoformat(),
-        "memories": len(memories),
+        "memories": cortex.stats().get("facts", 0),
     }
 
 
