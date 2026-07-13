@@ -42,6 +42,7 @@ export function SettingsPanel({
   const [keyStatus, setKeyStatus] = useState<ApiKeyStatus | null>(null);
   const [groqKey, setGroqKey] = useState("");
   const [anthropicKey, setAnthropicKey] = useState("");
+  const [mem0Key, setMem0Key] = useState("");
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState("");
   const firstFieldRef = useRef<HTMLInputElement | null>(null);
@@ -49,7 +50,7 @@ export function SettingsPanel({
   // Load current settings + key status each time the panel opens.
   useEffect(() => {
     if (!open) return;
-    setErr(""); setGroqKey(""); setAnthropicKey("");
+    setErr(""); setGroqKey(""); setAnthropicKey(""); setMem0Key("");
     fetch("/api/settings").then(r => r.json()).then(setS).catch(() => setS(null));
     if (hasElectron) window.electronAPI!.getApiKeyStatus!().then(setKeyStatus).catch(() => {});
     const t = setTimeout(() => firstFieldRef.current?.focus(), 60);
@@ -92,6 +93,7 @@ export function SettingsPanel({
         const keys: Record<string, string> = {};
         if (groqKey.trim()) keys.GROQ_API_KEY = groqKey.trim();
         if (anthropicKey.trim()) keys.ANTHROPIC_API_KEY = anthropicKey.trim();
+        if (mem0Key.trim()) keys.MEM0_API_KEY = mem0Key.trim();
         if (Object.keys(keys).length) {
           setKeyStatus(await window.electronAPI!.setApiKeys!(keys));
         }
@@ -102,7 +104,7 @@ export function SettingsPanel({
     } finally {
       setSaving(false);
     }
-  }, [s, groqKey, anthropicKey, hasElectron, onClose]);
+  }, [s, groqKey, anthropicKey, mem0Key, hasElectron, onClose]);
 
   if (!open) return null;
 
@@ -143,6 +145,12 @@ export function SettingsPanel({
             configured={Boolean(keyStatus?.anthropic)} disabled={!hasElectron}
             value={anthropicKey} onChange={setAnthropicKey} placeholder="sk-ant-…"
             onGet={() => openLink("https://console.anthropic.com/settings/keys")}
+          />
+          <KeyRow
+            c={c} label="Mem0" hint="optional — sync memory across devices"
+            configured={Boolean(keyStatus?.mem0)} disabled={!hasElectron}
+            value={mem0Key} onChange={setMem0Key} placeholder="m0-…"
+            onGet={() => openLink("https://app.mem0.ai/dashboard/api-keys")}
           />
 
           {s && (

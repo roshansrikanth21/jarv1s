@@ -1,4 +1,4 @@
-export type ApiKeyStatus = { secure: boolean; groq: boolean; anthropic: boolean };
+export type ApiKeyStatus = { secure: boolean; groq: boolean; anthropic: boolean; mem0: boolean };
 
 declare global {
   interface Window {

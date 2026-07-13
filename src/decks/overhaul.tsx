@@ -120,7 +120,7 @@ type MemItem = { id: number; content: string; category: string; importance: numb
 const shortModel = (m: string) => (m || "").split("/").pop()!.replace("-instruct", "");
 const MODE_LABEL: Record<string, string> = { auto: "Auto", eco: "Eco", local: "Local", cloud: "Cloud" };
 
-type ApiKeyStatus = { secure: boolean; groq: boolean; anthropic: boolean };
+type ApiKeyStatus = { secure: boolean; groq: boolean; anthropic: boolean; mem0: boolean };
 
 declare global {
   interface Window {

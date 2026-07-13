@@ -5,6 +5,15 @@ import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 
 const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage, screen, dialog } = electron;
+
+// Pin a stable app identity BEFORE anything touches userData (the single-instance lock below
+// does). Without this the name comes from package.json ("tanstack_start_ts") when run
+// unpackaged in dev, but from the packaged productName ("JARVIS") once installed — two
+// DIFFERENT userData directories. safeStorage binds its OS-crypt key to the userData dir, so
+// that split silently makes a saved API key undecryptable in the other context (and on any
+// name drift). One fixed name → one key store → keys persist across dev, packaged, and reopens.
+app.setName("JARVIS");
+
 const isDev = !app.isPackaged;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -49,26 +58,42 @@ let appIsQuitting = false;
 // libsecret on Linux) via Electron safeStorage — never written in plaintext and
 // never handed back to the renderer. The decrypted values are injected into the
 // Python backend's environment when it spawns.
-const KEY_IDS = ["GROQ_API_KEY", "ANTHROPIC_API_KEY"];
+// Every id here is encrypted at rest, loaded on launch, and injected into the Python
+// backend's env at spawn — the storage/load/inject logic is generic over this list.
+const KEY_IDS = ["GROQ_API_KEY", "ANTHROPIC_API_KEY", "MEM0_API_KEY"];
 const keysFilePath = () => path.join(app.getPath("userData"), "jarvis-keys.json");
 
 function loadDecryptedKeys() {
+  let enc;
   try {
-    const enc = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
-    if (!safeStorage.isEncryptionAvailable()) return {};
-    const out = {};
-    for (const id of KEY_IDS) {
-      if (!enc[id]) continue;
-      try {
-        out[id] = safeStorage.decryptString(Buffer.from(enc[id], "base64"));
-      } catch {
-        /* corrupt / different machine — skip */
-      }
-    }
-    return out;
+    enc = JSON.parse(fs.readFileSync(keysFilePath(), "utf-8"));
   } catch {
-    return {};
+    return {}; // no file yet / unreadable
   }
+  if (!safeStorage.isEncryptionAvailable()) return {};
+  const out = {};
+  let dropped = false;
+  for (const id of KEY_IDS) {
+    if (!enc[id]) continue;
+    try {
+      out[id] = safeStorage.decryptString(Buffer.from(enc[id], "base64"));
+    } catch {
+      // The blob exists but can't be decrypted — the OS-crypt key that encrypted it is gone
+      // (a different app identity/userData wrote it, or the key was regenerated). Don't
+      // silently retry it forever: drop the dead entry so status is honest and the user is
+      // cleanly prompted to re-enter, rather than "forgetting" the key with no explanation.
+      console.warn(`[Electron] API key "${id}" could not be decrypted — dropping the stale ` +
+                   `entry. Re-enter it in Settings (it will persist from now on).`);
+      delete enc[id];
+      dropped = true;
+    }
+  }
+  if (dropped) {
+    try {
+      fs.writeFileSync(keysFilePath(), JSON.stringify(enc), { mode: 0o600 });
+    } catch { /* best-effort cleanup */ }
+  }
+  return out;
 }
 
 function saveEncryptedKeys(keys) {
@@ -88,6 +113,17 @@ function saveEncryptedKeys(keys) {
     else delete store[id]; // empty string → clear it
   }
   fs.writeFileSync(keysFilePath(), JSON.stringify(store), { mode: 0o600 });
+
+  // Verify the write landed and reads back — so we never report a key as saved when it
+  // silently didn't persist (a disk/permission hiccup, or storage that can't round-trip).
+  const check = loadDecryptedKeys();
+  for (const id of KEY_IDS) {
+    const want = String(keys[id] ?? "").trim();
+    if (want && check[id] !== want) {
+      throw new Error("The key was written but couldn't be read back — it may not persist. " +
+                      "Please try again.");
+    }
+  }
 }
 
 function apiKeyStatus() {
@@ -98,7 +134,12 @@ function apiKeyStatus() {
     /* not ready yet */
   }
   const keys = loadDecryptedKeys();
-  return { secure, groq: Boolean(keys.GROQ_API_KEY), anthropic: Boolean(keys.ANTHROPIC_API_KEY) };
+  return {
+    secure,
+    groq: Boolean(keys.GROQ_API_KEY),
+    anthropic: Boolean(keys.ANTHROPIC_API_KEY),
+    mem0: Boolean(keys.MEM0_API_KEY),
+  };
 }
 
 function resolvePythonPath() {
