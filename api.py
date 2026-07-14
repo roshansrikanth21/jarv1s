@@ -101,6 +101,10 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 # personal use; rate limits degrade gracefully. For max throughput / no throttling
 # set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# Sub-agents default to the smaller/faster model so a spawn_agents call (up to 5 × 6 = 30
+# API hits) doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL to
+# put them on the big model, or set both to the same to disable the split.
+SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "openai/gpt-oss-20b")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
 GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard cap so a slow/hung API never stalls the agent
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
@@ -2586,7 +2590,9 @@ async def _subagent_brain(messages: list[dict], tools: list[dict], max_tokens: i
     if USE_GROQ and _HAS_GROQ:
         client = _openai_mod.AsyncOpenAI(
             api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-        kwargs: dict = {"model": GROQ_MODEL, "messages": messages, "max_tokens": max_tokens}
+        # Deliberately SUBAGENT_MODEL (small/fast), not GROQ_MODEL — see comment where it's
+        # defined. Prevents a spawn_agents call from burning through the parent's quota.
+        kwargs: dict = {"model": SUBAGENT_MODEL, "messages": messages, "max_tokens": max_tokens}
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
