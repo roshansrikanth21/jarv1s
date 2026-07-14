@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import desktop
 import device
 import governor
 import models_advisor
@@ -982,6 +983,59 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "desktop",
+            "description": (
+                "Control the Windows desktop and installed packages. Use this instead of "
+                "`launch_app` for anything Windows-system-shaped: opening folders/files in "
+                "Explorer, opening Settings pages, Control Panel applets, the Registry, "
+                "system components (Task Manager, Device Manager, Services, …), and "
+                "package management via winget (list installed apps, uninstall an app).\n"
+                "Actions (pass one per call):\n"
+                "  open_path       — open a file/folder in Explorer. args: path\n"
+                "  open_settings   — open a Settings page. args: page  (apps, display, "
+                "network, sound, wifi, bluetooth, personalization, notifications, "
+                "startupapps, defaultapps, updates, storage, region, keyboard, mouse, …)\n"
+                "  open_control_panel — args: applet  (programs, network, sound, display, "
+                "mouse, keyboard, regional, power, firewall, datetime, system, fonts, "
+                "userpasswords)\n"
+                "  open_registry   — open regedit, optionally pre-navigated. args: key "
+                "(optional, e.g. 'HKCU\\\\Software\\\\Microsoft')\n"
+                "  open_component  — args: component  (task_manager, device_manager, "
+                "services, event_viewer, disk_management, resource_monitor, perfmon, "
+                "msconfig, cmd, powershell, gpedit, secpol, notepad, calc, screenshot)\n"
+                "  list_apps       — list installed packages via winget. args: filter "
+                "(optional case-insensitive name substring)\n"
+                "  uninstall_app   — uninstall via winget. args: app (name or exact id), "
+                "confirm (bool, default false). REQUIRES confirm=true to actually run — "
+                "first call is a dry-run showing exactly what would be removed. Pattern: "
+                "call once without confirm (or after `list_apps`) → present the matched "
+                "package + version to the user → wait for their yes → call again with "
+                "confirm=true. If more than one package matches the name, the dry-run "
+                "returns the list so you can narrow down."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action":    {"type": "string",
+                                  "enum": ["open_path", "open_settings", "open_control_panel",
+                                           "open_registry", "open_component", "list_apps",
+                                           "uninstall_app"]},
+                    "path":      {"type": "string"},
+                    "page":      {"type": "string"},
+                    "applet":    {"type": "string"},
+                    "key":       {"type": "string"},
+                    "component": {"type": "string"},
+                    "app":       {"type": "string"},
+                    "filter":    {"type": "string"},
+                    "confirm":   {"type": "boolean"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_task",
             "description": "Add a task or reminder to the JARVIS task queue.",
             "parameters": {
@@ -1710,6 +1764,11 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         except Exception as exc:
             return f"Failed to launch {raw}: {exc}"
 
+    if name == "desktop":
+        # Windows-system-shaped ops: Explorer paths, Settings pages, Control Panel,
+        # regedit, system components, and winget list/uninstall (confirm-gated).
+        return desktop.run(str(args.get("action") or ""), args)
+
     if name == "add_task":
         task = {
             "id": _next_id(task_list),
@@ -2405,7 +2464,9 @@ You are in a live spoken conversation — your replies are read aloud and you re
 - One or two sentences for most things; go longer only when asked for detail or code.
 - NEVER use markdown, headers, bullets, asterisks, code fences, or math notation — spell math in words ("ninety minus sixty"). It all gets spoken.
 
-You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run."""
+You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, Windows desktop control (`desktop`), tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run.
+
+Windows desktop control (`desktop`): for anything system-shaped — "open my downloads folder", "open display settings", "open task manager", "uninstall Zoom" — use `desktop`, not `launch_app` or `run_command`. Actions: `open_path` (files/folders), `open_settings` (apps/display/network/…), `open_control_panel` (programs/network/sound/…), `open_registry` (regedit, optional key), `open_component` (task_manager/device_manager/services/event_viewer/…), `list_apps` + `uninstall_app` (winget). Uninstall pattern: call `uninstall_app` with the name first (dry-run, confirm defaults to false) → the tool returns the exact match with version → repeat back to the user and get their yes → call again with `confirm: true`. If the dry-run says 2+ packages matched, ask the user which one before proceeding. `list_apps` is safe to call whenever."""
 
 
 def _build_system_prompt(query: str = "") -> str:
