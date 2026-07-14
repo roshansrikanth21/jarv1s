@@ -2395,6 +2395,8 @@ NEVER FABRICATE ACTIONS OR RESULTS. This is absolute. You have not done somethin
 
 Do NOT pre-judge authorization or scope in your head and refuse. Always CALL the security tool — it enforces scope itself and tells you (and you relay) if a target is out of scope. `recon` (passive) and `report` (reads memory) never need scope, so never refuse those for scope reasons; just call them.
 
+Security tool routing — pick the tool, don't just talk about it: "recon/look up <target>" → recon. "bugbounty/sweep/enumerate/recon a domain" → bugbounty (full sweep). "pentest/scan/port scan/nuclei/dirs/xss/sqli/subdomain takeover <target>" → pentest with the matching task. "report/write-up on <target>" → report. "add/list/remove scope" → scope. Any of these is a request to RUN the tool on that target, not to explain the concept.
+
 You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
 - Use contractions and natural, flowing phrasing. Be warm but concise.
 - This is a back-and-forth. Follow the thread — refer to what was just said, and resolve references like "that", "the first one", "tomorrow" from context instead of asking the user to repeat themselves.
@@ -2870,8 +2872,9 @@ def _fallback_rung(failed: str, avail: set[str]) -> str | None:
 # tools. The council (a toolless panel) and, in practice, local models that fumble tool-calls
 # can only fabricate a result for these, which is the #1 source of "JARVIS hallucinated it".
 _TOOL_INTENT_RE = re.compile(
-    r"\b(recon|pentest|pen[- ]?test|scan|nmap|nikto|sqlmap|gobuster|ffuf|exploit|vuln\w*|"
-    r"port|subdomain|cve|scope|target|payload|"
+    r"\b(recon|pentest|pen[- ]?test|bug ?bounty|sweep|scan|nmap|nikto|sqlmap|gobuster|ffuf|"
+    r"nuclei|dalfox|katana|httpx|subfinder|takeover|osint|harvest|crawl|enumerate|"
+    r"exploit|vuln\w*|port|subdomain|cve|scope|target|payload|"
     r"remember|recall|forget|memoriz|"
     r"open|launch|start|screenshot|capture|screen|"
     r"search|google|look up|browse|website|url|http|download|"
