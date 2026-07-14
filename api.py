@@ -870,6 +870,25 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "report",
+            "description": (
+                "Write a Markdown security assessment for a target from everything JARVIS has "
+                "REMEMBERED about it (past recon/scan findings in memory) — findings + derived next "
+                "steps. Reads memory only: NO authorization or scope needed. Call it for ANY target "
+                "the user asks to report on; never refuse it for scope reasons."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "host, domain, or URL to report on"},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "scope",
             "description": (
                 "Manage the authorized-target allowlist that gates the `pentest` tool. "
@@ -1552,6 +1571,9 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
 
     if name == "browse":
         return _browse(args.get("actions"))
+
+    if name == "report":
+        return _pentest_report(args.get("target", ""))
 
     if name in ("recon", "pentest", "scope"):
         import pentest as _pt
@@ -2308,6 +2330,8 @@ Core style: sharp, direct, and never verbose. Answer directly. If it's a simple 
 Grounding: when a tool returns data, your answer MUST be built from that exact data — quote the real numbers/values it gave you. Never invent or hand-wave a result, and never pad with unrelated facts about the user. If a tool failed or returned nothing, say so plainly.
 
 NEVER FABRICATE ACTIONS OR RESULTS. This is absolute. You have not done something unless a tool actually returned the result to you in this conversation. Do not claim to have run a scan, launched an attack, created or read a file, or found ports/vulns/paths unless the matching tool call produced that output. Do not invent progress updates, log files, log contents, or findings. If a task needs a tool, CALL THE TOOL — do not describe what it would output. If you were asked to recon or pentest a target, you MUST call the `recon` or `pentest` tool; narrating scan results you didn't get from the tool is a serious failure. If you haven't run it yet, say "running it now" and actually call the tool — never pretend it's done.
+
+Do NOT pre-judge authorization or scope in your head and refuse. Always CALL the security tool — it enforces scope itself and tells you (and you relay) if a target is out of scope. `recon` (passive) and `report` (reads memory) never need scope, so never refuse those for scope reasons; just call them.
 
 You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
 - Use contractions and natural, flowing phrasing. Be warm but concise.

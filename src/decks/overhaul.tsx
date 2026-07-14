@@ -348,7 +348,7 @@ function CommandDeck() {
           const rm = /Running\s+([a-z_]+)/i.exec(txt || "");
           if (rm) {
             setRunningTool({ action: rm[1] });
-            if (["recon", "pentest", "scope", "browse"].includes(rm[1])) setOpsOpen(true);
+            if (["recon", "pentest", "scope", "browse", "report"].includes(rm[1])) setOpsOpen(true);
           } else if (d.status === "idle") {
             setRunningTool(null);
           }
@@ -472,7 +472,7 @@ function CommandDeck() {
           setRightTab("trace");
           setRunningTool(null);
           // Security work belongs in the big Ops console, not a side tab — pop it open.
-          if (["recon", "pentest", "scope", "browse"].includes(s.action)) setOpsOpen(true);
+          if (["recon", "pentest", "scope", "browse", "report"].includes(s.action)) setOpsOpen(true);
         }
       } catch { addLineRef.current("system", "Malformed backend packet."); }
     };

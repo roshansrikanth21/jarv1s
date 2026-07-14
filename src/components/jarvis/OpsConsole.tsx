@@ -14,6 +14,7 @@ const TOOL_META: Record<string, { label: string; color: string }> = {
   recon:       { label: "RECON",  color: "var(--c-blue)" },
   pentest:     { label: "ATTACK", color: "var(--c-danger)" },
   scope:       { label: "SCOPE",  color: "var(--c-gold)" },
+  report:      { label: "REPORT", color: "var(--c-green)" },
   browse:      { label: "BROWSE", color: "var(--c-green)" },
   search_web:  { label: "SEARCH", color: "var(--c-amber)" },
   capture_screen: { label: "VISION", color: "var(--c-green)" },
@@ -113,7 +114,7 @@ export function OpsConsole({
   // `running` the moment the tool's agent_tool result arrives, so the real step replaces it.
   const showRunning = !!running;
 
-  const opCount = trace.filter((s) => ["recon", "pentest", "scope", "browse"].includes(s.action)).length;
+  const opCount = trace.filter((s) => ["recon", "pentest", "scope", "browse", "report"].includes(s.action)).length;
 
   return (
     <motion.div
