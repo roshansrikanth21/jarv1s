@@ -44,3 +44,6 @@ out/
 # Local tool output/scratch
 graphify-out/
 scratch_nib2_*.png
+
+# Authorized-target allowlist for the pentest tool (engagement-sensitive)
+memory/jarvis_scope.json
