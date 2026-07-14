@@ -176,7 +176,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse", "recon", "pentest"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -814,6 +814,74 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "recon",
+            "description": (
+                "PASSIVE security reconnaissance on any host or URL — legal on any target "
+                "because it only reads public data and the target's own responses (like a "
+                "browser): DNS records, cert-transparency subdomains, HTTP headers, and a "
+                "one-page tech fingerprint. No port scans, no attacks. Use to map a target's "
+                "surface. For active scanning/exploitation use `pentest` (scope-gated)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Host, domain, or URL (e.g. example.com or https://example.com)"},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pentest",
+            "description": (
+                "ACTIVE security testing against a target, in an isolated Kali container. REFUSED "
+                "unless the target is in the authorized scope (labs, CTF/HTB, or a bug-bounty "
+                "program) — enforced, not advisory; authorize first with the `scope` tool.\n"
+                "tasks: ports (nmap open ports/services) · probe (subfinder→httpx: which subdomains "
+                "are LIVE and their status codes — 200 = directly reachable) · dirs (content "
+                "discovery, surfaces reachable paths) · nuclei (templated CVE/misconfig scan) · web "
+                "(nikto) · sqli (sqlmap) · full (ports+probe+dirs+nuclei).\n"
+                "Efficient bug-bounty order — run tasks ONE AT A TIME so each result guides the next, "
+                "and report findings between steps: probe → ports → dirs → nuclei. Call the tool per "
+                "step (don't just say you will); report exactly what each returns."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "Host/IP/URL/domain to test (must be in authorized scope)"},
+                    "task": {"type": "string", "description": "ports | probe | dirs | nuclei | web | sqli | full"},
+                },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "scope",
+            "description": (
+                "Manage the authorized-target allowlist that gates the `pentest` tool. "
+                "action: list (default) | add | remove. When adding, `target` is a host, "
+                "domain, or CIDR, and `source` marks why it's authorized (owned | lab | ctf | "
+                "bugbounty). Only add targets the user is genuinely allowed to attack."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "list | add | remove"},
+                    "target": {"type": "string", "description": "host, domain, or CIDR (for add/remove)"},
+                    "source": {"type": "string", "description": "owned | lab | ctf | bugbounty"},
+                    "program": {"type": "string", "description": "bug-bounty program name, if source=bugbounty"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "search_web",
             "description": (
                 "Search the web for current information. Modes: search (default), news, "
@@ -1287,6 +1355,61 @@ def _browse(actions) -> str:
     return _browser_run(script)
 
 
+# ── Pentest learning — feed findings into cortex so JARVIS accumulates a knowledge base
+#    of targets/tech/outcomes and pattern-matches new targets against systems it has seen. ──
+def _pentest_signals(text: str) -> str:
+    """Pull the structured signal out of raw tool output — the stuff worth remembering."""
+    sig: list[str] = []
+    ports = re.findall(r"(\d+)/tcp\s+open\s+(\S+)", text)
+    if ports:
+        sig.append("open ports " + ", ".join(f"{p}/{s}" for p, s in ports[:12]))
+    m = re.search(r"Server:\s*([^\r\n]+)", text) or re.search(r"HTTPServer\[([^\]]+)\]", text)
+    if m:
+        sig.append("server " + m.group(1).strip()[:60])
+    tech = re.findall(r"\b(Apache|nginx|PHP|WordPress|Cloudflare|IIS|Tomcat|Express|Node\.js|"
+                      r"Django|Laravel|Drupal|Joomla|OpenSSH|MySQL|Jenkins|Grafana)\b", text, re.I)
+    if tech:
+        sig.append("tech " + ", ".join(sorted({t.lower() for t in tech}))[:80])
+    paths = re.findall(r"(/[A-Za-z0-9_\-./]{1,40})\s+\(Status:\s*2\d\d", text)
+    if paths:
+        sig.append("paths " + ", ".join(sorted(set(paths))[:10]))
+    if re.search(r"OSVDB|CVE-\d|SQL injection|vulnerab", text, re.I):
+        sig.append("vulns flagged")
+    return "; ".join(sig)
+
+
+def _augment_and_learn(kind: str, target: str, task: str, output: str) -> str:
+    """Store this finding in cortex (episode + compact fact) AND surface similar past
+    systems from memory, so JARVIS reasons from what it has seen before — pattern analysis."""
+    if not target or not output or output.lstrip().startswith("⛔"):
+        return output
+    try:
+        import cortex
+        signals = _pentest_signals(output)
+        related = ""
+        try:
+            hits = cortex.recall(f"{kind} {signals or target}", k=4, namespace="security")
+            hits = [h for h in hits if target.lower() not in (h.get("text", "").lower())]
+            if hits:
+                related = "\n\n◆ From memory — similar systems seen before:\n" + "\n".join(
+                    "  · " + (h.get("text", "")[:130]) for h in hits[:3])
+        except Exception:
+            pass
+        try:
+            raw = f"[{kind} {target}{(' ' + task) if task else ''}]\n{output[:3000]}"
+            eid = cortex.store.add_episode(raw, source="pentest")
+            cortex.vectors.index_episode({"id": eid, "raw_text": raw, "source": "pentest",
+                                          "timestamp": cortex.store.utcnow()})
+            if signals:
+                cortex.remember(f"{target} — {signals}", category="situation",
+                                namespace="security", importance=6, source_model="pentest")
+        except Exception:
+            pass
+        return output + related
+    except Exception:
+        return output
+
+
 # ── Tool executor ──────────────────────────────────────────────────────────────
 def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str:
     global memories, task_list, _pending_content_panel
@@ -1367,6 +1490,21 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
 
     if name == "browse":
         return _browse(args.get("actions"))
+
+    if name in ("recon", "pentest", "scope"):
+        import pentest as _pt
+        if name == "recon":
+            tgt = args.get("target", "")
+            return _augment_and_learn("recon", tgt, "", _pt.recon(tgt))
+        if name == "pentest":
+            tgt, task = args.get("target", ""), args.get("task", "ports")
+            return _augment_and_learn("pentest", tgt, task, _pt.attack(tgt, task))
+        act = (args.get("action") or "list").strip().lower()
+        if act == "add":
+            return _pt.add_scope(args.get("target", ""), args.get("source", "manual"), args.get("program", ""))
+        if act == "remove":
+            return _pt.remove_scope(args.get("target", ""))
+        return _pt.list_scope()
 
     if name == "search_web":
         try:
@@ -2104,6 +2242,8 @@ Core style: sharp, direct, and never verbose. Answer directly. If it's a simple 
 
 Grounding: when a tool returns data, your answer MUST be built from that exact data — quote the real numbers/values it gave you. Never invent or hand-wave a result, and never pad with unrelated facts about the user. If a tool failed or returned nothing, say so plainly.
 
+NEVER FABRICATE ACTIONS OR RESULTS. This is absolute. You have not done something unless a tool actually returned the result to you in this conversation. Do not claim to have run a scan, launched an attack, created or read a file, or found ports/vulns/paths unless the matching tool call produced that output. Do not invent progress updates, log files, log contents, or findings. If a task needs a tool, CALL THE TOOL — do not describe what it would output. If you were asked to recon or pentest a target, you MUST call the `recon` or `pentest` tool; narrating scan results you didn't get from the tool is a serious failure. If you haven't run it yet, say "running it now" and actually call the tool — never pretend it's done.
+
 You are in a live spoken conversation — your replies are read aloud and you remember what was just said. Talk like a person, not a document:
 - Use contractions and natural, flowing phrasing. Be warm but concise.
 - This is a back-and-forth. Follow the thread — refer to what was just said, and resolve references like "that", "the first one", "tomorrow" from context instead of asking the user to repeat themselves.
@@ -2112,7 +2252,7 @@ You are in a live spoken conversation — your replies are read aloud and you re
 - One or two sentences for most things; go longer only when asked for detail or code.
 - NEVER use markdown, headers, bullets, asterisks, code fences, or math notation — spell math in words ("ninety minus sixty"). It all gets spoken.
 
-You have tools — memory, web search, system info, app launch, tasks, screen capture, shell, market scans, and opening the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings, small talk, or anything you can answer from what you already know, just reply directly — never call a tool for "hi"."""
+You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run."""
 
 
 def _build_system_prompt(query: str = "") -> str:
@@ -2314,7 +2454,9 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
         + [{"role": "user", "content": text}]
     )
 
-    use_tools = governor.agent_needs_tools(decision, device)
+    # Force tools whenever the request clearly wants an action/live data — otherwise the
+    # model can't act and (rightly forbidden from fabricating) returns nothing.
+    use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
     final_answer = ""
     for _ in range(8):
         try:
@@ -2369,7 +2511,9 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
     client   = _AnthropicClient(api_key=ANTHROPIC_API_KEY)
     messages: list[dict] = list(history) + [{"role": "user", "content": text}]
 
-    use_tools = governor.agent_needs_tools(decision, device)
+    # Force tools whenever the request clearly wants an action/live data — otherwise the
+    # model can't act and (rightly forbidden from fabricating) returns nothing.
+    use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
     final_answer = ""
     for _ in range(8):
         req: dict = {
@@ -2425,7 +2569,9 @@ async def _brain_ollama(
         + [{"role": "user", "content": text}]
     )
 
-    use_tools = governor.agent_needs_tools(decision, device)
+    # Force tools whenever the request clearly wants an action/live data — otherwise the
+    # model can't act and (rightly forbidden from fabricating) returns nothing.
+    use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
     opts = _ollama_chat_options()
     if not use_tools:
         response = await client.chat(model=model, messages=messages, options=opts)
@@ -2569,6 +2715,27 @@ def _fallback_rung(failed: str, avail: set[str]) -> str | None:
     return None
 
 
+# Requests that plainly want an ACTION or live DATA — these must reach a brain that can call
+# tools. The council (a toolless panel) and, in practice, local models that fumble tool-calls
+# can only fabricate a result for these, which is the #1 source of "JARVIS hallucinated it".
+_TOOL_INTENT_RE = re.compile(
+    r"\b(recon|pentest|pen[- ]?test|scan|nmap|nikto|sqlmap|gobuster|ffuf|exploit|vuln\w*|"
+    r"port|subdomain|cve|scope|target|payload|"
+    r"remember|recall|forget|memoriz|"
+    r"open|launch|start|screenshot|capture|screen|"
+    r"search|google|look up|browse|website|url|http|download|"
+    r"weather|market|price|stock|nifty|sensex|"
+    r"cpu|memory|ram|disk|processes|system info|uptime|"
+    r"upload|read the file|pdf|"
+    r"remind|reminder)\b",
+    re.I,
+)
+
+
+def _needs_tools(text: str) -> bool:
+    return bool(_TOOL_INTENT_RE.search(text or ""))
+
+
 async def _run_agent(text: str) -> None:
     """Route the request through the Governor, then run the chosen rung. The Governor
     picks the cheapest brain that clears the difficulty bar within the current
@@ -2613,6 +2780,16 @@ async def _run_agent(text: str) -> None:
             mode_hint = " Local mode requires Ollama — start it and pull a model."
         await _emit_final(f"No brain available for {_gov.mode} mode.{mode_hint}")
         return
+
+    # Tool-intent guard: an action/data request must land on a tool-capable brain. The council
+    # has no tools and local models fumble tool-calls, so routing there = guaranteed
+    # hallucination. Force such requests onto cloud tools first, else the best local rung.
+    if _needs_tools(text):
+        tool_rungs = [r for r in ("cloud_fast", "cloud_deep", "local_deep", "local_fast") if r in avail]
+        if tool_rungs and decision["rung"] not in tool_rungs:
+            decision = {**decision, "rung": tool_rungs[0],
+                        "rationale": "forced to a tool-capable brain — request needs a tool; council/other has none"}
+
     await broadcast({"type": "governor_decision",
                      "decision": _public_decision(decision),
                      "homeostasis": _homeostasis(dev), "device": _device_brief(dev)})
@@ -3029,7 +3206,9 @@ async def handle_command(text: str) -> None:
 
     try:
         question = _deliberation_target(text)
-        if question and USE_GROQ and _HAS_GROQ:
+        # The council is a toolless panel — never send it a request that needs a tool/action,
+        # or it can only fabricate the result. Those go to the tool-capable agent instead.
+        if question and USE_GROQ and _HAS_GROQ and not _needs_tools(text):
             await _deliberate(question)
         else:
             await _run_agent(text)
