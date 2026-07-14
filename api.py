@@ -780,19 +780,41 @@ TOOLS: list[dict] = [
             "description": (
                 "Drive a REAL Chrome browser to open sites, read live page content, click, "
                 "type, and screenshot — for anything a plain web search can't do (interacting "
-                "with a page, reading JS-rendered content, multi-step navigation). Provide an "
-                "ordered list of `actions`; JARVIS runs them in sequence and returns what each "
-                "read/page_info produced. Available actions (op + params):\n"
+                "with a page, reading JS-rendered content, multi-step navigation, driving web "
+                "apps like WhatsApp/Slack/Gmail). Provide an ordered list of `actions`; JARVIS "
+                "runs them in sequence and returns what each read/page_info produced.\n"
+                "Selector-based ops (when you know the CSS):\n"
                 "  {\"op\":\"navigate\",\"url\":\"https://…\"} — open/go to a URL (http/https only)\n"
-                "  {\"op\":\"read\",\"selector\":\"h3\"} — return innerText of the first match "
+                "  {\"op\":\"read\",\"selector\":\"h3\"} — innerText of the first match "
                 "(omit selector to read the whole page)\n"
                 "  {\"op\":\"read_all\",\"selector\":\".titleline a\"} — innerText of EVERY match\n"
                 "  {\"op\":\"click\",\"selector\":\"button.login\"} — click the first match\n"
                 "  {\"op\":\"type\",\"selector\":\"input[name=q]\",\"text\":\"hello\"} — type into a field\n"
                 "  {\"op\":\"screenshot\"} — capture the viewport\n"
-                "  {\"op\":\"page_info\"} — return {url, title, ...}\n"
-                "Example: [{\"op\":\"navigate\",\"url\":\"https://news.ycombinator.com\"},"
-                "{\"op\":\"read_all\",\"selector\":\".titleline a\"}]"
+                "  {\"op\":\"page_info\"} — return {url, title, …}\n"
+                "Text-based ops (when you DON'T have a stable CSS selector — the usual case in "
+                "modern web apps). These match visible text / aria-label / placeholder / title "
+                "case-insensitively; exact match preferred, substring fallback:\n"
+                "  {\"op\":\"find_text\",\"action\":\"click\",\"text\":\"Send\"} — click the first "
+                "visible element whose label is \"Send\"\n"
+                "  {\"op\":\"find_text\",\"action\":\"type\",\"text\":\"Type a message\","
+                "\"text2\":\"hey\"} — type \"hey\" into the field whose placeholder/label is "
+                "\"Type a message\" (handles React-controlled inputs + contenteditable)\n"
+                "  {\"op\":\"find_text\",\"action\":\"read\",\"text\":\"Roshan\"} — first visible "
+                "element containing \"Roshan\" (use to disambiguate contacts / search results)\n"
+                "  optional \"role\" narrows the search (e.g. role:\"button\")\n"
+                "Timing (web apps load asynchronously):\n"
+                "  {\"op\":\"wait_for_text\",\"text\":\"Chats\",\"timeout_ms\":5000} — poll until "
+                "the text appears (or timeout)\n"
+                "  {\"op\":\"wait_ms\",\"ms\":1500} — hard sleep\n"
+                "Shortcuts:\n"
+                "  {\"op\":\"open_app\",\"app\":\"whatsapp\"} — smart-open a known web app "
+                "(whatsapp/slack/discord/spotify/gmail/youtube/x/reddit/github/notion/…)\n"
+                "Example — send a WhatsApp message: [{\"op\":\"open_app\",\"app\":\"whatsapp\"},"
+                "{\"op\":\"wait_for_text\",\"text\":\"Chats\"},{\"op\":\"find_text\","
+                "\"action\":\"click\",\"text\":\"Roshan\"},{\"op\":\"find_text\",\"action\":"
+                "\"type\",\"text\":\"Type a message\",\"text2\":\"hey\"},{\"op\":\"find_text\","
+                "\"action\":\"click\",\"text\":\"Send\"}]"
             ),
             "parameters": {
                 "type": "object",
@@ -1331,6 +1353,115 @@ def _browse_allowed(url: str) -> str | None:
     return None
 
 
+# Common web-app shortcuts — `{"op": "open_app", "app": "whatsapp"}` resolves to a full URL
+# without the model having to guess it. Add entries here as new apps come up.
+_WEB_APPS: dict[str, str] = {
+    "whatsapp":  "https://web.whatsapp.com",
+    "slack":     "https://app.slack.com/client",
+    "discord":   "https://discord.com/app",
+    "spotify":   "https://open.spotify.com",
+    "gmail":     "https://mail.google.com",
+    "calendar":  "https://calendar.google.com",
+    "drive":     "https://drive.google.com",
+    "docs":      "https://docs.google.com",
+    "sheets":    "https://sheets.google.com",
+    "youtube":   "https://www.youtube.com",
+    "twitter":   "https://x.com",
+    "x":         "https://x.com",
+    "reddit":    "https://www.reddit.com",
+    "github":    "https://github.com",
+    "notion":    "https://www.notion.so",
+    "linear":    "https://linear.app",
+    "figma":     "https://www.figma.com",
+    "chatgpt":   "https://chatgpt.com",
+    "claude":    "https://claude.ai",
+    "instagram": "https://www.instagram.com",
+    "linkedin":  "https://www.linkedin.com",
+    "netflix":   "https://www.netflix.com",
+    "amazon":    "https://www.amazon.com",
+    "twitch":    "https://www.twitch.tv",
+    "maps":      "https://www.google.com/maps",
+}
+
+
+# The `find_text` op compiles into this JS blob. It's authored by us (never by the model),
+# so the only model-supplied values are the string literals that flow through js_lit() —
+# they can't escape their quoted context. Handles the three common typable-element flavours:
+# a plain <input>/<textarea> (React-safe native setter), a contenteditable (execCommand),
+# and everything else (returns a friendly 'not typable'). Visible-text match is case-insensitive,
+# prefers exact match, falls back to substring.
+_FIND_TEXT_JS = r"""
+(function(){
+  var target = __TARGET__;
+  var action = __ACTION__;
+  var typeText = __TYPE_TEXT__;
+  var role = __ROLE__;
+  function norm(s){ return (s==null?'':String(s)).trim().toLowerCase(); }
+  var want = norm(target);
+  var roles = role ? [role] : ['button','a','[role="button"]','[role="link"]',
+    '[role="menuitem"]','[role="tab"]','[role="option"]','input','textarea',
+    '[contenteditable="true"]','[contenteditable=""]','li','div','span'];
+  function visible(el){
+    var r = el.getBoundingClientRect();
+    if (r.width===0 && r.height===0) return false;
+    var s = window.getComputedStyle(el);
+    return s && s.visibility!=='hidden' && s.display!=='none';
+  }
+  function labelOf(el){
+    return norm(el.innerText || el.value || el.getAttribute('aria-label') ||
+                el.getAttribute('placeholder') || el.getAttribute('title'));
+  }
+  var el = null;
+  outer: for (var pass=0; pass<2 && !el; pass++){
+    for (var i=0; i<roles.length; i++){
+      var els = document.querySelectorAll(roles[i]);
+      for (var j=0; j<els.length; j++){
+        if (!visible(els[j])) continue;
+        var t = labelOf(els[j]);
+        if (!t) continue;
+        if ((pass===0 && t===want) || (pass===1 && t.indexOf(want)>=0)) {
+          el = els[j]; break outer;
+        }
+      }
+    }
+  }
+  if (!el) return 'no element matched: ' + target;
+  try { el.scrollIntoView({block:'center'}); } catch(e){}
+  if (action==='click') { el.click(); return 'clicked: ' + target; }
+  if (action==='read')  { return (el.innerText||'').slice(0,600); }
+  if (action==='type'){
+    if (el.tagName==='INPUT' || el.tagName==='TEXTAREA'){
+      var proto = el.tagName==='INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+      var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+      el.focus(); setter.call(el, typeText);
+      el.dispatchEvent(new Event('input', {bubbles:true}));
+      el.dispatchEvent(new Event('change', {bubbles:true}));
+      return 'typed: ' + typeText;
+    }
+    if (el.isContentEditable){
+      el.focus();
+      try { document.execCommand('insertText', false, typeText); return 'typed (ce): ' + typeText; }
+      catch(e){ el.textContent = typeText;
+        el.dispatchEvent(new InputEvent('input',{bubbles:true,data:typeText,inputType:'insertText'}));
+        return 'typed (ce-fallback): ' + typeText; }
+    }
+    return 'element not typable: ' + target;
+  }
+  return 'unknown action: ' + action;
+})()
+""".strip()
+
+
+# `wait_for_text` polls the document for a visible text to appear (or disappear, if invert).
+_WAIT_FOR_TEXT_JS = r"""
+(function(){
+  var want = (__TARGET__||'').toLowerCase();
+  var text = (document.body && document.body.innerText || '').toLowerCase();
+  return text.indexOf(want) >= 0 ? 'found' : 'missing';
+})()
+""".strip()
+
+
 def _bh_build_script(actions: list[dict]) -> tuple[str | None, str | None]:
     """Compile a list of STRUCTURED actions into a browser-harness Python snippet. Every
     model-supplied value is JSON-encoded at both the Python and the JavaScript quoting levels,
@@ -1348,7 +1479,8 @@ def _bh_build_script(actions: list[dict]) -> tuple[str | None, str | None]:
     def py_print_js(js_source: str) -> str:   # `print(js(<js_source as a python str literal>))`
         return f"print(js({json.dumps(js_source)}))"
 
-    lines = ["# auto-generated by JARVIS from structured actions - NOT model-authored code"]
+    lines = ["# auto-generated by JARVIS from structured actions - NOT model-authored code",
+             "import time"]
     opened = False
     for i, step in enumerate(actions):
         if not isinstance(step, dict):
@@ -1397,6 +1529,72 @@ def _bh_build_script(actions: list[dict]) -> tuple[str | None, str | None]:
         elif op == "page_info":
             lines.append(f'print("[page_info #{i}]")')
             lines.append("print(page_info())")
+        elif op == "open_app":
+            # Smart-open a known web app by name. Falls back to `navigate` semantics if
+            # the model already supplied a full URL.
+            app = str(step.get("app", "")).strip().lower()
+            url = _WEB_APPS.get(app) or (str(step.get("url", "")).strip() or "")
+            if not url:
+                supported = ", ".join(sorted(_WEB_APPS))
+                return None, (f"action {i} (open_app): unknown app {app!r}. "
+                              f"Supply {{app: <one of {supported}>}} or a full url.")
+            err = _browse_allowed(url)
+            if err:
+                return None, err
+            lines.append(f"{'new_tab' if not opened else 'goto_url'}({json.dumps(url)})")
+            lines.append("wait_for_load()")
+            # Header is JSON-encoded so a hostile URL (query params with quotes, etc.)
+            # can't break the compiled script's Python parsing or leak into a code path.
+            lines.append(f"print({json.dumps(f'[open_app #{i}] {app or url}')})")
+            opened = True
+        elif op == "find_text":
+            # Act on the first visible element whose visible text/aria-label/placeholder
+            # matches. The compiler owns the JS — the only model-supplied values are
+            # string literals routed through js_lit() (safe inside their quoted context).
+            text = step.get("text")
+            if not text:
+                return None, f"action {i} (find_text) needs a 'text'."
+            act = str(step.get("action", "click")).strip().lower()
+            if act not in {"click", "type", "read"}:
+                return None, (f"action {i} (find_text): action must be one of "
+                              f"click|type|read, got {act!r}.")
+            if act == "type" and step.get("text2") is None and step.get("value") is None:
+                return None, f"action {i} (find_text, action=type) needs a 'text2' or 'value'."
+            js_source = (_FIND_TEXT_JS
+                         .replace("__TARGET__", js_lit(text))
+                         .replace("__ACTION__", js_lit(act))
+                         .replace("__TYPE_TEXT__", js_lit(step.get("text2") or step.get("value")))
+                         .replace("__ROLE__", js_lit(step.get("role"))))
+            # Header JSON-encoded — text may contain quotes/newlines that would otherwise
+            # break the compiled script's Python parsing. Preview truncated to keep logs small.
+            _preview = str(text)[:80]
+            lines.append(f"print({json.dumps(f'[find_text #{i}] {act}: {_preview}')})")
+            lines.append(py_print_js(js_source))
+        elif op == "wait_for_text":
+            text = step.get("text")
+            if not text:
+                return None, f"action {i} (wait_for_text) needs a 'text'."
+            try:
+                timeout_ms = max(100, min(20000, int(step.get("timeout_ms", 5000))))
+            except (TypeError, ValueError):
+                return None, f"action {i} (wait_for_text): timeout_ms must be an integer."
+            poll_js = _WAIT_FOR_TEXT_JS.replace("__TARGET__", js_lit(text))
+            polls = max(1, timeout_ms // 250)
+            _preview = str(text)[:80]
+            lines.append(f"print({json.dumps(f'[wait_for_text #{i}] up to {timeout_ms}ms: {_preview}')})")
+            lines.append("_hit = 'missing'")
+            lines.append(f"for _ in range({polls}):")
+            lines.append(f"    _hit = js({json.dumps(poll_js)})")
+            lines.append("    if _hit == 'found': break")
+            lines.append("    time.sleep(0.25)")
+            lines.append('print("[wait_for_text result]", _hit)')
+        elif op == "wait_ms":
+            try:
+                ms = max(0, min(15000, int(step.get("ms", 500))))
+            except (TypeError, ValueError):
+                return None, f"action {i} (wait_ms): ms must be an integer."
+            lines.append(f'print("[wait_ms #{i}] {ms}ms")')
+            lines.append(f"time.sleep({ms / 1000.0})")
         else:
             return None, f"action {i}: unknown op {op!r}."
     return "\n".join(lines), None
@@ -2508,9 +2706,13 @@ You are in a live spoken conversation — your replies are read aloud and you re
 
 You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, Windows desktop control (`desktop`), parallel sub-agents (`spawn_agents`), tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run.
 
+Driving web apps with `browse`: for anything like "open WhatsApp and message Roshan", "play X on Spotify", "post in #general on Slack" — use `browse` with an `open_app` action first, then `find_text` to click/type by visible label (search box → contact/track/channel → send). Prefer `find_text` over `click`/`type` with CSS selectors — visible-text matching survives redesigns. Use `wait_for_text` after navigation because these apps load asynchronously.
+
 Windows desktop control (`desktop`): for anything system-shaped — "open my downloads folder", "open display settings", "open task manager", "uninstall Zoom" — use `desktop`, not `launch_app` or `run_command`. Actions: `open_path` (files/folders), `open_settings` (apps/display/network/…), `open_control_panel` (programs/network/sound/…), `open_registry` (regedit, optional key), `open_component` (task_manager/device_manager/services/event_viewer/…), `list_apps` + `uninstall_app` (winget). Uninstall pattern: call `uninstall_app` with the name first (dry-run, confirm defaults to false) → the tool returns the exact match with version → repeat back to the user and get their yes → call again with `confirm: true`. If the dry-run says 2+ packages matched, ask the user which one before proceeding. `list_apps` is safe to call whenever.
 
-Parallel sub-agents (`spawn_agents`): use when the same request has INDEPENDENT sub-parts you can answer in parallel — "compare the top 3 laptops on price, battery, keyboard", "summarize what these five links say", "research pros vs cons vs pricing for X". Fire up to 5 sub-agents, each with its own focused prompt; they run at the same time with a read-only tool set and you get a combined result block to reason over. Do NOT use `spawn_agents` for a single question with one part — call the right tool directly. Do NOT use it as a wrapper around a single tool call. Sub-agents can't write memory, run shell, or drive the desktop; if the task needs those, do it yourself."""
+Parallel sub-agents (`spawn_agents`): use when the same request has INDEPENDENT sub-parts you can answer in parallel — "compare the top 3 laptops on price, battery, keyboard", "summarize what these five links say", "research pros vs cons vs pricing for X". Fire up to 5 sub-agents, each with its own focused prompt; they run at the same time with a read-only tool set and you get a combined result block to reason over. Do NOT use `spawn_agents` for a single question with one part — call the right tool directly. Do NOT use it as a wrapper around a single tool call. Sub-agents can't write memory, run shell, or drive the desktop; if the task needs those, do it yourself.
+
+Confirm before irreversible actions when there's ANY ambiguity. If the user says "message Roshan" and the contact list surfaces one Roshan, send it. If two Roshans surface, STOP and ask which one — do not guess. Same for delete/purchase/publish actions: if you're certain of the target, act; if you're not, one short question first. Reading, searching, opening pages — no confirm needed."""
 
 
 def _build_system_prompt(query: str = "") -> str:
