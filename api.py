@@ -176,7 +176,7 @@ VOICE_OPTIONS = [
 # quickly enough that a filler would just talk over the reply.
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
-SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse", "recon", "pentest"}
+SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse", "recon", "pentest", "bugbounty"}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -843,8 +843,11 @@ TOOLS: list[dict] = [
                 "codes, 200=reachable) · urls (gau/waybackurls + katana crawl: harvest + JS URLs) · "
                 "candidates (gf: harvested URLs mapped to likely vuln classes — xss/sqli/lfi/ssrf/"
                 "redirect — the 'where to look' map) · js (extract endpoints from JavaScript) · "
-                "params (arjun) · dirs (ffuf content discovery) · nuclei (templated CVE/misconfig "
-                "scan) · web (nikto) · sqli (sqlmap) · xss (dalfox — CONFIRMS reflected/DOM XSS on "
+                "params (arjun) · asn (amass intel — related domains/seeds the org owns) · secrets "
+                "(grep harvested JS for leaked api keys/tokens) · dirs (ffuf content discovery) · "
+                "nuclei (templated CVE/misconfig "
+                "scan) · takeover (subdomain-takeover check across subdomains — high-value) · web "
+                "(nikto) · sqli (sqlmap) · xss (dalfox — CONFIRMS reflected/DOM XSS on "
                 "the candidates, with PoC) · scanall (enumerate ALL live subdomains → nuclei across "
                 "the whole attack surface; slow) · full · report (writes a Markdown assessment "
                 "from everything JARVIS has remembered about the target — no target tool needed).\n"
@@ -863,6 +866,25 @@ TOOLS: list[dict] = [
                     "target": {"type": "string", "description": "Host/IP/URL/domain to test (must be in authorized scope)"},
                     "task": {"type": "string", "description": "ports | probe | dirs | nuclei | web | sqli | full"},
                 },
+                "required": ["target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bugbounty",
+            "description": (
+                "Run the full bug-bounty recon sweep on a domain in one call — recon → probe (live "
+                "subdomains) → urls (harvest+crawl) → candidates (vuln-class map) — in the efficient "
+                "order, emitting EACH phase live to the ops console and storing every finding in "
+                "memory. Active phases need the domain in scope (they refuse otherwise). Use for "
+                "'recon/sweep/enumerate <domain>'. Follow with `pentest <d> nuclei`/`scanall` and "
+                "`report <d>`."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"target": {"type": "string", "description": "domain to sweep"}},
                 "required": ["target"],
             },
         },
@@ -1413,6 +1435,43 @@ def _pentest_signals(text: str) -> str:
     return "; ".join(sig)
 
 
+def _bugbounty_run(domain: str) -> str:
+    """Full-chain bug-bounty sweep — recon → probe → urls → candidates — run in the efficient
+    order, with EACH phase emitted as its own OpsConsole step (a real agent_tool event) so it
+    stays step-by-step and honest, and every phase feeds cortex. Active phases are scope-gated
+    (they refuse if the domain isn't authorized); recon/probe are broad. Ask for a `report`
+    after for the write-up. (nuclei/scanall are heavier — run them as a follow-up.)"""
+    import pentest as _pt
+    host = _pt._host_of(domain) or (domain or "").strip()
+    if not host:
+        return "Give a domain to sweep, e.g. bugbounty acme.com."
+    phases = [("recon", None), ("probe", "probe"), ("urls", "urls"), ("candidates", "candidates")]
+    summary: list[str] = []
+    for label, task in phases:
+        try:
+            out = _pt.recon(host) if task is None else _pt.attack(host, task)
+        except Exception as exc:
+            out = f"(phase failed: {exc})"
+        # learn + emit a per-phase OpsConsole step (like _run_tool does)
+        try:
+            out = _augment_and_learn("bugbounty", host, task or "recon", out)
+        except Exception:
+            pass
+        entry = {"step": len(agent_trace) + 1, "action": f"bugbounty·{label}",
+                 "args": {"target": host, "phase": label}, "observation": out[:2500]}
+        agent_trace.append(entry)
+        agent_trace[:] = agent_trace[-25:]
+        broadcast_from_thread({"type": "agent_tool", "step": entry})
+        if out.lstrip().startswith("⛔"):
+            summary.append(f"[{label}] refused — {host} not in scope (scope add it first)")
+            break
+        summary.append(f"[{label}] " + (_pentest_signals(out) or "done"))
+    return (f"Bug-bounty sweep of {host} — {len(summary)} phase(s):\n"
+            + "\n".join("- " + s for s in summary)
+            + "\n\nNext: `pentest {h} nuclei` / `scanall` for vulns, then `report {h}` for the write-up."
+              .replace("{h}", host))
+
+
 def _pentest_report(target: str) -> str:
     """Turn everything cortex has learned about a target into a Markdown assessment report —
     the bug-bounty deliverable (methodology phase 7). Fact-driven, with derived next steps."""
@@ -1574,6 +1633,9 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
 
     if name == "report":
         return _pentest_report(args.get("target", ""))
+
+    if name == "bugbounty":
+        return _bugbounty_run(args.get("target", ""))
 
     if name in ("recon", "pentest", "scope"):
         import pentest as _pt
