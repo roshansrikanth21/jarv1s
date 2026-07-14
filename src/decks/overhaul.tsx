@@ -37,6 +37,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { HudAmbient } from "@/components/jarvis/HudAmbient";
 import { ShaderBackdrop } from "@/components/jarvis/ShaderBackdrop";
+import { OpsConsole } from "@/components/jarvis/OpsConsole";
 import { notifyNative } from "@/lib/utils";
 
 // Rendered as a UI preset by src/routes/index.tsx (not a standalone route).
@@ -213,6 +214,9 @@ function CommandDeck() {
   const [cmdHistory, setCmdHistory] = useState<string[]>([]);
   const [histIdx, setHistIdx]       = useState(-1);
   const [rightTab, setRightTab]     = useState<"governor" | "rig" | "memory" | "tasks" | "trace" | "markets">("governor");
+  // Live Ops console — the pentest cockpit. Auto-opens when a security tool fires.
+  const [opsOpen, setOpsOpen]       = useState(false);
+  const [runningTool, setRunningTool] = useState<{ action: string } | null>(null);
   const [reactorFlash, setReactorFlash] = useState(false);
   const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized]   = useState(false);
@@ -340,6 +344,14 @@ function CommandDeck() {
           if (d.status === "speaking") setSpeaking(true);
           else if (!audioRef.current) setSpeaking(false);
           if (txt) addLineRef.current("system", txt);
+          // "Running <tool>…" → show it as an in-flight step in the Ops console.
+          const rm = /Running\s+([a-z_]+)/i.exec(txt || "");
+          if (rm) {
+            setRunningTool({ action: rm[1] });
+            if (["recon", "pentest", "scope", "browse"].includes(rm[1])) setOpsOpen(true);
+          } else if (d.status === "idle") {
+            setRunningTool(null);
+          }
         }
         if (d.type === "emotion" && d.emotion) {
           setAgentStatus(prev => ({ ...prev, emotion: d.emotion }));
@@ -458,6 +470,9 @@ function CommandDeck() {
             trace: [...(prev.trace ?? []), s].slice(-30),
           }));
           setRightTab("trace");
+          setRunningTool(null);
+          // Security work belongs in the big Ops console, not a side tab — pop it open.
+          if (["recon", "pentest", "scope", "browse"].includes(s.action)) setOpsOpen(true);
         }
       } catch { addLineRef.current("system", "Malformed backend packet."); }
     };
@@ -680,6 +695,9 @@ function CommandDeck() {
 
         <div className="hud-header-controls no-drag">
           <MoodChip emotion={agentStatus.emotion} />
+          <IconBtn onClick={() => setOpsOpen(o => !o)} title="Live Ops — pentest console (step-by-step tool activity)">
+            <Radio className="w-3.5 h-3.5" style={opsOpen ? { color: "var(--c-amber)" } : undefined} />
+          </IconBtn>
           <IconBtn onClick={() => setHelpOpen(true)} title="What is this? — quick guide"><HelpCircle className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={refreshStatus} title="Refresh"><Activity className="w-3.5 h-3.5" /></IconBtn>
           <IconBtn onClick={() => setSettingsOpen(true)} title="Settings"><Settings className="w-3.5 h-3.5" /></IconBtn>
@@ -761,7 +779,21 @@ function CommandDeck() {
         </motion.aside>
 
         {/* ── CENTER: TERMINAL ── */}
-        <section className="hud-center">
+        <section className="hud-center" style={{ position: "relative" }}>
+
+          {/* Live Ops console — the pentest cockpit. Overlays the conversation when a
+              security tool runs; toggle with the Ops button in the header. */}
+          <AnimatePresence>
+            {opsOpen && (
+              <OpsConsole
+                key="ops"
+                trace={trace}
+                running={runningTool}
+                accent="var(--c-amber)"
+                onClose={() => setOpsOpen(false)}
+              />
+            )}
+          </AnimatePresence>
 
           {/* Stream header */}
           <div className="hud-stream-header">

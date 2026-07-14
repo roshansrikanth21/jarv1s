@@ -8,6 +8,7 @@ import ChatDeck from "@/decks/chat";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { BootIntro } from "@/components/jarvis/BootIntro";
+import { LiveOps } from "@/components/jarvis/LiveOps";
 import { SettingsPanel } from "@/components/jarvis/SettingsPanel";
 
 export const Route = createFileRoute("/")({
@@ -148,6 +149,8 @@ function Page() {
             accent={PRESET_ACCENT[preset] ?? "#c4a5ff"}
             onClose={() => setSettingsOpen(false)}
           />
+          {/* Ground-truth feed of real tool executions — proves what JARVIS actually ran. */}
+          <LiveOps />
         </>
       )}
     </>
