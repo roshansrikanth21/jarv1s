@@ -44,6 +44,7 @@ import ambient
 import briefing
 import perception
 import persona as persona_mod
+import subagents
 import system_monitor
 import web_search as websearch_mod
 
@@ -100,6 +101,10 @@ GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 # personal use; rate limits degrade gracefully. For max throughput / no throttling
 # set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
 GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+# Sub-agents default to the smaller/faster model so a spawn_agents call (up to 5 × 6 = 30
+# API hits) doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL to
+# put them on the big model, or set both to the same to disable the split.
+SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "openai/gpt-oss-20b")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
 GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard cap so a slow/hung API never stalls the agent
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
@@ -1030,6 +1035,43 @@ TOOLS: list[dict] = [
                     "confirm":   {"type": "boolean"},
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_agents",
+            "description": (
+                "Spawn up to 5 focused sub-agents that run IN PARALLEL, each with its "
+                "own tool loop (read-only tools only), and get back a combined result "
+                "block. Use when the same question has independent sub-parts that can "
+                "be answered separately — e.g. 'compare the top 3 laptops', "
+                "'research pros vs cons vs pricing', 'summarize what these five links "
+                "say'. Sub-agents CANNOT write memory, run shell, drive the desktop, "
+                "or spawn nested sub-agents. Each sub-agent is bounded (6 tool "
+                "iterations); the whole call is bounded (90s wall-clock). Don't use "
+                "spawn_agents for a single question — call the right tool directly."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agents": {
+                        "type": "array",
+                        "description": "List of sub-agent specs (max 5).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name":   {"type": "string",
+                                           "description": "Short label for this agent's result (e.g. 'pricing', 'cons')."},
+                                "prompt": {"type": "string",
+                                           "description": "The focused question this sub-agent should answer."},
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                },
+                "required": ["agents"],
             },
         },
     },
@@ -2464,9 +2506,11 @@ You are in a live spoken conversation — your replies are read aloud and you re
 - One or two sentences for most things; go longer only when asked for detail or code.
 - NEVER use markdown, headers, bullets, asterisks, code fences, or math notation — spell math in words ("ninety minus sixty"). It all gets spoken.
 
-You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, Windows desktop control (`desktop`), tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run.
+You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, Windows desktop control (`desktop`), parallel sub-agents (`spawn_agents`), tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run.
 
-Windows desktop control (`desktop`): for anything system-shaped — "open my downloads folder", "open display settings", "open task manager", "uninstall Zoom" — use `desktop`, not `launch_app` or `run_command`. Actions: `open_path` (files/folders), `open_settings` (apps/display/network/…), `open_control_panel` (programs/network/sound/…), `open_registry` (regedit, optional key), `open_component` (task_manager/device_manager/services/event_viewer/…), `list_apps` + `uninstall_app` (winget). Uninstall pattern: call `uninstall_app` with the name first (dry-run, confirm defaults to false) → the tool returns the exact match with version → repeat back to the user and get their yes → call again with `confirm: true`. If the dry-run says 2+ packages matched, ask the user which one before proceeding. `list_apps` is safe to call whenever."""
+Windows desktop control (`desktop`): for anything system-shaped — "open my downloads folder", "open display settings", "open task manager", "uninstall Zoom" — use `desktop`, not `launch_app` or `run_command`. Actions: `open_path` (files/folders), `open_settings` (apps/display/network/…), `open_control_panel` (programs/network/sound/…), `open_registry` (regedit, optional key), `open_component` (task_manager/device_manager/services/event_viewer/…), `list_apps` + `uninstall_app` (winget). Uninstall pattern: call `uninstall_app` with the name first (dry-run, confirm defaults to false) → the tool returns the exact match with version → repeat back to the user and get their yes → call again with `confirm: true`. If the dry-run says 2+ packages matched, ask the user which one before proceeding. `list_apps` is safe to call whenever.
+
+Parallel sub-agents (`spawn_agents`): use when the same request has INDEPENDENT sub-parts you can answer in parallel — "compare the top 3 laptops on price, battery, keyboard", "summarize what these five links say", "research pros vs cons vs pricing for X". Fire up to 5 sub-agents, each with its own focused prompt; they run at the same time with a read-only tool set and you get a combined result block to reason over. Do NOT use `spawn_agents` for a single question with one part — call the right tool directly. Do NOT use it as a wrapper around a single tool call. Sub-agents can't write memory, run shell, or drive the desktop; if the task needs those, do it yourself."""
 
 
 def _build_system_prompt(query: str = "") -> str:
@@ -2537,6 +2581,51 @@ def _build_system_prompt(query: str = "") -> str:
 
 
 # ── Shared tool runner ──────────────────────────────────────────────────────────
+async def _subagent_brain(messages: list[dict], tools: list[dict], max_tokens: int) -> dict:
+    """Sub-agent brain call. Groq first (fast + real tool-call support), Ollama fallback.
+    Skips Claude to avoid triple-implementing the tool-call schema — the parent turn can
+    still be a Claude run; sub-agents just don't need the extra plumbing.
+
+    Returns {"content": str, "tool_calls": [{"id", "name", "arguments"}]}."""
+    if USE_GROQ and _HAS_GROQ:
+        client = _openai_mod.AsyncOpenAI(
+            api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
+        # Deliberately SUBAGENT_MODEL (small/fast), not GROQ_MODEL — see comment where it's
+        # defined. Prevents a spawn_agents call from burning through the parent's quota.
+        kwargs: dict = {"model": SUBAGENT_MODEL, "messages": messages, "max_tokens": max_tokens}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        r = await client.chat.completions.create(**kwargs)
+        m = r.choices[0].message
+        return {
+            "content": m.content or "",
+            "tool_calls": [
+                {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
+                for tc in (m.tool_calls or [])
+            ],
+        }
+    if _LOCAL_OK and LOCAL_FAST:
+        import ollama
+        client = ollama.AsyncClient()
+        kwargs = {"model": LOCAL_FAST, "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+        r = await client.chat(**kwargs)
+        m = r.message
+        return {
+            "content": m.content or "",
+            "tool_calls": [
+                {"id": f"call_{i}", "name": tc.function.name,
+                 "arguments": (json.dumps(tc.function.arguments)
+                               if isinstance(tc.function.arguments, dict)
+                               else str(tc.function.arguments))}
+                for i, tc in enumerate(m.tool_calls or [])
+            ],
+        }
+    raise RuntimeError("no brain available for sub-agents (need GROQ_API_KEY or Ollama)")
+
+
 async def _run_tool(name: str, args: dict) -> str:
     global _filler_sent, _pending_content_panel
     # A slow tool means a real wait — bridge the dead air with a quick spoken
@@ -2547,7 +2636,15 @@ async def _run_tool(name: str, args: dict) -> str:
     await broadcast({"type": "state", "status": "thinking", "text": f"Running {name}..."})
     my_gen = _turn_generation
     try:
-        observation = await asyncio.to_thread(execute_tool, name, args, my_gen)
+        if name == "spawn_agents":
+            # Native async path — execute_tool is sync and can't await sub-agent gathering.
+            # subagents.run_all is bounded (max 5 agents, 6 tool iterations each, 90s wall
+            # clock), and the tool set it sees is the read-only subset only.
+            results = await subagents.run_all(
+                args.get("agents"), TOOLS, _subagent_brain, execute_tool)
+            observation = subagents.format_results(results)
+        else:
+            observation = await asyncio.to_thread(execute_tool, name, args, my_gen)
     except Exception as exc:
         observation = f"Tool {name} failed: {exc}"
     if _pending_content_panel:
