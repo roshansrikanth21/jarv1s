@@ -839,13 +839,16 @@ TOOLS: list[dict] = [
                 "ACTIVE security testing against a target, in an isolated Kali container. REFUSED "
                 "unless the target is in the authorized scope (labs, CTF/HTB, or a bug-bounty "
                 "program) — enforced, not advisory; authorize first with the `scope` tool.\n"
-                "tasks: ports (nmap open ports/services) · probe (subfinder→httpx: which subdomains "
-                "are LIVE and their status codes — 200 = directly reachable) · dirs (content "
-                "discovery, surfaces reachable paths) · nuclei (templated CVE/misconfig scan) · web "
-                "(nikto) · sqli (sqlmap) · full (ports+probe+dirs+nuclei).\n"
-                "Efficient bug-bounty order — run tasks ONE AT A TIME so each result guides the next, "
-                "and report findings between steps: probe → ports → dirs → nuclei. Call the tool per "
-                "step (don't just say you will); report exactly what each returns."
+                "tasks: ports (nmap) · probe (subfinder→httpx: which subdomains are LIVE + status "
+                "codes, 200=reachable) · urls (gau/waybackurls + katana crawl: harvest + JS URLs) · "
+                "candidates (gf: harvested URLs mapped to likely vuln classes — xss/sqli/lfi/ssrf/"
+                "redirect — the 'where to look' map) · params (arjun parameter discovery) · dirs "
+                "(ffuf content discovery) · nuclei (templated CVE/misconfig scan) · web (nikto) · "
+                "sqli (sqlmap) · full.\n"
+                "Efficient bug-bounty order — run ONE task at a time so each result guides the next, "
+                "reporting findings between steps: probe → ports → urls → candidates → nuclei → then "
+                "targeted tests (sqli/params) on the candidates. Call the tool per step (don't say "
+                "you will — actually call it); report exactly what each returns."
             ),
             "parameters": {
                 "type": "object",
@@ -1373,7 +1376,13 @@ def _pentest_signals(text: str) -> str:
     paths = re.findall(r"(/[A-Za-z0-9_\-./]{1,40})\s+\(Status:\s*2\d\d", text)
     if paths:
         sig.append("paths " + ", ".join(sorted(set(paths))[:10]))
-    if re.search(r"OSVDB|CVE-\d|SQL injection|vulnerab", text, re.I):
+    m = re.search(r"harvested\s+(\d+)\s+.*URLs", text)
+    if m:
+        sig.append(f"{m.group(1)} URLs harvested")
+    cands = re.findall(r"^\[(xss|sqli|lfi|ssrf|redirect|rce|ssti|idor)\]", text, re.M)
+    if cands:
+        sig.append("vuln candidates: " + ", ".join(sorted(set(cands))))
+    if re.search(r"OSVDB|CVE-\d|SQL injection|\bvulnerab", text, re.I):
         sig.append("vulns flagged")
     return "; ".join(sig)
 
