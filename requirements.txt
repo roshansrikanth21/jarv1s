@@ -18,6 +18,11 @@ edge-tts
 sounddevice
 numpy
 
+# Robust speech detection (spectral VAD) — separates speech from mic/background noise far
+# better than an energy threshold. Prebuilt wheels, no C compiler needed. If absent, voice
+# capture degrades to a simple energy gate rather than breaking.
+webrtcvad-wheels
+
 # System tools
 psutil
 
