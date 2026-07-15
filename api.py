@@ -4187,6 +4187,31 @@ def _is_stt_noise(text: str) -> bool:
     # A single very short word is almost always a noise artifact.
     if len(t.split()) == 1 and len(alnum) <= 2:
         return True
+    # Repetition = hallucination. On noise, tiny.en loops one phrase dozens of times
+    # ("take a look at how take a look at how ...", "see you in the next video, see you ...").
+    # Real speech has variety; a transcript whose words are mostly the same handful, OR that
+    # contains a phrase repeated 3+ times back-to-back, is a hallucination.
+    if _is_repetitive(t):
+        return True
+    return False
+
+
+def _is_repetitive(t: str) -> bool:
+    """Detect Whisper's degenerate looping. Two cheap signals: low lexical diversity over a
+    longish transcript, and an n-gram that repeats many times in a row."""
+    words = re.findall(r"[a-z0-9']+", t)
+    if len(words) >= 12:
+        diversity = len(set(words)) / len(words)
+        if diversity < 0.35:               # e.g. 8 unique words across 40 → looped phrase
+            return True
+    # A 2–5 word phrase repeated 3+ times consecutively.
+    for n in range(2, 6):
+        if len(words) < n * 3:
+            continue
+        for i in range(len(words) - n * 3 + 1):
+            gram = words[i:i + n]
+            if words[i + n:i + 2 * n] == gram and words[i + 2 * n:i + 3 * n] == gram:
+                return True
     return False
 
 
@@ -4254,7 +4279,15 @@ def _warm_local_whisper() -> None:
 def _transcribe_local(pcm16, sample_rate: int):
     """Transcribe raw int16 mono PCM via the local faster-whisper singleton — no WAV/file
     round-trip, no PyAV. Returns text, or None if the local model isn't available (caller
-    should fall back to Groq)."""
+    should fall back to Groq).
+
+    Heavily hardened against Whisper's #1 failure mode: on background noise or near-silence,
+    tiny.en HALLUCINATES — usually a short phrase looped dozens of times ("thanks for watching,
+    see you in the next video, ..." / "take a look at how take a look at how ..."). Three gates
+    kill it: (1) faster-whisper's built-in Silero VAD strips non-speech BEFORE decoding; (2)
+    per-segment confidence — drop anything the model itself thinks is silence (high
+    no_speech_prob) or low-confidence (low avg_logprob) or degenerate (high compression ratio);
+    (3) a repetition detector downstream in `_is_stt_noise`."""
     model = _get_local_whisper()
     if model is None:
         return None
@@ -4262,11 +4295,25 @@ def _transcribe_local(pcm16, sample_rate: int):
         import numpy as np
         audio_f32 = (pcm16.astype(np.float32) / 32768.0)
         segments, _info = model.transcribe(
-            audio_f32, language="en", vad_filter=False,
-            initial_prompt="Jarvis",   # bias decoding toward the wake word, per faster-whisper docs
+            audio_f32, language="en",
+            # Silero VAD removes the silence/noise regions that whisper hallucinates over.
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
             temperature=0.0, condition_on_previous_text=False,   # each utterance is independent
+            no_speech_threshold=0.6,          # segment marked no-speech above this → dropped
+            log_prob_threshold=-1.0,          # low-confidence decode → treated as no-speech
+            compression_ratio_threshold=2.2,  # repetitive/degenerate text → dropped (hallucination)
         )
-        text = " ".join(seg.text for seg in segments).strip()
+        kept = []
+        for seg in segments:
+            # Belt-and-braces: even with the thresholds above, drop any segment the model is
+            # unsure is speech. These attributes always exist on faster-whisper segments.
+            if getattr(seg, "no_speech_prob", 0.0) > 0.6:
+                continue
+            if getattr(seg, "avg_logprob", 0.0) < -1.0:
+                continue
+            kept.append(seg.text)
+        text = " ".join(kept).strip()
         return "" if _is_stt_noise(text) else text
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Local transcription failed: {exc}"})
@@ -4612,6 +4659,12 @@ def _voice_worker() -> None:
     except Exception:
         _vad = None
 
+    # Loudness floor a frame must clear (mean |amplitude| of int16) to count as speech, on top
+    # of the spectral VAD. ~250 keeps distant TV / fans / room tone from triggering while normal
+    # talking near the mic clears it easily. Raise if background still gets through, lower if it
+    # misses you.
+    MIN_SPEECH_ENERGY = int(os.environ.get("JARVIS_MIC_MIN_ENERGY", "250"))
+
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
     START_PAD, START_VOICED = 5, 3       # trigger FAST: 3 of the last 5 frames (~150 ms) voiced,
     #                                      so a quick "Jarvis" is caught on the first try
@@ -4686,9 +4739,15 @@ def _voice_worker() -> None:
                         try:
                             speech = _vad.is_speech(frame.tobytes(), 16000)
                         except Exception:
-                            speech = int(np.abs(frame).mean()) > 300
+                            speech = energy > 300
                     else:
-                        speech = int(np.abs(frame).mean()) > 300   # dependency-free fallback
+                        speech = energy > 300   # dependency-free fallback
+                    # Energy floor: webrtcvad is spectral-only and will call quiet room tone /
+                    # distant TV "speech". Requiring a loudness minimum too means only sound
+                    # actually near the mic (you talking) triggers — the biggest single win for
+                    # "stop transcribing background noise". Tune with JARVIS_MIC_MIN_ENERGY.
+                    if speech and energy < MIN_SPEECH_ENERGY:
+                        speech = False
 
                     ring.append((frame, speech))
                     if not triggered:
