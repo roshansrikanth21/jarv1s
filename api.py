@@ -79,17 +79,29 @@ PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
 MEMORY_FILE.parent.mkdir(exist_ok=True)
 TRADING_ROOT = Path(os.environ.get("C0MR4DES_DIR", str(BASE_DIR.parent / "c0mr4des_terminal")))
 
-# Load .env from repo root if present
+# Load .env from repo root if present.
+#
+# API-KEY PRECEDENCE: the Electron app injects keys from its encrypted store as env vars
+# BEFORE this runs, so a plain setdefault would let a STALE stored key shadow a fresh one the
+# user just typed into .env — the exact "I put a new key in but it still says limit reached"
+# trap. So for the known key vars, an explicitly-set .env value OVERRIDES the injected env
+# (editing .env is a deliberate, current action). Everything else keeps setdefault semantics
+# (real env still wins) so runtime overrides like JARVIS_PORT behave normally.
+_ENV_OVERRIDE = {"GROQ_API_KEY", "ANTHROPIC_API_KEY", "MEM0_API_KEY", "GROQ_MODEL"}
 _env_file = BASE_DIR / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text(encoding="utf-8").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
+            _k = _k.strip()
             _v = _v.strip()
             if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
                 _v = _v[1:-1]
-            os.environ.setdefault(_k.strip(), _v)
+            if _k in _ENV_OVERRIDE and _v:
+                os.environ[_k] = _v          # explicit .env value wins over a stale injected key
+            else:
+                os.environ.setdefault(_k, _v)
 
 # ── Brain config ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
