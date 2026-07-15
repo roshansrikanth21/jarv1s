@@ -1066,9 +1066,22 @@ TOOLS: list[dict] = [
                 "  notify          — args: title, message, timeout (2-30s). Native OS toast.\n"
                 "  capture_webcam  — args: path (optional). Grabs one frame; returns file "
                 "path. Feed the path to `analyze_image` for vision reasoning.\n"
+                "  window_focus / window_minimize / window_maximize / window_restore / "
+                "window_close — args: title (substring, case-insensitive). Refuses if 0 "
+                "or 2+ windows match — surface the list to the user first.\n"
+                "  window_list     — enumerate visible windows so you can pick one.\n"
+                "  remind          — args: sub_action (schedule|list|cancel), when, "
+                "message, title. `when` accepts ISO ('2026-07-15T15:00'), 'in 5 minutes', "
+                "'tomorrow 9am', 'today 15:00', or 'HH:MM'. Uses OS-native scheduling "
+                "(Windows Task Scheduler) so the toast fires even if JARVIS is closed. "
+                "list returns pending reminders; cancel takes id from schedule/list.\n"
+                "YouTube/Spotify/Netflix playback control: use key_press with media "
+                "keys (playpause / nexttrack / prevtrack / stop / volumemute / volumeup "
+                "/ volumedown) — they work in any focused player.\n"
                 "Safety: destructive/irreversible actions (uninstall_app, long type_text) "
                 "MUST go through the confirm gate. Read-only / navigational actions "
-                "(open_*, list_apps, notify, capture_webcam, mouse_move) don't."
+                "(open_*, list_apps, notify, capture_webcam, mouse_move, window_list, "
+                "remind list) don't."
             ),
             "parameters": {
                 "type": "object",
@@ -1079,7 +1092,10 @@ TOOLS: list[dict] = [
                                            "uninstall_app", "system_volume", "brightness",
                                            "toggle_wifi", "mouse_click", "mouse_move",
                                            "mouse_scroll", "type_text", "key_press",
-                                           "notify", "capture_webcam"]},
+                                           "notify", "capture_webcam",
+                                           "window_focus", "window_minimize",
+                                           "window_maximize", "window_restore",
+                                           "window_close", "window_list", "remind"]},
                     "path":      {"type": "string"},
                     "page":      {"type": "string"},
                     "applet":    {"type": "string"},
@@ -1101,6 +1117,13 @@ TOOLS: list[dict] = [
                     "title":     {"type": "string"},
                     "message":   {"type": "string"},
                     "timeout":   {"type": "integer"},
+                    # p2 additions:
+                    "when":      {"type": "string",
+                                  "description": "For remind: ISO datetime OR 'in 5 minutes' / 'tomorrow 9am' / 'today 15:00' / 'HH:MM'."},
+                    "sub_action":{"type": "string",
+                                  "description": "For remind: schedule | list | cancel."},
+                    "id":        {"type": "string",
+                                  "description": "For remind cancel: the reminder id returned by schedule."},
                 },
                 "required": ["action"],
             },
@@ -1176,7 +1199,13 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "capture_screen",
-            "description": "Take a screenshot and describe what is currently on the screen.",
+            "description": (
+                "Take a screenshot and describe what is currently on the screen. "
+                "When you call this tool, ALSO speak one short natural line first "
+                "('let me look' / 'checking your screen' / 'one sec, taking a look') "
+                "so there's no awkward silence while the capture runs. The vision "
+                "analysis is your next response after the tool returns."
+            ),
             "parameters": {"type": "object", "properties": {}},
         },
     },

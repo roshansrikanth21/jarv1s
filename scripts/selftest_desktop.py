@@ -387,13 +387,92 @@ def run() -> int:
     section("dispatch — new action names are all recognized")
     for new_act in ("system_volume", "brightness", "toggle_wifi", "mouse_click",
                     "mouse_move", "mouse_scroll", "type_text", "key_press",
-                    "notify", "capture_webcam"):
-        # Dispatching with missing required args should return a friendly error, not
-        # a "unknown action" — proves the action is wired.
+                    "notify", "capture_webcam",
+                    # p2 additions
+                    "window_focus", "window_minimize", "window_maximize",
+                    "window_restore", "window_close", "window_list", "remind"):
         _reset()
         out = desktop.run(new_act, {})
         ok(f"{new_act:15s} is dispatched (not 'unknown action')",
            "unknown action" not in out, out[:80])
+
+    # ── p2: media keys allowlist ──
+    section("media keys are in the key_press allowlist")
+    for k in ("playpause", "nexttrack", "prevtrack", "stop",
+              "volumeup", "volumedown", "volumemute"):
+        _reset()
+        # fake_pa was installed earlier; re-install a quick stub so keypress records.
+        class _MK:
+            def __init__(self): self.calls = []; self.FAILSAFE = True
+            def press(self, k): self.calls.append(k)
+            def hotkey(self, *_): pass
+        _mk = _MK()
+        desktop._pyautogui = lambda mk=_mk: mk
+        out = desktop.run("key_press", {"keys": k})
+        ok(f"{k:12s} accepted by key_press", k in _mk.calls, out[:80])
+
+    # ── p2: reminder time parser ──
+    section("reminder time parsing (offline, deterministic)")
+    import reminder
+    from datetime import datetime as _dt, timedelta as _td
+    now = _dt(2026, 7, 15, 12, 0, 0)
+    ok("'in 5 minutes' → +5m",
+       reminder.parse_when("in 5 minutes", now=now) == now + _td(minutes=5))
+    ok("'in 2 hours' → +2h",
+       reminder.parse_when("in 2 hours", now=now) == now + _td(hours=2))
+    ok("'tomorrow 9am' → next day 09:00",
+       reminder.parse_when("tomorrow 9am", now=now)
+       == _dt(2026, 7, 16, 9, 0))
+    ok("'today 15:00' → today 15:00",
+       reminder.parse_when("today 15:00", now=now) == _dt(2026, 7, 15, 15, 0))
+    ok("bare '15:30' → today 15:30 (future)",
+       reminder.parse_when("15:30", now=now) == _dt(2026, 7, 15, 15, 30))
+    ok("bare '09:00' when past → tomorrow 09:00 (rollover)",
+       reminder.parse_when("09:00", now=now) == _dt(2026, 7, 16, 9, 0))
+    ok("ISO datetime parses",
+       reminder.parse_when("2026-08-01T10:30", now=now) == _dt(2026, 8, 1, 10, 30))
+    ok("garbage returns None", reminder.parse_when("nonsense", now=now) is None)
+    ok("empty returns None", reminder.parse_when("", now=now) is None)
+
+    # ── p2: reminder schedule refuses past + missing message ──
+    section("reminder schedule: input validation")
+    r = reminder.schedule(when="in 5 minutes", message="")
+    ok("empty message refused", r.get("ok") is False and "message" in r.get("error", ""), str(r))
+    r = reminder.schedule(when="garbage", message="do X")
+    ok("unparseable when refused",
+       r.get("ok") is False and "could not parse" in r.get("error", ""), str(r))
+    r = reminder.schedule(when="2020-01-01T09:00", message="do X")
+    ok("past when refused", r.get("ok") is False and "past" in r.get("error", ""), str(r))
+
+    # ── p2: window_list uses pyautogui.getAllWindows ──
+    section("window_focus disambiguation")
+    class _Win:
+        def __init__(self, title): self.title = title; self.actions = []
+        def activate(self): self.actions.append("activate")
+        def minimize(self): self.actions.append("minimize")
+        def maximize(self): self.actions.append("maximize")
+        def restore(self): self.actions.append("restore")
+        def close(self): self.actions.append("close")
+    class _FakePAW:
+        FAILSAFE = True
+        def __init__(self, wins): self.wins = wins
+        def getAllWindows(self): return self.wins
+        def size(self): return (1920, 1080)
+    _fake_pa_2 = _FakePAW([_Win("Notepad"), _Win("VS Code"), _Win("Chrome - GitHub")])
+    desktop._pyautogui = lambda pa=_fake_pa_2: pa
+    out = desktop.run("window_focus", {"title": "Notepad"})
+    ok("single match → activate", _fake_pa_2.wins[0].actions == ["activate"], out)
+    out = desktop.run("window_focus", {"title": "notepad"})
+    ok("substring case-insensitive match works",
+       _fake_pa_2.wins[0].actions == ["activate", "activate"], out)
+    out = desktop.run("window_focus", {"title": "nonexistent"})
+    ok("no match errors, does not activate", "no window title matched" in out)
+    _fake_pa_3 = _FakePAW([_Win("Chrome — GitHub"), _Win("Chrome — Notion")])
+    desktop._pyautogui = lambda pa=_fake_pa_3: pa
+    out = desktop.run("window_focus", {"title": "chrome"})
+    ok("multi-match refuses and lists matches",
+       "2 windows matched" in out and "Chrome" in out
+       and _fake_pa_3.wins[0].actions == [] and _fake_pa_3.wins[1].actions == [])
 
     passed = sum(1 for _, c, _ in _checks if c)
     total = len(_checks)
