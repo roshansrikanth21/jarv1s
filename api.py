@@ -328,6 +328,9 @@ _awake_until = 0.0             # armed-for-command deadline after a bare wake wo
 _listen_thread: threading.Thread | None = None
 _voice_lock = threading.Lock() # serializes mic start/stop so they can't spawn two InputStreams
 _tts_playing = False          # frontend reports the exact playback window
+_tts_ended_at = 0.0           # when playback last ended — mic stays muted a beat after, so the
+                              # acoustic tail/reverb of JARVIS's own voice can't retrigger the VAD
+_tts_gen = 0                  # bumped per TTS clip; lets a stale mute-failsafe know it's superseded
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task   = None          # in-flight _speak task (for barge-in cancel)
@@ -644,7 +647,7 @@ def _origin_allowed(origin: str | None) -> bool:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
-    global _tts_playing, _speaking_text, _tts_voice
+    global _tts_playing, _tts_ended_at, _speaking_text, _tts_voice
     if not _origin_allowed(websocket.headers.get("origin")):
         await websocket.close(code=1008)   # policy violation
         return
@@ -682,6 +685,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             elif action == "tts_end":
                 # Playback finished — clear the echo guard so the mic acts normally.
                 _tts_playing = False
+                _tts_ended_at = time.time()   # start the acoustic-tail cooldown
                 _speaking_text = ""
             elif action == "set_voice":
                 vid = data.get("voice", "")
@@ -731,6 +735,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             active_connections.remove(websocket)
         except ValueError:
             pass
+        # A client that disconnects mid-playback can never send its tts_end. Release the mute
+        # here so the mic can't stay wedged (there are no speakers playing once it's gone).
+        if not active_connections:
+            _tts_playing = False
+            _tts_ended_at = time.time()
         # The mic/watch loops are single global resources, not per-connection. If
         # the last client just disconnected without sending stop_listening (e.g.
         # the window was simply closed), stop them — otherwise the daemon thread
@@ -1332,6 +1341,37 @@ _CMD_BLOCK_RE = re.compile(
 )
 _CMD_META_RE = re.compile(r"[;&|`>]|(?:\$\()")
 
+# Each desktop sub-action reads ONE primary arg under this name. Used to repair calls where
+# the model passed {"<sub-action>": value} instead of {"action":"<sub-action>", "<arg>":value}.
+_DESKTOP_PRIMARY_ARG = {
+    "open_path": "path", "open_settings": "page", "open_control_panel": "applet",
+    "open_registry": "key", "open_component": "component", "list_apps": "filter",
+    "uninstall_app": "app", "toggle_wifi": "state", "type_text": "text",
+    "key_press": "keys", "notify": "message", "window_focus": "title",
+    "window_minimize": "title", "window_maximize": "title", "window_restore": "title",
+    "window_close": "title",
+}
+
+
+def _normalize_desktop_args(args: dict) -> dict:
+    """Repair the `desktop` arg shape gpt-oss frequently mangles: a sub-action passed as a KEY
+    ({"open_path": "C:\\…"}) instead of {"action":"open_path","path":"C:\\…"}. If `action` is
+    already set, returns args untouched."""
+    if not isinstance(args, dict) or (args.get("action") or "").strip():
+        return args
+    for k in list(args.keys()):
+        if k in _DESKTOP_PRIMARY_ARG:
+            v = args[k]
+            fixed = {kk: vv for kk, vv in args.items() if kk != k}
+            fixed["action"] = k
+            if isinstance(v, dict):          # value is itself the arg bundle
+                fixed.update(v)
+            else:                            # scalar → put under the action's primary arg
+                fixed.setdefault(_DESKTOP_PRIMARY_ARG[k], v)
+            return fixed
+    return args
+
+
 _LAUNCH_ALLOWLIST = {
     "chrome": "chrome.exe", "firefox": "firefox.exe", "edge": "msedge.exe",
     "code": "code", "vscode": "code", "spotify": "spotify.exe",
@@ -1739,6 +1779,10 @@ def _browser_run(script: str) -> str:
         return f"Browser unavailable — {err}"
     # Minimal env: only what the harness needs. NOT **os.environ — that would hand the
     # decrypted GROQ/ANTHROPIC keys to the subprocess. Force UTF-8 so unicode pages survive.
+    # The home/appdata vars are REQUIRED on Windows: browser-harness resolves Path.home() at
+    # import (for its ~/.config + tmp dirs), which needs USERPROFILE — omitting it crashes the
+    # harness before it runs. These are just the user's home path, not secrets, so passing them
+    # doesn't reopen the API-key exfil hole the scrub exists to close.
     env = {
         "BU_CDP_URL": BH_CDP_URL,
         "PYTHONIOENCODING": "utf-8",
@@ -1747,6 +1791,9 @@ def _browser_run(script: str) -> str:
         "TEMP": os.environ.get("TEMP", ""),
         "TMP": os.environ.get("TMP", ""),
     }
+    for _var in ("USERPROFILE", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA", "HOME"):
+        if os.environ.get(_var):
+            env[_var] = os.environ[_var]
     try:
         proc = subprocess.run([BH_CLI], input=script, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=BH_TIMEOUT, env=env)
@@ -2082,6 +2129,10 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
     if name == "desktop":
         # Windows-system-shaped ops: Explorer paths, Settings pages, Control Panel,
         # regedit, system components, and winget list/uninstall (confirm-gated).
+        # gpt-oss often mis-structures this call — it puts the sub-action as a KEY
+        # (e.g. {"open_path": "C:\\…"}) instead of {"action":"open_path","path":"C:\\…"},
+        # which would fail with "unknown action ''". Normalize that shape back.
+        args = _normalize_desktop_args(args)
         return desktop.run(str(args.get("action") or ""), args)
 
     if name == "add_task":
@@ -2991,6 +3042,48 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool):
     return full_text, tool_calls_raw
 
 
+def _salvage_text_toolcall(text: str):
+    """gpt-oss occasionally emits a tool call as PLAIN TEXT instead of a native tool_call —
+    e.g. it streams `{"action":"desktop","parameters":{...}}` into the answer, so the user
+    sees raw JSON and nothing runs. Detect that shape and recover (name, args) so we can
+    execute the real tool instead. Returns (name, args_dict) or None if it isn't one.
+
+    Tolerant of the several shapes the model improvises: name under action/name/tool/function,
+    args under parameters/arguments/args/input; and it may wrap the JSON in a ```json fence."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    if t.startswith("```"):                       # strip a ```json … ``` fence
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return None
+    try:
+        obj = json.loads(t)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or obj.get("action") or obj.get("tool") or obj.get("function")
+    args = obj.get("parameters")
+    if args is None: args = obj.get("arguments")
+    if args is None: args = obj.get("args")
+    if args is None: args = obj.get("input")
+    if args is None: args = {}
+    if isinstance(name, dict):                     # {"function":{"name":…,"arguments":…}}
+        args = name.get("arguments", args)
+        name = name.get("name")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            args = {}
+    if not isinstance(name, str) or name not in _TOOL_NAMES:
+        return None
+    if not isinstance(args, dict):
+        args = {}
+    return name, args
+
+
 def _record_turn(user: str, assistant: str) -> None:
     """Keep a short rolling window of the conversation for multi-turn context, AND
     persist the exchange to cortex (episode + fire-and-forget extraction)."""
@@ -3063,6 +3156,20 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
                 break
 
         if not tool_calls_raw:
+            # gpt-oss sometimes DUMPS a tool call as text instead of calling it. If the "answer"
+            # is really a tool-call JSON, execute it instead of showing the user raw JSON.
+            salvaged = _salvage_text_toolcall(full_text) if use_tools else None
+            if salvaged:
+                name, args = salvaged
+                await broadcast({"type": "llm_reset"})   # discard the JSON already streamed to the UI
+                tc_id = f"salvage_{name}_{len(messages)}"
+                messages.append({"role": "assistant", "content": None,
+                                 "tool_calls": [{"id": tc_id, "type": "function",
+                                                 "function": {"name": name,
+                                                              "arguments": json.dumps(args)}}]})
+                obs = await _run_tool(name, args)
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs})
+                continue
             if full_text.strip():
                 final_answer = full_text.strip()
             else:
@@ -3735,7 +3842,7 @@ async def _prewarm_wake_acks() -> None:
 async def _wake_ack() -> None:
     """Heard a bare 'jarvis' — acknowledge and open the command window. Any speech mid-
     reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
-    global _speaking_text
+    global _speaking_text, _tts_playing
     await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
     phrase = random.choice(WAKE_ACKS)
     cached = _wake_ack_cache.get((phrase, _tts_voice))
@@ -3743,6 +3850,8 @@ async def _wake_ack() -> None:
         # Instant: replay the pre-synthesized clip (no edge-tts round-trip).
         _speaking_text = re.sub(r"[*_`#\[\]()]", "", phrase).strip().lower()
         await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+        _tts_playing = True                         # mute the mic through the ack (base64 ≈ bytes×0.75)
+        _arm_tts_failsafe(len(cached) * 0.75 / 6000.0)
         await broadcast({"type": "tts_audio", "data": cached})
         await broadcast({"type": "state", "status": "idle"})
     else:
@@ -3957,8 +4066,30 @@ async def _schedule_speak(text: str) -> None:
     _speak_task = asyncio.create_task(_speak(text))
 
 
+def _arm_tts_failsafe(est_seconds: float) -> None:
+    """Guarantee the send-time TTS mute is released even if the frontend's tts_end never
+    arrives (client disconnect, browser blocked the audio). Without this, a lost tts_end
+    would wedge the mic muted forever — worse than the echo we're preventing. Fires only if
+    this same clip is still the current one after its expected duration + margin."""
+    global _tts_gen
+    _tts_gen += 1
+    gen = _tts_gen
+
+    async def _clear() -> None:
+        global _tts_playing, _tts_ended_at
+        await asyncio.sleep(min(max(est_seconds, 0.0) + 2.0, 60.0))
+        if _tts_gen == gen and _tts_playing:   # not superseded, and tts_end never cleared it
+            _tts_playing = False
+            _tts_ended_at = time.time()
+
+    try:
+        asyncio.create_task(_clear())
+    except RuntimeError:
+        pass   # no running loop (shouldn't happen here) — frontend tts_end will still clear it
+
+
 async def _speak(text: str) -> None:
-    global _speaking_text
+    global _speaking_text, _tts_playing
     try:
         import edge_tts
     except ImportError:
@@ -3987,6 +4118,12 @@ async def _speak(text: str) -> None:
             await broadcast({"type": "state", "status": "idle"})
             return
         b64 = base64.b64encode(audio_bytes).decode()
+        # Mute the mic BEFORE the audio reaches the speakers — closes the ~100 ms gap between
+        # sending the clip and the frontend confirming tts_start, so no echo leading-edge leaks.
+        # The frontend's tts_end clears this normally; the failsafe clears it if that's lost.
+        # edge-tts mp3 ≈ 48 kbit/s → bytes / 6000 ≈ seconds of audio.
+        _tts_playing = True
+        _arm_tts_failsafe(len(audio_bytes) / 6000.0)
         await broadcast({"type": "tts_audio", "data": b64})
     except asyncio.CancelledError:
         _speaking_text = ""
@@ -4019,6 +4156,7 @@ async def _start_voice() -> None:
     await broadcast({"type": "state", "status": "listening", "text": hint})
     await broadcast({"type": "mic", "listening": True})   # authoritative — UI mirrors this
     asyncio.create_task(_prewarm_wake_acks())             # so the "Yes, sir." ack is instant
+    _warm_local_whisper()                                  # so the first utterance isn't stuck behind model load
 
 
 def _stop_voice() -> None:
@@ -4053,17 +4191,113 @@ def _is_stt_noise(text: str) -> bool:
     return False
 
 
-def _transcribe(wav_bytes: bytes) -> str:
-    """Transcribe WAV audio via Groq Whisper. Returns text (or '' on failure/noise)."""
+_whisper_model = None
+_whisper_lock = threading.Lock()
+_whisper_load_failed = False   # sticky — don't retry a 1-3s failed load on every utterance
+
+
+def _import_faster_whisper():
+    """Import the faster_whisper package, working around Windows Smart App Control blocking
+    PyAV's native DLL (a hard, unbypassable reputation-policy block — not a mark-of-web flag
+    `Unblock-File` can clear). faster-whisper's package `__init__` unconditionally imports
+    PyAV (`av`) to decode audio files/bytes, but we never need that decoder: the mic capture
+    already hands us raw PCM, and passing a numpy array straight to `model.transcribe()`
+    skips `decode_audio()`/PyAV entirely. So we stub a harmless empty `av` module before
+    import — satisfies the import, never actually used. Raises on genuine failure."""
+    import sys
+    if "av" not in sys.modules:
+        try:
+            import av  # noqa: F401  — real PyAV works fine, use it if SAC allows
+        except ImportError:
+            import types
+            sys.modules["av"] = types.ModuleType("av")   # unused stand-in, see docstring
+    import faster_whisper
+    return faster_whisper
+
+
+def _stt_available() -> bool:
+    """True if voice input can transcribe at all — local faster-whisper or Groq cloud."""
+    try:
+        _import_faster_whisper()
+        return True
+    except ImportError:
+        return bool(USE_GROQ and _HAS_GROQ)
+
+
+def _get_local_whisper():
+    """Process-level singleton faster-whisper model (CPU, int8, tiny.en) — the default STT
+    backend: offline, free, no per-request quota. Loaded lazily on first use so app boot
+    isn't delayed; returns None (and stays None) if it can't load, so callers fall back to
+    Groq's cloud Whisper."""
+    global _whisper_model, _whisper_load_failed
+    if _whisper_model is not None or _whisper_load_failed:
+        return _whisper_model
+    with _whisper_lock:
+        if _whisper_model is not None or _whisper_load_failed:
+            return _whisper_model
+        try:
+            WhisperModel = _import_faster_whisper().WhisperModel
+            _whisper_model = WhisperModel(
+                os.environ.get("JARVIS_STT_MODEL", "tiny.en"), device="cpu", compute_type="int8",
+            )
+        except Exception as exc:
+            _whisper_load_failed = True
+            broadcast_from_thread({"type": "system", "text": f"Local STT unavailable ({exc}); using Groq cloud Whisper."})
+    return _whisper_model
+
+
+def _warm_local_whisper() -> None:
+    """Load the local Whisper model off the hot path — call once when voice starts so the
+    first real utterance isn't stuck behind a one-time model load/download."""
+    threading.Thread(target=_get_local_whisper, daemon=True).start()
+
+
+def _transcribe_local(pcm16, sample_rate: int):
+    """Transcribe raw int16 mono PCM via the local faster-whisper singleton — no WAV/file
+    round-trip, no PyAV. Returns text, or None if the local model isn't available (caller
+    should fall back to Groq)."""
+    model = _get_local_whisper()
+    if model is None:
+        return None
+    try:
+        import numpy as np
+        audio_f32 = (pcm16.astype(np.float32) / 32768.0)
+        segments, _info = model.transcribe(
+            audio_f32, language="en", vad_filter=False,
+            initial_prompt="Jarvis",   # bias decoding toward the wake word, per faster-whisper docs
+            temperature=0.0, condition_on_previous_text=False,   # each utterance is independent
+        )
+        text = " ".join(seg.text for seg in segments).strip()
+        return "" if _is_stt_noise(text) else text
+    except Exception as exc:
+        broadcast_from_thread({"type": "system", "text": f"Local transcription failed: {exc}"})
+        return ""
+
+
+def _transcribe(pcm16, sample_rate: int = 16000) -> str:
+    """Transcribe 16kHz mono int16 PCM — local faster-whisper first (no network round-trip
+    and no per-request quota, so wake-word detection is instant and doesn't depend on
+    internet/Groq availability), falling back to Groq cloud Whisper only if the local model
+    can't load."""
+    local = _transcribe_local(pcm16, sample_rate)
+    if local is not None:
+        return local
     if not (USE_GROQ and _HAS_GROQ):
         return ""
     try:
+        import wave
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(pcm16.tobytes())
         client = _openai_mod.OpenAI(
             api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
         )
         result = client.audio.transcriptions.create(
             model=STT_MODEL,
-            file=("speech.wav", wav_bytes, "audio/wav"),
+            file=("speech.wav", buf.getvalue(), "audio/wav"),
             response_format="text",
             language="en",
         )
@@ -4203,8 +4437,10 @@ def _voice_worker() -> None:
         _voice_stopped()
         return
 
-    if not (USE_GROQ and _HAS_GROQ):
-        broadcast_from_thread({"type": "system", "text": "Voice input needs a GROQ_API_KEY for Whisper transcription."})
+    if not _stt_available():
+        broadcast_from_thread({"type": "system", "text":
+            "Voice input needs either the local STT model (pip install faster-whisper) or a "
+            "GROQ_API_KEY for cloud Whisper."})
         _voice_stopped()
         return
 
@@ -4249,13 +4485,7 @@ def _voice_worker() -> None:
         peak = float(np.abs(audio).max())
         if 0.0 < peak < 26000.0:
             audio = np.clip(audio * (26000.0 / peak), -32768.0, 32767.0)
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio.astype(np.int16).tobytes())
-        text = _transcribe(buf.getvalue())
+        text = _transcribe(audio.astype(np.int16), 16000)
         if not text:
             return
 
@@ -4312,10 +4542,45 @@ def _voice_worker() -> None:
             _act(cmd)
         # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
+    # One dedicated STT worker (queue-and-worker), NOT a thread per utterance. Two reasons:
+    #  • the local CTranslate2/Whisper model isn't safe for concurrent transcribe() calls — a
+    #    thread-per-utterance pileup (which is exactly what happened when JARVIS heard its own
+    #    reply) contends the model and produces garbled/empty text on the NEXT real input;
+    #  • a single serialized worker keeps transcription off the capture loop (mic stays live)
+    #    while guaranteeing one decode at a time.
+    stt_q: Q.Queue = Q.Queue(maxsize=8)   # bounded: drop the oldest stale segment if it backs up
+
+    def _stt_worker() -> None:
+        while _listening:
+            try:
+                pcm16 = stt_q.get(timeout=0.3)
+            except Q.Empty:
+                continue
+            if pcm16 is None:
+                break
+            try:
+                _flush(pcm16)
+            except Exception as exc:
+                broadcast_from_thread({"type": "system", "text": f"STT worker error: {exc}"})
+
     def _flush_async(pcm16) -> None:
-        # Transcription is a blocking network call — run it OFF the capture loop so the mic
-        # keeps hearing you in real time instead of going deaf during every Whisper round-trip.
-        threading.Thread(target=_flush, args=(pcm16,), daemon=True).start()
+        try:
+            stt_q.put_nowait(pcm16)
+        except Q.Full:
+            try:                     # queue full → discard the oldest (stale) segment, keep newest
+                stt_q.get_nowait()
+                stt_q.put_nowait(pcm16)
+            except Exception:
+                pass
+
+    def _tts_muted() -> bool:
+        # Half-duplex: while JARVIS is speaking (or within a short acoustic-tail cooldown after),
+        # the mic must not collect — otherwise it transcribes JARVIS's own voice off the speakers,
+        # which both wastes the model and corrupts the next real utterance. No echo cancellation
+        # needed; we simply don't listen while we talk, like a real push-to-talk radio.
+        return _tts_playing or (time.time() - _tts_ended_at) < TTS_TAIL_COOLDOWN
+
+    TTS_TAIL_COOLDOWN = 0.35   # seconds after playback before the mic is trusted again
 
     # Real speech detection via WebRTC VAD (spectral, gain-INDEPENDENT) at 16 kHz — replaces the
     # brittle energy-threshold VAD that couldn't separate speech from a noisy low-gain mic. A
@@ -4342,6 +4607,9 @@ def _voice_worker() -> None:
         return np.interp(np.linspace(0.0, 1.0, n, endpoint=False),
                          np.linspace(0.0, 1.0, len(mono_f32), endpoint=False), mono_f32)
 
+    stt_thread = threading.Thread(target=_stt_worker, daemon=True)
+    stt_thread.start()
+
     try:
         from collections import deque
         with sd.InputStream(device=input_device, samplerate=RATE, channels=CHANS, dtype="int16",
@@ -4359,6 +4627,22 @@ def _voice_worker() -> None:
                     chunk = audio_q.get(timeout=0.3)
                 except Q.Empty:
                     continue
+
+                # Half-duplex: while JARVIS is speaking (or in the tail cooldown), don't listen.
+                # Drain what we captured, reset the collector, and drive the orb to calm — this is
+                # what stops the mic from transcribing JARVIS's own reply and corrupting the next
+                # turn. The moment playback ends (+cooldown) we pick right back up.
+                if _tts_muted():
+                    if triggered or voiced:
+                        triggered = False
+                        voiced = []
+                        ring.clear()
+                    leftover = np.zeros(0, dtype=np.int16)
+                    if level_tick:                    # settle the orb once
+                        broadcast_from_thread({"type": "audio_level", "level": 0})
+                        level_tick = 0
+                    continue
+
                 # Resample this chunk to 16 kHz mono and slice into fixed 30 ms VAD frames.
                 mono = _resample16(chunk.reshape(-1).astype(np.float32))
                 leftover = np.concatenate([leftover, mono.astype(np.int16)])
@@ -4392,15 +4676,20 @@ def _voice_worker() -> None:
                         ended = len(recent) >= END_PAD and sum(1 for _, s in recent if not s) >= END_UNVOICED
                         if ended or len(voiced) >= MAX_UTTER_FRAMES:
                             triggered = False
-                            _flush_async(np.concatenate(voiced))
+                            # Don't flush a segment that ended right as JARVIS started talking —
+                            # it's almost certainly the leading edge of the echo.
+                            if not _tts_muted():
+                                _flush_async(np.concatenate(voiced))
                             voiced = []
                             ring.clear()
 
-            if triggered and voiced:                 # flush an in-progress utterance on mic-off
+            if triggered and voiced and not _tts_muted():   # flush an in-progress utterance on mic-off
                 _flush_async(np.concatenate(voiced))
 
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Voice error: {exc}"})
+
+    stt_q.put(None)   # release the STT worker so it exits cleanly with the capture loop
 
     # Any exit — normal stop, mic/stream error, or GROQ hiccup — resets the flag so the mic
     # can always be restarted (and so ALWAYS_LISTEN's auto-restart isn't permanently blocked).
@@ -4433,9 +4722,9 @@ async def agent_status() -> dict:
             "current": _tts_voice,
             "options": VOICE_OPTIONS,
             "tts": True,
-            "stt": bool(USE_GROQ and _HAS_GROQ),
-            "stt_hint": None if (USE_GROQ and _HAS_GROQ) else
-                        "Mic input needs a free Groq API key (Whisper). Speech output does not.",
+            "stt": _stt_available(),
+            "stt_hint": None if _stt_available() else
+                        "Mic input needs faster-whisper (local, offline) or a free Groq API key. Speech output does not.",
         },
         "user": {
             "name":      _user_name(),
@@ -4504,7 +4793,7 @@ async def get_settings() -> dict:
         "modes":           list(governor.MODES),
         "always_listen":   ALWAYS_LISTEN,
         "store_overheard": STORE_OVERHEARD,
-        "stt":             bool(USE_GROQ and _HAS_GROQ),
+        "stt":             _stt_available(),
     }
 
 

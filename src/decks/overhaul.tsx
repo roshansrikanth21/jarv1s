@@ -360,6 +360,7 @@ function CommandDeck() {
         if (d.type === "llm_chunk" && d.text) {
           setStreamLine(prev => prev + (d.text as string));
         }
+        if (d.type === "llm_reset") setStreamLine("");   // model dumped a tool-call as text; discard it
         if (d.type === "llm_response" || d.type === "response") {
           setStreamLine("");
           flashReactorRef.current();
