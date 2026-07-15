@@ -153,7 +153,7 @@ WAKE_REQUIRED = os.environ.get("JARVIS_WAKE_REQUIRED", "1") != "0"
 # take the NEXT thing you say as the command — so "Jarvis…" [pause] "what's the weather"
 # works like any real assistant, not just "jarvis what's the weather" in one breath.
 WAKE_WINDOW = float(os.environ.get("JARVIS_WAKE_WINDOW", "8"))
-WAKE_ACKS = ["Yes?", "Go ahead.", "I'm listening.", "Mm-hm?", "Sir?"]
+WAKE_ACKS = ["Yes, sir?", "Yes, sir.", "Go ahead, sir.", "Sir?", "I'm listening, sir."]
 # Always-on ears: auto-start the mic when a client connects, so JARVIS is listening
 # without a button press. It still only ACTS on utterances addressed with the wake word.
 ALWAYS_LISTEN = os.environ.get("JARVIS_ALWAYS_LISTEN", "1") != "0"
@@ -3674,10 +3674,17 @@ def _match_wake_word(text: str):
     fillers like 'hey'/'ok') and boundary-checked, so ordinary speech that merely CONTAINS a
     wake-ish word ('we saw Travis yesterday') no longer fires a spurious command."""
     t = text.lower().strip().lstrip("\"'.,!?;:- ")
-    for filler in ("hey ", "ok ", "okay ", "yo "):
-        if t.startswith(filler):
-            t = t[len(filler):].lstrip()
-            break
+    # Strip any leading fillers before the wake word — "hey/hello/hi/yo jarvis", "ok jarvis",
+    # even "hey there jarvis". Loops so multiple stack.
+    _fillers = ("hey there ", "hey ", "hello ", "hi ", "ok ", "okay ", "yo ", "um ", "uh ")
+    changed = True
+    while changed:
+        changed = False
+        for filler in _fillers:
+            if t.startswith(filler):
+                t = t[len(filler):].lstrip()
+                changed = True
+                break
     for w in WAKE_WORDS:
         if t.startswith(w):
             nxt = t[len(w):len(w) + 1]
@@ -3699,11 +3706,48 @@ def _is_echo(cmd: str) -> bool:
     return hits / len(words) >= 0.6
 
 
+_wake_ack_cache: dict = {}   # (phrase, voice) -> base64 mp3, so the ack plays with no TTS delay
+
+
+async def _prewarm_wake_acks() -> None:
+    """Pre-synthesize the wake-ack phrases once so 'Yes, sir.' after 'Jarvis' is instant —
+    no edge-tts network round-trip on the critical path. Re-runs cheaply if the voice changes."""
+    try:
+        import edge_tts
+    except Exception:
+        return
+    rate, pitch = _voice_params(TTS_RATE)
+    for phrase in WAKE_ACKS:
+        key = (phrase, _tts_voice)
+        if key in _wake_ack_cache:
+            continue
+        try:
+            audio = b""
+            async for chunk in edge_tts.Communicate(phrase, _tts_voice, rate=rate, pitch=pitch).stream():
+                if chunk["type"] == "audio":
+                    audio += chunk["data"]
+            if audio:
+                _wake_ack_cache[key] = base64.b64encode(audio).decode()
+        except Exception:
+            pass
+
+
 async def _wake_ack() -> None:
     """Heard a bare 'jarvis' — acknowledge and open the command window. Any speech mid-
     reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
+    global _speaking_text
     await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
-    await _schedule_speak(random.choice(WAKE_ACKS))
+    phrase = random.choice(WAKE_ACKS)
+    cached = _wake_ack_cache.get((phrase, _tts_voice))
+    if cached:
+        # Instant: replay the pre-synthesized clip (no edge-tts round-trip).
+        _speaking_text = re.sub(r"[*_`#\[\]()]", "", phrase).strip().lower()
+        await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+        await broadcast({"type": "tts_audio", "data": cached})
+        await broadcast({"type": "state", "status": "idle"})
+    else:
+        await _schedule_speak(phrase)
+        asyncio.create_task(_prewarm_wake_acks())   # warm the cache for next time
 
 
 async def _stop_speaking() -> None:
@@ -3974,6 +4018,7 @@ async def _start_voice() -> None:
     hint = f"Listening — say \"{WAKE_WORDS[0]}\" to wake me." if WAKE_REQUIRED else "Listening..."
     await broadcast({"type": "state", "status": "listening", "text": hint})
     await broadcast({"type": "mic", "listening": True})   # authoritative — UI mirrors this
+    asyncio.create_task(_prewarm_wake_acks())             # so the "Yes, sir." ack is instant
 
 
 def _stop_voice() -> None:
@@ -4039,6 +4084,110 @@ def _voice_stopped() -> None:
     broadcast_from_thread({"type": "audio_level", "level": 0})
 
 
+def _pick_input_device(sd):
+    """Find a microphone that actually WORKS on this machine → (device_index, rate, channels).
+
+    Fully device-agnostic — no hardcoded devices, rates, or channel counts; everything is
+    discovered by probing the machine's own hardware, so it works across laptops/OSes:
+
+      1. FIRST honor the OS default input device (the mic the user picked in Windows/macOS/
+         Linux). On the vast majority of machines this just opens and is used — respecting the
+         user's choice, and using shared-mode audio (no exclusive lock).
+      2. Only if the default can't be opened (e.g. the Intel Smart Sound array whose MME/
+         DirectSound default fails with a -9999 host error) do we fall back to probing every
+         input device — preferring WASAPI (modern, shared) then WDM-KS, skipping loopbacks/
+         speaker-mixes, trying mono then the device's native channel count, and preferring a
+         device that delivers NON-ZERO audio (so we don't grab a silent unplugged jack).
+
+    For each device we try 16 kHz first (no resampling for Whisper) then its native rate;
+    Groq Whisper resamples on its end. Returns (None, None, None) if nothing works — the
+    caller then shows a mic-privacy hint."""
+    import numpy as np
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+    except Exception:
+        return None, None, None
+
+    def probe(dev, rate, ch):
+        """Open + capture ~0.2s. Returns mean amplitude (0 = streamed silence) or None on
+        error / no buffers delivered (some phantom devices open but never fire a callback)."""
+        acc = []
+        try:
+            with sd.InputStream(device=dev, samplerate=rate, channels=ch, dtype="int16",
+                                blocksize=1024, callback=lambda indata, *a: acc.append(indata.copy())):
+                sd.sleep(200)
+        except Exception:
+            return None
+        if not acc:
+            return None
+        try:
+            return int(np.abs(np.concatenate(acc)).mean())
+        except Exception:
+            return 0
+
+    def configs(d):
+        """Formats to try for a device, cheapest-for-Whisper first."""
+        maxch = int(d.get("max_input_channels", 0) or 0)
+        native = int(d.get("default_samplerate") or 16000)
+        chans = [c for c in (1, 2) if c <= maxch] or ([maxch] if maxch else [1])
+        for ch in chans:
+            for rate in dict.fromkeys([16000, native]):   # dedupe if native == 16000
+                yield rate, ch
+
+    # ── 1) the OS default input device — respect the user's chosen mic ──────────────
+    try:
+        default_in = sd.default.device[0]
+    except Exception:
+        default_in = -1
+    if isinstance(default_in, int) and default_in >= 0:
+        try:
+            di = sd.query_devices(default_in)
+            if int(di.get("max_input_channels", 0) or 0) >= 1:
+                for rate, ch in configs(di):
+                    if probe(default_in, rate, ch) is not None:   # streams (even if silent) → trust it
+                        return default_in, rate, ch
+        except Exception:
+            pass
+
+    # ── 2) default unusable → probe every input device ─────────────────────────────
+    pref = ["wasapi", "wdm-ks", "directsound", "mme", "core audio", "alsa", "jack", "asio"]
+    def host_rank(name: str) -> int:
+        low = name.lower()
+        for i, p in enumerate(pref):
+            if p in low:
+                return i
+        return len(pref)
+
+    candidates = []
+    for i, d in enumerate(devices):
+        if i == default_in or int(d.get("max_input_channels", 0) or 0) < 1:
+            continue
+        low = (d.get("name") or "").lower()
+        deprio = 1 if any(k in low for k in ("stereo mix", "sound mapper", "speaker",
+                                             "loopback", "what u hear")) else 0
+        candidates.append((deprio, host_rank(hostapis[d["hostapi"]]["name"]), i, d))
+    candidates.sort(key=lambda t: (t[0], t[1], t[2]))
+
+    fallback = None  # streams but silent — last resort if nothing has live audio
+    for _deprio, _rank, i, d in candidates:
+        found = None
+        for rate, ch in configs(d):
+            amp = probe(i, rate, ch)
+            if amp is not None:
+                found = (i, rate, ch, amp)
+                break
+        if not found:
+            continue
+        if found[3] > 0:                     # live audio → best; use immediately
+            return found[0], found[1], found[2]
+        if fallback is None:
+            fallback = found                 # keep the first streaming-but-silent device
+    if fallback:
+        return fallback[0], fallback[1], fallback[2]
+    return None, None, None
+
+
 def _voice_worker() -> None:
     import queue as Q
     import wave
@@ -4059,37 +4208,53 @@ def _voice_worker() -> None:
         _voice_stopped()
         return
 
-    RATE = 16000
-    CHUNK = 1024            # ~64ms per callback at 16kHz
-    SPEECH_THRESH = 650     # mean absolute value → speech onset (raised: ignore ambient noise)
-    SILENCE_THRESH = 150    # mean absolute value → silence
-    SILENCE_CHUNKS = 12     # ~0.8 s of trailing silence ends the utterance (snappier)
-    MIN_UTTER_CHUNKS = 8    # ignore sub-~0.5s blips (claps, key taps, coughs)
-
+    CHUNK = 1024
+    # Pick a mic that actually opens here — the default MME device fails on many Windows
+    # machines (Intel Smart Sound arrays) with a -9999 host error. RATE is whatever that
+    # device accepts (16 kHz if possible, else its native rate; Groq Whisper resamples).
+    input_device, RATE, CHANS = _pick_input_device(sd)
+    if input_device is None:
+        broadcast_from_thread({"type": "system", "text":
+            "No usable microphone. Check Windows mic access (Settings → Privacy & security → "
+            "Microphone → let desktop apps use the mic), that a mic is enabled, and that no "
+            "other app is holding it exclusively."})
+        _voice_stopped()
+        return
     audio_q: Q.Queue = Q.Queue()
 
     def _cb(indata, frames, time_info, status):
-        audio_q.put(indata.copy())
+        # Downmix multi-channel capture (some arrays only open at their native 2ch) to mono.
+        if indata.shape[1] > 1:
+            audio_q.put(indata.mean(axis=1, keepdims=True).astype(indata.dtype))
+        else:
+            audio_q.put(indata.copy())
 
     def _run(coro):
         if _main_loop and not _main_loop.is_closed():
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
-    def _flush(utterance: list) -> None:
+    MIN_UTTER_SAMPLES = int(0.30 * 16000)   # ignore sub-0.3s blips (input is already 16 kHz mono)
+
+    def _flush(pcm16) -> None:
+        """Transcribe one utterance. `pcm16` is a 1-D int16 numpy array, 16 kHz mono."""
         global _audio_arousal, _awake_until
-        if len(utterance) < MIN_UTTER_CHUNKS:
+        if pcm16 is None or len(pcm16) < MIN_UTTER_SAMPLES:
             return
-        all_audio = np.concatenate(utterance, axis=0)
+        audio = pcm16.astype(np.float32)
         try:
-            _audio_arousal = float(min(1.0, max(0.0, (np.abs(all_audio).mean() - 300) / 1500.0)))
+            _audio_arousal = float(min(1.0, max(0.0, (np.abs(audio).mean() - 300) / 1500.0)))
         except Exception:
             _audio_arousal = None
+        # Peak-normalize so a low-gain mic still hands Whisper a clean, loud signal.
+        peak = float(np.abs(audio).max())
+        if 0.0 < peak < 26000.0:
+            audio = np.clip(audio * (26000.0 / peak), -32768.0, 32767.0)
         buf = io.BytesIO()
         with wave.open(buf, "wb") as wf:
             wf.setnchannels(1)
             wf.setsampwidth(2)
-            wf.setframerate(RATE)
-            wf.writeframes(all_audio.tobytes())
+            wf.setframerate(16000)
+            wf.writeframes(audio.astype(np.int16).tobytes())
         text = _transcribe(buf.getvalue())
         if not text:
             return
@@ -4147,14 +4312,46 @@ def _voice_worker() -> None:
             _act(cmd)
         # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
+    def _flush_async(pcm16) -> None:
+        # Transcription is a blocking network call — run it OFF the capture loop so the mic
+        # keeps hearing you in real time instead of going deaf during every Whisper round-trip.
+        threading.Thread(target=_flush, args=(pcm16,), daemon=True).start()
+
+    # Real speech detection via WebRTC VAD (spectral, gain-INDEPENDENT) at 16 kHz — replaces the
+    # brittle energy-threshold VAD that couldn't separate speech from a noisy low-gain mic. A
+    # ratio-window collector (below) + a pre-roll buffer means the onset of "Jarvis" is never
+    # clipped and ambient blips don't trigger. Falls back to a plain energy gate only if the
+    # package is missing (it's in requirements). Aggressiveness 0..3 via JARVIS_VAD_AGGR.
     try:
-        with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
+        import webrtcvad
+        _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "2")))))
+    except Exception:
+        _vad = None
+
+    FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
+    START_PAD, START_VOICED = 5, 3       # trigger FAST: 3 of the last 5 frames (~150 ms) voiced,
+    #                                      so a quick "Jarvis" is caught on the first try
+    END_PAD, END_UNVOICED = 12, 10       # end only on a clean ~360 ms pause (won't cut a sentence)
+    RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
+    MAX_UTTER_FRAMES = int(14000 / 30)   # ~14 s hard cap
+
+    def _resample16(mono_f32):
+        if RATE == 16000 or len(mono_f32) < 2:
+            return mono_f32
+        n = max(1, int(round(len(mono_f32) * 16000 / RATE)))
+        return np.interp(np.linspace(0.0, 1.0, n, endpoint=False),
+                         np.linspace(0.0, 1.0, len(mono_f32), endpoint=False), mono_f32)
+
+    try:
+        from collections import deque
+        with sd.InputStream(device=input_device, samplerate=RATE, channels=CHANS, dtype="int16",
                             blocksize=CHUNK, callback=_cb):
             broadcast_from_thread({"type": "system", "text": "Mic online. Listening..."})
 
-            recording = False
-            utterance: list = []
-            silence_cnt = 0
+            leftover = np.zeros(0, dtype=np.int16)   # 16 kHz samples spanning callback boundaries
+            ring = deque(maxlen=RING_MAX)             # (frame, is_speech) — recent window + pre-roll
+            triggered = False
+            voiced: list = []
             level_tick = 0
 
             while _listening:
@@ -4162,35 +4359,45 @@ def _voice_worker() -> None:
                     chunk = audio_q.get(timeout=0.3)
                 except Q.Empty:
                     continue
+                # Resample this chunk to 16 kHz mono and slice into fixed 30 ms VAD frames.
+                mono = _resample16(chunk.reshape(-1).astype(np.float32))
+                leftover = np.concatenate([leftover, mono.astype(np.int16)])
 
-                # Note: the mic stays live even while JARVIS speaks, so you can
-                # barge in with the wake word. Self-talk is prevented by the
-                # wake-word gate + echo guard in _flush(), not by muting.
-                energy = int(np.abs(chunk).mean())
-                level_tick += 1
-                if level_tick % 4 == 0:
-                    broadcast_from_thread({"type": "audio_level", "level": min(energy * 5, 32767)})
+                while len(leftover) >= FRAME:
+                    frame = leftover[:FRAME]
+                    leftover = leftover[FRAME:]
 
-                if not recording:
-                    if energy > SPEECH_THRESH:
-                        recording = True
-                        utterance = [chunk]
-                        silence_cnt = 0
-                else:
-                    utterance.append(chunk)
-                    if energy < SILENCE_THRESH:
-                        silence_cnt += 1
-                        if silence_cnt >= SILENCE_CHUNKS:
-                            recording = False
-                            silence_cnt = 0
-                            _flush(utterance)
-                            utterance = []
+                    level_tick += 1
+                    if level_tick % 3 == 0:          # ~every 90 ms, drive the orb
+                        broadcast_from_thread({"type": "audio_level",
+                                               "level": min(int(np.abs(frame).mean()) * 6, 32767)})
+
+                    if _vad is not None:
+                        try:
+                            speech = _vad.is_speech(frame.tobytes(), 16000)
+                        except Exception:
+                            speech = int(np.abs(frame).mean()) > 300
                     else:
-                        silence_cnt = 0
+                        speech = int(np.abs(frame).mean()) > 300   # dependency-free fallback
 
-            # flush a final in-progress utterance when mic is turned off
-            if recording:
-                _flush(utterance)
+                    ring.append((frame, speech))
+                    if not triggered:
+                        recent = list(ring)[-START_PAD:]           # last ~150 ms
+                        if len(recent) >= START_PAD and sum(1 for _, s in recent if s) >= START_VOICED:
+                            triggered = True
+                            voiced = [f for f, _ in ring]          # pre-roll → never clips the onset
+                    else:
+                        voiced.append(frame)
+                        recent = list(ring)[-END_PAD:]             # last ~360 ms
+                        ended = len(recent) >= END_PAD and sum(1 for _, s in recent if not s) >= END_UNVOICED
+                        if ended or len(voiced) >= MAX_UTTER_FRAMES:
+                            triggered = False
+                            _flush_async(np.concatenate(voiced))
+                            voiced = []
+                            ring.clear()
+
+            if triggered and voiced:                 # flush an in-progress utterance on mic-off
+                _flush_async(np.concatenate(voiced))
 
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Voice error: {exc}"})
