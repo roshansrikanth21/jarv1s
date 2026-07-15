@@ -157,6 +157,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         if (d.type === "emotion" && d.emotion) setMood(d.emotion);
         if (d.type === "transcription" || d.type === "transcript") addRef.current("user", txt);
         if (d.type === "llm_chunk" && d.text) setStream(p => p + (d.text as string));
+        if (d.type === "llm_reset") setStream("");   // model dumped a tool-call as text; discard it
         if (d.type === "llm_response" || d.type === "response") { setStream(""); addRef.current("agent", txt); }
         if (d.type === "tts_audio" && d.data) playTts(d.data as string);
         if ((d.type === "system" || d.type === "tts_error") && txt.trim()) {

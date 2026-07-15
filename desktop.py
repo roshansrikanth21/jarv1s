@@ -167,7 +167,12 @@ def _spawn(argv: list[str]) -> tuple[bool, str]:
 
 # ── actions ─────────────────────────────────────────────────────────────────────
 def open_path(path: str) -> str:
-    """Open a file or folder in Explorer (or its default handler)."""
+    """Open a file/folder/app the way a user means "open X":
+      • executable (.exe/.com/.bat/.cmd) → LAUNCH it (so "open notepad/chrome" actually
+        starts the app, instead of revealing it in Explorer);
+      • folder → open it in Explorer;
+      • document → open in its default handler.
+    os.startfile does exactly this per-type; explorer.exe <exe> would only reveal the file."""
     if not IS_WINDOWS:
         return _NOT_WINDOWS
     p = (path or "").strip()
@@ -179,8 +184,14 @@ def open_path(path: str) -> str:
         expanded = p
     if not os.path.exists(expanded):
         return f"open_path: no such path: {expanded}"
-    ok, err = _spawn(["explorer.exe", expanded])
-    return f"Opened Explorer at: {expanded}" if ok else f"open_path: {err}"
+    is_exe = os.path.isfile(expanded) and os.path.splitext(expanded)[1].lower() in (
+        ".exe", ".com", ".bat", ".cmd")
+    try:
+        os.startfile(expanded)   # launches exes, opens folders in Explorer, docs in their app
+        return (f"Launched: {expanded}" if is_exe else f"Opened: {expanded}")
+    except Exception as exc:
+        ok, err = _spawn(["explorer.exe", expanded])   # fallback: reveal in Explorer
+        return f"Opened Explorer at: {expanded}" if ok else f"open_path: {exc or err}"
 
 
 def open_settings(page: str) -> str:
