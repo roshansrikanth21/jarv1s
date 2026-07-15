@@ -106,7 +106,26 @@ except ImportError:
     _HAS_ANTHROPIC = False
     USE_CLAUDE = False
 
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+# GROQ_API_KEY may hold ONE key or SEVERAL (comma/space/newline-separated). With more than
+# one, JARVIS auto-rotates to the next on a rate-limit or auth failure — so when a free-tier
+# key exhausts its daily/minute quota, the next key picks up seamlessly instead of the brain
+# going dead. Add keys any time by editing .env: GROQ_API_KEY=gsk_aaa,gsk_bbb,gsk_ccc
+GROQ_API_KEYS   = [k for k in re.split(r"[,\s]+", os.environ.get("GROQ_API_KEY", "").strip()) if k]
+_groq_key_idx   = 0
+GROQ_API_KEY    = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+
+
+def _rotate_groq_key(reason: str = "") -> bool:
+    """Advance to the next configured Groq key (wrapping). Mutates the module-global
+    GROQ_API_KEY so every subsequent client picks up the new key. Returns True if it actually
+    switched (i.e. more than one key is configured)."""
+    global _groq_key_idx, GROQ_API_KEY
+    if len(GROQ_API_KEYS) <= 1:
+        return False
+    _groq_key_idx = (_groq_key_idx + 1) % len(GROQ_API_KEYS)
+    GROQ_API_KEY = GROQ_API_KEYS[_groq_key_idx]
+    log.warning("Groq key rotated to #%d/%d (%s)", _groq_key_idx + 1, len(GROQ_API_KEYS), reason or "failover")
+    return True
 # Default: gpt-oss-120b — true reasoning model. Keeps chain-of-thought on a hidden
 # channel and returns clean, concise answers (ideal for TTS). 8k TPM is fine for
 # personal use; rate limits degrade gracefully. For max throughput / no throttling
@@ -3108,11 +3127,20 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     # model can't act and (rightly forbidden from fabricating) returns nothing.
     use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
     final_answer = ""
+    keys_tried = 1   # rotate through additional keys on rate-limit, each at most once per turn
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools)
         except _openai_mod.RateLimitError:
-            return "I've hit Groq's per-minute rate limit. Give me a few seconds and ask again."
+            # This key is throttled/exhausted — swap to the next configured key and retry the
+            # round. Only after every key has been tried do we surface the rate-limit message.
+            if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat rate limit"):
+                keys_tried += 1
+                client = _openai_mod.AsyncOpenAI(
+                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                    timeout=GROQ_TIMEOUT, max_retries=0)
+                continue
+            return "I've hit Groq's rate limit on all configured keys. Give me a few seconds and ask again."
         except _openai_mod.APIError:
             # Malformed tool call rejected mid-stream — retry forcing a text answer;
             # prior tool results stay in context.
