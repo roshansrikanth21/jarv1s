@@ -35,6 +35,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+# Normalize OLLAMA_HOST BEFORE any local module import that might `import ollama` at
+# module top-level (models_advisor does). The Ollama Python client builds its default
+# HTTP client at import time from OLLAMA_HOST — if that value is `0.0.0.0:11434`
+# (a common Windows misconfig: `0.0.0.0` is a valid BIND address but not a valid
+# CONNECT address), the default client gets baked with a broken URL and every later
+# `ollama.embeddings/chat/list` fails. Rewrite to loopback for our process.
+_oh = (os.environ.get("OLLAMA_HOST") or "").strip()
+if _oh.startswith("0.0.0.0"):
+    _port = _oh.split(":", 1)[1] if ":" in _oh else "11434"
+    os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{_port}"
+
 import desktop
 import device
 import governor
@@ -270,11 +281,13 @@ async def _lifespan(app: FastAPI):
         cortex.emotion.sync_from_persona(_persona)
     except Exception as _exc:
         log.warning("cortex init failed: %s", _exc)
-    # Background tasks (don't block serving): hardware probe, sleep cycle, ambient.
+    # Background tasks (don't block serving): hardware probe, sleep cycle, ambient,
+    # monitor, proactive silence-break.
     _boot_task = asyncio.create_task(_boot_probe())
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
+    _proactive_task = asyncio.create_task(_proactive_loop())
     # (Cortex init above already embedded every fact + episode via vectors._bootstrap_from_store,
     #  so first recall is warm without a separate task.)
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
@@ -285,7 +298,7 @@ async def _lifespan(app: FastAPI):
     else:
         print("[JARVIS] Dev mode — UI served by Vite on :8080")
     yield
-    for _t in (_boot_task, _sleep_task, _ambient_task, _monitor_task):
+    for _t in (_boot_task, _sleep_task, _ambient_task, _monitor_task, _proactive_task):
         if _t:
             _t.cancel()
 
@@ -349,6 +362,8 @@ _last_read = None                      # last perception.Read (drives prompt + U
 _ambient_task = None                   # background ambient (weather/location) refresher
 _boot_task = None                      # one-shot hardware/local-model probe (off critical path)
 _monitor_task = None                   # proactive CPU/RAM/temp/GPU alerts
+_proactive_task = None                 # proactive silence-break loop (idle → optional suggestion)
+_last_proactive = 0.0                  # timestamp of last proactive utterance (rate-limit)
 _sys_monitor = system_monitor.SystemMonitor()
 _briefing_running = False
 _pending_content_panel: dict | None = None
@@ -1012,11 +1027,9 @@ TOOLS: list[dict] = [
         "function": {
             "name": "desktop",
             "description": (
-                "Control the Windows desktop and installed packages. Use this instead of "
-                "`launch_app` for anything Windows-system-shaped: opening folders/files in "
-                "Explorer, opening Settings pages, Control Panel applets, the Registry, "
-                "system components (Task Manager, Device Manager, Services, …), and "
-                "package management via winget (list installed apps, uninstall an app).\n"
+                "Control the Windows desktop, hardware toggles, mouse/keyboard, "
+                "notifications, webcam, and installed packages. Use this instead of "
+                "`launch_app` for anything Windows-system-shaped.\n"
                 "Actions (pass one per call):\n"
                 "  open_path       — open a file/folder in Explorer. args: path\n"
                 "  open_settings   — open a Settings page. args: page  (apps, display, "
@@ -1030,15 +1043,45 @@ TOOLS: list[dict] = [
                 "  open_component  — args: component  (task_manager, device_manager, "
                 "services, event_viewer, disk_management, resource_monitor, perfmon, "
                 "msconfig, cmd, powershell, gpedit, secpol, notepad, calc, screenshot)\n"
-                "  list_apps       — list installed packages via winget. args: filter "
-                "(optional case-insensitive name substring)\n"
-                "  uninstall_app   — uninstall via winget. args: app (name or exact id), "
-                "confirm (bool, default false). REQUIRES confirm=true to actually run — "
-                "first call is a dry-run showing exactly what would be removed. Pattern: "
-                "call once without confirm (or after `list_apps`) → present the matched "
-                "package + version to the user → wait for their yes → call again with "
-                "confirm=true. If more than one package matches the name, the dry-run "
-                "returns the list so you can narrow down."
+                "  list_apps       — list installed packages via winget. args: filter\n"
+                "  uninstall_app   — uninstall via winget. args: app, confirm. REQUIRES "
+                "confirm=true to actually run — first call is a dry-run showing what "
+                "would be removed. If 2+ packages match, be more specific.\n"
+                "  system_volume   — args: action (up|down|mute|set), level (0-100 for set). "
+                "'set' is approximate.\n"
+                "  brightness      — args: action (up|down|set), level (0-100 for set). "
+                "WMI — works on laptop internal displays only.\n"
+                "  toggle_wifi     — args: state (on|off). Usually needs admin.\n"
+                "  mouse_click     — args: x, y, button (left|right|middle), clicks. "
+                "Absolute screen coords.\n"
+                "  mouse_move      — args: x, y, duration (0-3 seconds).\n"
+                "  mouse_scroll    — args: clicks (+up / -down, capped ±20).\n"
+                "  type_text       — args: text, confirm. Requires confirm=true for text "
+                ">60 chars or containing newlines/tabs. Preview the payload to the user "
+                "and get their yes before setting confirm.\n"
+                "  key_press       — args: keys ('enter' | 'esc' | 'f5' | 'ctrl+c' | "
+                "'cmd+shift+p'). Allowlisted: a-z, 0-9, named keys (enter/esc/tab/space/"
+                "backspace/delete/arrows/home/end/pageup/pagedown/f1-f24), modifiers "
+                "(ctrl/alt/shift/cmd/win).\n"
+                "  notify          — args: title, message, timeout (2-30s). Native OS toast.\n"
+                "  capture_webcam  — args: path (optional). Grabs one frame; returns file "
+                "path. Feed the path to `analyze_image` for vision reasoning.\n"
+                "  window_focus / window_minimize / window_maximize / window_restore / "
+                "window_close — args: title (substring, case-insensitive). Refuses if 0 "
+                "or 2+ windows match — surface the list to the user first.\n"
+                "  window_list     — enumerate visible windows so you can pick one.\n"
+                "  remind          — args: sub_action (schedule|list|cancel), when, "
+                "message, title. `when` accepts ISO ('2026-07-15T15:00'), 'in 5 minutes', "
+                "'tomorrow 9am', 'today 15:00', or 'HH:MM'. Uses OS-native scheduling "
+                "(Windows Task Scheduler) so the toast fires even if JARVIS is closed. "
+                "list returns pending reminders; cancel takes id from schedule/list.\n"
+                "YouTube/Spotify/Netflix playback control: use key_press with media "
+                "keys (playpause / nexttrack / prevtrack / stop / volumemute / volumeup "
+                "/ volumedown) — they work in any focused player.\n"
+                "Safety: destructive/irreversible actions (uninstall_app, long type_text) "
+                "MUST go through the confirm gate. Read-only / navigational actions "
+                "(open_*, list_apps, notify, capture_webcam, mouse_move, window_list, "
+                "remind list) don't."
             ),
             "parameters": {
                 "type": "object",
@@ -1046,7 +1089,13 @@ TOOLS: list[dict] = [
                     "action":    {"type": "string",
                                   "enum": ["open_path", "open_settings", "open_control_panel",
                                            "open_registry", "open_component", "list_apps",
-                                           "uninstall_app"]},
+                                           "uninstall_app", "system_volume", "brightness",
+                                           "toggle_wifi", "mouse_click", "mouse_move",
+                                           "mouse_scroll", "type_text", "key_press",
+                                           "notify", "capture_webcam",
+                                           "window_focus", "window_minimize",
+                                           "window_maximize", "window_restore",
+                                           "window_close", "window_list", "remind"]},
                     "path":      {"type": "string"},
                     "page":      {"type": "string"},
                     "applet":    {"type": "string"},
@@ -1055,6 +1104,26 @@ TOOLS: list[dict] = [
                     "app":       {"type": "string"},
                     "filter":    {"type": "string"},
                     "confirm":   {"type": "boolean"},
+                    "level":     {"type": "integer"},
+                    "state":     {"type": "string"},
+                    "adapter":   {"type": "string"},
+                    "x":         {"type": "integer"},
+                    "y":         {"type": "integer"},
+                    "button":    {"type": "string"},
+                    "clicks":    {"type": "integer"},
+                    "duration":  {"type": "number"},
+                    "text":      {"type": "string"},
+                    "keys":      {"type": "string"},
+                    "title":     {"type": "string"},
+                    "message":   {"type": "string"},
+                    "timeout":   {"type": "integer"},
+                    # p2 additions:
+                    "when":      {"type": "string",
+                                  "description": "For remind: ISO datetime OR 'in 5 minutes' / 'tomorrow 9am' / 'today 15:00' / 'HH:MM'."},
+                    "sub_action":{"type": "string",
+                                  "description": "For remind: schedule | list | cancel."},
+                    "id":        {"type": "string",
+                                  "description": "For remind cancel: the reminder id returned by schedule."},
                 },
                 "required": ["action"],
             },
@@ -1130,7 +1199,13 @@ TOOLS: list[dict] = [
         "type": "function",
         "function": {
             "name": "capture_screen",
-            "description": "Take a screenshot and describe what is currently on the screen.",
+            "description": (
+                "Take a screenshot and describe what is currently on the screen. "
+                "When you call this tool, ALSO speak one short natural line first "
+                "('let me look' / 'checking your screen' / 'one sec, taking a look') "
+                "so there's no awkward silence while the capture runs. The vision "
+                "analysis is your next response after the tool returns."
+            ),
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -2098,6 +2173,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         proc = subprocess.Popen(
             cmd, shell=True, cwd=str(cwd),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:
             out, err = proc.communicate(timeout=30)
@@ -2687,6 +2763,8 @@ _BASE_PROMPT = """You are JARVIS — Just A Rather Very Intelligent System. Pers
 You don't assume things about __USER__ you weren't told — what you know about them comes from your saved memory below, nothing else.
 
 Core style: sharp, direct, and never verbose. Answer directly. If it's a simple question, answer it — don't narrate your process. When you use a tool, report the result, not what you're about to do.
+
+Language matching: reply in the same language the user is using. Match their register too — if they address you formally, do the same; if they're casual, be casual. When the language has a natural respectful vocative (English 'sir', Turkish 'efendim', Japanese 'さん'/'様', Hindi 'ji'/'sahab', Spanish 'señor', French 'monsieur', Arabic 'sayyidi', German 'Herr'), you may use it when it feels natural — sparingly, at most once per reply, and never mixed between languages in the same turn.
 
 Grounding: when a tool returns data, your answer MUST be built from that exact data — quote the real numbers/values it gave you. Never invent or hand-wave a result, and never pad with unrelated facts about the user. If a tool failed or returned nothing, say so plainly.
 
@@ -3433,6 +3511,71 @@ async def _sleep_loop() -> None:
             raise
         except Exception as exc:
             log.warning("sleep/consolidation cycle error: %s", exc)
+
+
+# ── proactive silence-break ─────────────────────────────────────────────────────
+# After N minutes of user inactivity (env JARVIS_PROACTIVE_IDLE_MIN, default 15),
+# JARVIS optionally offers ONE useful line — something to do next given cortex facts
+# + any pending prospective items. Off by default (JARVIS_PROACTIVE=1 to enable) so
+# nobody accidentally has an assistant talking to itself.
+#
+# Guardrails: never mid-conversation, never mid-TTS, never more than once per
+# JARVIS_PROACTIVE_COOLDOWN_MIN (default 45), never on battery, never when muted.
+# The suggestion is generated by the same brain path as a normal reply, so it
+# inherits persona/emotion/memory naturally; TTS uses the existing speak path.
+PROACTIVE_ENABLED = os.environ.get("JARVIS_PROACTIVE", "0") == "1"
+PROACTIVE_IDLE_MIN = int(os.environ.get("JARVIS_PROACTIVE_IDLE_MIN", "15"))
+PROACTIVE_COOLDOWN_MIN = int(os.environ.get("JARVIS_PROACTIVE_COOLDOWN_MIN", "45"))
+
+
+async def _proactive_loop() -> None:
+    """Nudge the user with ONE useful line when they've been quiet a while."""
+    global _last_proactive
+    if not PROACTIVE_ENABLED:
+        return
+    log.info("proactive silence-break enabled — idle=%dmin, cooldown=%dmin",
+             PROACTIVE_IDLE_MIN, PROACTIVE_COOLDOWN_MIN)
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            idle_min = (now - _last_activity) / 60.0
+            since_last = (now - _last_proactive) / 60.0
+            on_ac = (_last_device or {}).get("power_state", "ac") == "ac"
+            busy = _tts_playing or bool(_current_task and not _current_task.done())
+            if not (idle_min >= PROACTIVE_IDLE_MIN and since_last >= PROACTIVE_COOLDOWN_MIN
+                    and on_ac and not busy and not _sleeping):
+                continue
+            # Pull a bit of context so the suggestion isn't disembodied.
+            try:
+                pending = cortex.store.pending_prospective(limit=3) or []
+            except Exception:
+                pending = []
+            pending_lines = "; ".join(p.get("description", "") for p in pending) or "(none)"
+            prompt = (
+                "The user hasn't said anything in a while. Speak ONE short line that's "
+                "genuinely useful — no small talk, no 'how can I help', no self-reference. "
+                "If there's a pending item, mention it. If nothing obvious, silence is "
+                "better than filler — reply with the literal text SKIP to say nothing.\n"
+                f"pending items: {pending_lines}"
+            )
+            try:
+                # Reuse the cortex router (small/fast model, no tools, JSON off).
+                line = (await cortex.router.route("reflection", prompt) or "").strip()
+            except Exception as exc:
+                log.info("proactive: brain call skipped (%s)", exc)
+                continue
+            if not line or line.upper().startswith("SKIP"):
+                continue
+            # One line, cap length.
+            line = line.splitlines()[0].strip()[:220]
+            _last_proactive = now
+            log.info("proactive: %r", line)
+            await _emit_final(line)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("proactive loop error: %s", exc)
 
 
 async def _pull_model(model: str) -> None:

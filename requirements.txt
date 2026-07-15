@@ -52,6 +52,13 @@ mem0ai
 # Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama
 
+# Mouse / keyboard control for the `desktop` tool (mouse_click, type_text, key_press …)
+pyautogui
+
+# Native OS toast notifications for `desktop.notify` (Windows Action Center / macOS /
+# Linux libnotify — one API, cross-platform).
+plyer
+
 # Web search — optional faster DDG client (falls back to HTML scrape)
 duckduckgo-search
 

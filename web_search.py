@@ -36,7 +36,10 @@ def _ddg_html(query: str, max_results: int = 6) -> list[dict[str, str]]:
     return out
 
 
-def _ddg_api(query: str, max_results: int = 6) -> list[dict[str, str]]:
+def _ddg_api(query: str, max_results: int = 6, *, kind: str = "text") -> list[dict[str, str]]:
+    """DDG API-backed search. `kind='news'` uses ddgs.news() which returns real article
+    URLs with sources + timestamps — much better than ddgs.text() for news queries,
+    which returns website homepages instead of articles."""
     try:
         try:
             from ddgs import DDGS  # type: ignore
@@ -44,12 +47,24 @@ def _ddg_api(query: str, max_results: int = 6) -> list[dict[str, str]]:
             from duckduckgo_search import DDGS  # type: ignore
         results: list[dict[str, str]] = []
         with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=max_results):
-                results.append({
-                    "title": r.get("title", ""),
-                    "snippet": r.get("body", ""),
-                    "url": r.get("href", ""),
-                })
+            if kind == "news":
+                for r in ddgs.news(query, max_results=max_results):
+                    # news() returns: date, title, body, url, image, source
+                    src = r.get("source", "") or ""
+                    date = (r.get("date", "") or "")[:10]   # yyyy-mm-dd slice
+                    header = f"{src} — {date}" if (src or date) else ""
+                    results.append({
+                        "title":   r.get("title", "") or "",
+                        "snippet": (f"[{header}] " if header else "") + (r.get("body", "") or ""),
+                        "url":     r.get("url", "") or "",
+                    })
+            else:
+                for r in ddgs.text(query, max_results=max_results):
+                    results.append({
+                        "title":   r.get("title", "") or "",
+                        "snippet": r.get("body", "") or "",
+                        "url":     r.get("href", "") or "",
+                    })
         if results:
             return results
     except Exception:
@@ -113,7 +128,10 @@ def search(
         title = f"COMPARE — {', '.join(items[:3])}"
     else:
         shaped = _shape_query(query, mode, items, aspect)
-        results = _ddg_api(shaped, max_results=max_results if mode != "research" else 8)
+        # News mode → ddgs.news() for real article URLs with source+date, not homepages.
+        kind = "news" if mode == "news" else "text"
+        results = _ddg_api(shaped, max_results=max_results if mode != "research" else 8,
+                           kind=kind)
         label = mode.upper()
         title = f"{label} — {query[:48]}"
         text = _format_results(shaped, results, header=f"{label}: {query}")
@@ -123,8 +141,9 @@ def search(
 
 
 def fetch_headlines(n: int = 5) -> tuple[list[str], str]:
-    """Headlines for morning briefing — returns (titles, full_display_text)."""
-    results = _ddg_api("world news today headlines", max_results=max(n, 6))
+    """Headlines for morning briefing — returns (titles, full_display_text).
+    Uses ddgs.news() so we get real article URLs with sources + dates, not homepages."""
+    results = _ddg_api("world news today headlines", max_results=max(n, 6), kind="news")
     titles = [r["title"] for r in results if r.get("title")][:n]
     body = _format_results("world news today", results, header="Latest headlines")
     return titles, body
