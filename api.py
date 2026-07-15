@@ -4018,9 +4018,11 @@ def _voice_worker() -> None:
                             blocksize=CHUNK, callback=_cb, device=_dev or None):
             broadcast_from_thread({"type": "system", "text": "Mic online. Listening..."})
 
-            # Auto-calibrate to the ambient noise floor (unless disabled) so quiet AND noisy
-            # mics both work: sample ~1s of room tone, set thresholds relative to it.
-            if os.environ.get("JARVIS_MIC_AUTOCAL", "1") != "0":
+            # Auto-calibrate to the ambient noise floor (unless the threshold is set explicitly)
+            # so quiet AND noisy mics both work. The threshold SCALES with the room and has a
+            # low floor, so a modest-gain mic still triggers — the old fixed 650 was too high
+            # for quiet mics (it heard you but never crossed the bar).
+            if os.environ.get("JARVIS_MIC_AUTOCAL", "1") != "0" and not os.environ.get("JARVIS_MIC_SPEECH_THRESH"):
                 floor: list = []
                 cal_until = time.time() + 1.0
                 while time.time() < cal_until:
@@ -4030,9 +4032,10 @@ def _voice_worker() -> None:
                         break
                 if len(floor) >= 3:
                     noise = sorted(floor)[len(floor) // 2]  # median room tone
-                    SPEECH_THRESH = max(SPEECH_THRESH, int(noise * 2.8) + 120)
-                    SILENCE_THRESH = max(60, min(SPEECH_THRESH - 100, int(noise * 1.4) + 40))
+                    SPEECH_THRESH = max(220, int(noise * 6) + 80)   # scales with room; sensitive on quiet mics
+                    SILENCE_THRESH = max(60, min(SPEECH_THRESH - 80, int(noise * 2) + 40))
                     log.info("voice: calibrated — noise=%d speech=%d silence=%d", noise, SPEECH_THRESH, SILENCE_THRESH)
+            broadcast_from_thread({"type": "voice", "state": "listening", "thresh": SPEECH_THRESH})
 
             recording = False
             utterance: list = []
@@ -4050,14 +4053,20 @@ def _voice_worker() -> None:
                 # wake-word gate + echo guard in _flush(), not by muting.
                 energy = int(np.abs(chunk).mean())
                 level_tick += 1
-                if level_tick % 4 == 0:
-                    broadcast_from_thread({"type": "audio_level", "level": min(energy * 5, 32767)})
+                if level_tick % 2 == 0:
+                    # Include raw energy + the live threshold so the UI can draw a real meter
+                    # with a trigger line, and light up the moment you cross it.
+                    broadcast_from_thread({"type": "audio_level",
+                                           "level": min(energy * 5, 32767),
+                                           "energy": energy, "thresh": SPEECH_THRESH,
+                                           "hearing": recording or energy > SPEECH_THRESH})
 
                 if not recording:
                     if energy > SPEECH_THRESH:
                         recording = True
                         utterance = [chunk]
                         silence_cnt = 0
+                        broadcast_from_thread({"type": "voice", "state": "hearing"})
                 else:
                     utterance.append(chunk)
                     if energy < SILENCE_THRESH:
@@ -4065,8 +4074,10 @@ def _voice_worker() -> None:
                         if silence_cnt >= SILENCE_CHUNKS:
                             recording = False
                             silence_cnt = 0
+                            broadcast_from_thread({"type": "voice", "state": "transcribing"})
                             _flush(utterance)
                             utterance = []
+                            broadcast_from_thread({"type": "voice", "state": "listening"})
                     else:
                         silence_cnt = 0
 
