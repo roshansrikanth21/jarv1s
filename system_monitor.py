@@ -24,11 +24,14 @@ DEFAULT_THRESHOLDS = {
 }
 
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
 def _gpu_usage() -> float:
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=2,
+            capture_output=True, text=True, timeout=2, creationflags=_NO_WINDOW,
         )
         if r.returncode == 0:
             vals = [float(v.strip()) for v in r.stdout.strip().split("\n") if v.strip()]
@@ -58,7 +61,7 @@ def _cpu_temp() -> float:
                     "(Get-WmiObject MSAcpi_ThermalZoneTemperature "
                     "-Namespace root/wmi).CurrentTemperature",
                 ],
-                capture_output=True, text=True, timeout=3,
+                capture_output=True, text=True, timeout=3, creationflags=_NO_WINDOW,
             )
             if r.returncode == 0 and r.stdout.strip():
                 raw = float(r.stdout.strip().split("\n")[0])

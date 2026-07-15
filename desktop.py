@@ -134,11 +134,16 @@ def _find_winget() -> str | None:
     return str(p) if p.exists() else None
 
 
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)   # Windows: suppress console flash
+
+
 def _run(argv: list[str], *, capture: bool = False, timeout: int = 30) -> tuple[int, str, str]:
-    """Bounded subprocess. argv (never shell=True). Returns (rc, stdout, stderr)."""
+    """Bounded subprocess. argv (never shell=True). CREATE_NO_WINDOW on Windows so calls
+    to powershell/netsh/reg/winget never flash a cmd window. Returns (rc, stdout, stderr)."""
     try:
         proc = subprocess.run(argv, capture_output=capture, text=capture,
-                              encoding="utf-8", errors="replace", timeout=timeout)
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              creationflags=_NO_WINDOW)
     except FileNotFoundError:
         return 127, "", f"{argv[0]}: not found"
     except subprocess.TimeoutExpired:
@@ -379,9 +384,311 @@ def uninstall_app(app: str, confirm: bool = False) -> str:
     return f"uninstall_app failed (rc={rc}) for {exact_id}.\n{summary}"
 
 
+# ── system control (volume / brightness / wifi) ─────────────────────────────────
+# All Windows-only. Zero pip deps — uses PowerShell + WMI + netsh, which ship with Windows.
+
+_VK = {"volume_mute": 173, "volume_down": 174, "volume_up": 175}
+
+
+def system_volume(action: str, level: int | None = None) -> str:
+    """System volume: up | down | mute | set (with level 0-100).
+    `set` is approximate — issued as N up/down presses (~2% per press) rather than a
+    Core Audio API call. Exact level requires pycaw; kept dep-free on purpose."""
+    if not IS_WINDOWS:
+        return _NOT_WINDOWS
+    act = (action or "").strip().lower()
+    if act not in ("up", "down", "mute", "set"):
+        return "system_volume: action must be up|down|mute|set."
+    if act == "set":
+        if level is None:
+            return "system_volume: set requires level (0-100)."
+        try:
+            lvl = max(0, min(100, int(level)))
+        except (TypeError, ValueError):
+            return "system_volume: level must be an integer 0-100."
+        # Ensure the floor (50 downs is more than enough for any preset), then N ups.
+        cmds = (["(New-Object -ComObject WScript.Shell).SendKeys([char]174)"] * 50
+                + ["(New-Object -ComObject WScript.Shell).SendKeys([char]175)"] * (lvl // 2))
+        ps = "; ".join(cmds)
+    else:
+        vk = _VK[f"volume_{act}"]
+        ps = f"(New-Object -ComObject WScript.Shell).SendKeys([char]{vk})"
+    rc, _, err = _run(["powershell.exe", "-NoProfile", "-Command", ps],
+                      capture=True, timeout=10)
+    if rc == 0:
+        return f"volume: {act}" + (f" (~{level}%)" if act == "set" else "")
+    return f"system_volume failed: {(err or '').strip()[:160]}"
+
+
+def brightness(action: str, level: int | None = None) -> str:
+    """Screen brightness: up | down | set (level 0-100). Uses WMI — works on laptop
+    internal displays that support DDC. External monitors and desktops usually can't be
+    controlled this way (that's a hardware limit, not a bug)."""
+    if not IS_WINDOWS:
+        return _NOT_WINDOWS
+    act = (action or "").strip().lower()
+    if act not in ("up", "down", "set"):
+        return "brightness: action must be up|down|set."
+    if act == "set":
+        if level is None:
+            return "brightness: set requires level (0-100)."
+        try:
+            target = max(0, min(100, int(level)))
+        except (TypeError, ValueError):
+            return "brightness: level must be an integer 0-100."
+    else:
+        query = ("$b = (Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightness "
+                 "-ErrorAction SilentlyContinue).CurrentBrightness; "
+                 "if ($b -eq $null) { 50 } else { $b }")
+        rc, out, _ = _run(["powershell.exe", "-NoProfile", "-Command", query],
+                          capture=True, timeout=8)
+        try:
+            current = int((out or "50").strip().splitlines()[-1])
+        except Exception:
+            current = 50
+        target = min(100, current + 10) if act == "up" else max(0, current - 10)
+    ps = (f"(Get-WmiObject -Namespace root/wmi -Class WmiMonitorBrightnessMethods "
+          f"-ErrorAction Stop).WmiSetBrightness(1, {target}) | Out-Null")
+    rc, _, err = _run(["powershell.exe", "-NoProfile", "-Command", ps],
+                      capture=True, timeout=8)
+    if rc == 0:
+        return f"brightness: {target}%"
+    return (f"brightness failed (WMI brightness only works on laptop displays with DDC "
+            f"support): {(err or '').strip()[:160]}")
+
+
+def toggle_wifi(state: str, adapter: str = "Wi-Fi") -> str:
+    """Enable / disable the named network adapter (default 'Wi-Fi'). Usually needs admin;
+    the underlying netsh call will return the error verbatim if it doesn't have rights."""
+    if not IS_WINDOWS:
+        return _NOT_WINDOWS
+    s = (state or "").strip().lower()
+    if s in ("on", "enable"):
+        op = "enable"
+    elif s in ("off", "disable"):
+        op = "disable"
+    else:
+        return "toggle_wifi: state must be on|off."
+    rc, out, err = _run(["netsh.exe", "interface", "set", "interface",
+                         adapter, op], capture=True, timeout=10)
+    if rc == 0:
+        return f"Wi-Fi ({adapter}): {op}d"
+    msg = (err or out or "").strip()[:220]
+    return (f"toggle_wifi failed: {msg}. Usually this needs admin — right-click PowerShell "
+            "> Run as administrator, or toggle it in Settings > Network.")
+
+
+# ── mouse + keyboard control (via pyautogui — lazy import) ─────────────────────
+def _pyautogui():
+    """Lazy import so hosts without pyautogui installed can still use every other
+    desktop action. Callers get a clear string error instead of a hard ImportError."""
+    try:
+        import pyautogui
+        # Failsafe: pyautogui raises when the mouse hits (0,0), a physical panic-abort.
+        # Leave it enabled — it's a real safety on a machine driven by an LLM.
+        pyautogui.FAILSAFE = True
+        return pyautogui
+    except Exception as exc:
+        raise RuntimeError(
+            f"pyautogui not installed ({exc}). Run `pip install pyautogui` "
+            "in the JARVIS venv.")
+
+
+def _screen_bounds() -> tuple[int, int] | None:
+    try:
+        pa = _pyautogui()
+        return pa.size()
+    except Exception:
+        return None
+
+
+def mouse_click(x: int, y: int, button: str = "left", clicks: int = 1) -> str:
+    """Click at absolute screen coords. Left/right/middle. clicks capped at 3."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    if button not in ("left", "right", "middle"):
+        return "mouse_click: button must be left|right|middle."
+    try:
+        xi, yi = int(x), int(y)
+        n = max(1, min(3, int(clicks)))
+    except (TypeError, ValueError):
+        return "mouse_click: x/y/clicks must be integers."
+    size = _screen_bounds()
+    if size and (xi < 0 or yi < 0 or xi >= size[0] or yi >= size[1]):
+        return f"mouse_click: ({xi},{yi}) is off-screen (screen is {size[0]}x{size[1]})."
+    try:
+        pa.click(xi, yi, clicks=n, button=button)
+        return f"clicked ({xi},{yi}) {button} x{n}"
+    except Exception as exc:
+        return f"mouse_click failed: {exc}"
+
+
+def mouse_move(x: int, y: int, duration: float = 0.0) -> str:
+    """Move the pointer to absolute screen coords. duration in seconds (0..3)."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    try:
+        xi, yi = int(x), int(y)
+        d = max(0.0, min(3.0, float(duration)))
+    except (TypeError, ValueError):
+        return "mouse_move: x/y must be int; duration must be number."
+    try:
+        pa.moveTo(xi, yi, duration=d)
+        return f"mouse at ({xi},{yi})"
+    except Exception as exc:
+        return f"mouse_move failed: {exc}"
+
+
+def mouse_scroll(clicks: int) -> str:
+    """Scroll wheel — positive is up, negative is down."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    try:
+        n = max(-20, min(20, int(clicks)))
+    except (TypeError, ValueError):
+        return "mouse_scroll: clicks must be an integer (-20..20)."
+    try:
+        pa.scroll(n)
+        return f"scrolled {n:+d}"
+    except Exception as exc:
+        return f"mouse_scroll failed: {exc}"
+
+
+def type_text(text: str, confirm: bool = False) -> str:
+    """Type text into whatever window has focus. Requires confirm=true when the payload
+    is > 60 chars OR contains newlines/tabs — otherwise a hallucinated string could dump
+    a whole paragraph into a chat / code editor / terminal. The model must preview it to
+    the user and get a yes first."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    t = "" if text is None else str(text)
+    if not t:
+        return "type_text: text is empty."
+    if not confirm and (len(t) > 60 or "\n" in t or "\t" in t):
+        preview = (t[:60] + "…") if len(t) > 60 else t
+        return (f"type_text: payload is {len(t)} chars and/or has newlines/tabs — "
+                f"preview {preview!r} to the user, then call again with confirm=true.")
+    try:
+        pa.typewrite(t, interval=0.005)   # tiny per-char delay = better key registration
+        return f"typed {len(t)} char(s)"
+    except Exception as exc:
+        return f"type_text failed: {exc}"
+
+
+_ALLOWED_KEYS = frozenset({
+    *"abcdefghijklmnopqrstuvwxyz0123456789",
+    "enter", "return", "esc", "escape", "tab", "backspace", "delete", "space",
+    "up", "down", "left", "right", "home", "end", "pageup", "pagedown", "insert",
+    "capslock", "printscreen", "scrolllock", "pause",
+    *(f"f{i}" for i in range(1, 25)),
+    "ctrl", "control", "alt", "shift", "cmd", "command", "win", "winleft", "winright",
+})
+
+
+def key_press(keys: str) -> str:
+    """Press a single key or a hotkey combo. Single: 'enter' | 'esc' | 'f5' | 'a'.
+    Combo: 'ctrl+c' | 'cmd+shift+p' | 'alt+tab'. Keys are allowlisted — arbitrary
+    unicode strings would be a `type_text` call, not this one."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    seq = str(keys or "").strip().lower()
+    if not seq:
+        return "key_press: needs 'keys'."
+    parts = [p.strip() for p in seq.split("+") if p.strip()]
+    for p in parts:
+        if p not in _ALLOWED_KEYS:
+            return (f"key_press: unknown key {p!r}. Allowed: a-z, 0-9, named keys "
+                    "(enter/esc/tab/space/backspace/delete/arrows/home/end/pageup/pagedown/"
+                    "f1-f24), modifiers (ctrl/alt/shift/cmd/win).")
+    try:
+        if len(parts) == 1:
+            pa.press(parts[0])
+        else:
+            pa.hotkey(*parts)
+        return f"pressed: {seq}"
+    except Exception as exc:
+        return f"key_press failed: {exc}"
+
+
+# ── OS toast notifications ──────────────────────────────────────────────────────
+def notify(title: str, message: str, timeout: int = 5) -> str:
+    """Fire a native OS toast notification via plyer (cross-platform).
+    On Windows this uses the Action Center toast; on macOS AppleScript notifications;
+    on Linux libnotify. Not persistent — fire-and-forget."""
+    try:
+        from plyer import notification
+    except Exception as exc:
+        return (f"notify: plyer not installed ({exc}). "
+                "Run `pip install plyer` in the JARVIS venv.")
+    try:
+        notification.notify(
+            title=(title or "").strip()[:60] or "JARVIS",
+            message=(message or "").strip()[:200] or "",
+            timeout=max(2, min(30, int(timeout))),
+            app_name="JARVIS",
+        )
+        return f"notified: {title!r}"
+    except Exception as exc:
+        return f"notify failed: {exc}"
+
+
+# ── webcam capture ──────────────────────────────────────────────────────────────
+def capture_webcam(save_path: str | None = None) -> str:
+    """Grab one frame from the default webcam. Returns the file path so the model can
+    hand it to `analyze_image` for vision reasoning. opencv is already a JARVIS dep."""
+    try:
+        import cv2
+    except Exception as exc:
+        return f"capture_webcam: opencv not available ({exc})."
+    # DirectShow backend is much friendlier on Windows than the default.
+    backend = cv2.CAP_DSHOW if IS_WINDOWS else 0
+    cap = cv2.VideoCapture(0, backend)
+    if not cap.isOpened():
+        return "capture_webcam: no camera available (or in use by another app)."
+    try:
+        # First read is often black on some drivers — do a couple of warm-up frames.
+        frame = None
+        for _ in range(4):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                break
+        if frame is None:
+            return "capture_webcam: camera opened but returned no frame."
+        import time
+        from pathlib import Path as _P
+        if save_path:
+            out = _P(save_path)
+        else:
+            out_dir = _P(__file__).resolve().parent / "memory" / "webcam"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"webcam_{int(time.time())}.jpg"
+        cv2.imwrite(str(out), frame)
+        return f"captured: {out}"
+    finally:
+        cap.release()
+
+
 # ── one entry point the tool dispatch calls ─────────────────────────────────────
-_ACTIONS = {"open_path", "open_settings", "open_control_panel", "open_registry",
-            "open_component", "list_apps", "uninstall_app"}
+_ACTIONS = {
+    # existing
+    "open_path", "open_settings", "open_control_panel", "open_registry",
+    "open_component", "list_apps", "uninstall_app",
+    # new (Mark-XLVIII parity)
+    "system_volume", "brightness", "toggle_wifi",
+    "mouse_click", "mouse_move", "mouse_scroll",
+    "type_text", "key_press",
+    "notify", "capture_webcam",
+}
 
 
 def run(action: str, args: dict) -> str:
@@ -404,4 +711,33 @@ def run(action: str, args: dict) -> str:
         return list_apps(str(args.get("filter") or ""))
     if act == "uninstall_app":
         return uninstall_app(str(args.get("app") or ""), bool(args.get("confirm")))
+    # new dispatch (Mark-XLVIII parity)
+    if act == "system_volume":
+        return system_volume(str(args.get("action") or args.get("volume_action") or ""),
+                             args.get("level"))
+    if act == "brightness":
+        return brightness(str(args.get("action") or args.get("brightness_action") or ""),
+                          args.get("level"))
+    if act == "toggle_wifi":
+        return toggle_wifi(str(args.get("state") or ""),
+                           str(args.get("adapter") or "Wi-Fi"))
+    if act == "mouse_click":
+        return mouse_click(args.get("x", 0), args.get("y", 0),
+                           str(args.get("button") or "left"),
+                           int(args.get("clicks") or 1))
+    if act == "mouse_move":
+        return mouse_move(args.get("x", 0), args.get("y", 0),
+                          args.get("duration") or 0.0)
+    if act == "mouse_scroll":
+        return mouse_scroll(int(args.get("clicks") or 0))
+    if act == "type_text":
+        return type_text(str(args.get("text") or ""), bool(args.get("confirm")))
+    if act == "key_press":
+        return key_press(str(args.get("keys") or ""))
+    if act == "notify":
+        return notify(str(args.get("title") or ""),
+                      str(args.get("message") or args.get("body") or ""),
+                      int(args.get("timeout") or 5))
+    if act == "capture_webcam":
+        return capture_webcam(args.get("path"))
     return f"desktop: action {act!r} was in _ACTIONS but had no handler — this is a bug."
