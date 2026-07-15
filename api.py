@@ -3918,8 +3918,10 @@ def _voice_worker() -> None:
 
     RATE = 16000
     CHUNK = 1024            # ~64ms per callback at 16kHz
-    SPEECH_THRESH = 650     # mean absolute value → speech onset (raised: ignore ambient noise)
-    SILENCE_THRESH = 150    # mean absolute value → silence
+    # Thresholds are env-tunable AND auto-calibrated to the room below — a hardcoded value is
+    # the #1 reason voice "doesn't hear me" (quiet mic) or "triggers on nothing" (noisy mic).
+    SPEECH_THRESH = int(os.environ.get("JARVIS_MIC_SPEECH_THRESH", "650"))
+    SILENCE_THRESH = int(os.environ.get("JARVIS_MIC_SILENCE_THRESH", "150"))
     SILENCE_CHUNKS = 12     # ~0.8 s of trailing silence ends the utterance (snappier)
     MIN_UTTER_CHUNKS = 8    # ignore sub-~0.5s blips (claps, key taps, coughs)
 
@@ -4004,10 +4006,33 @@ def _voice_worker() -> None:
             _act(cmd)
         # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
+    # optional explicit mic device (JARVIS_MIC_DEVICE = index or name substring)
+    _dev = os.environ.get("JARVIS_MIC_DEVICE")
+    try:
+        _dev = int(_dev) if _dev and _dev.strip().lstrip("-").isdigit() else _dev
+    except Exception:
+        pass
+
     try:
         with sd.InputStream(samplerate=RATE, channels=1, dtype="int16",
-                            blocksize=CHUNK, callback=_cb):
+                            blocksize=CHUNK, callback=_cb, device=_dev or None):
             broadcast_from_thread({"type": "system", "text": "Mic online. Listening..."})
+
+            # Auto-calibrate to the ambient noise floor (unless disabled) so quiet AND noisy
+            # mics both work: sample ~1s of room tone, set thresholds relative to it.
+            if os.environ.get("JARVIS_MIC_AUTOCAL", "1") != "0":
+                floor: list = []
+                cal_until = time.time() + 1.0
+                while time.time() < cal_until:
+                    try:
+                        floor.append(int(np.abs(audio_q.get(timeout=0.3)).mean()))
+                    except Q.Empty:
+                        break
+                if len(floor) >= 3:
+                    noise = sorted(floor)[len(floor) // 2]  # median room tone
+                    SPEECH_THRESH = max(SPEECH_THRESH, int(noise * 2.8) + 120)
+                    SILENCE_THRESH = max(60, min(SPEECH_THRESH - 100, int(noise * 1.4) + 40))
+                    log.info("voice: calibrated — noise=%d speech=%d silence=%d", noise, SPEECH_THRESH, SILENCE_THRESH)
 
             recording = False
             utterance: list = []
