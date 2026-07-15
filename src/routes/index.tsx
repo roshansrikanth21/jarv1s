@@ -10,6 +10,7 @@ import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { BootIntro } from "@/components/jarvis/BootIntro";
 import { LiveOps } from "@/components/jarvis/LiveOps";
+import { MicMonitor } from "@/components/jarvis/MicMonitor";
 import { SettingsPanel } from "@/components/jarvis/SettingsPanel";
 
 export const Route = createFileRoute("/")({
@@ -154,6 +155,8 @@ function Page() {
           />
           {/* Ground-truth feed of real tool executions — proves what JARVIS actually ran. */}
           <LiveOps />
+          {/* Live mic indicator — reacts to your voice so you can SEE it's hearing you. */}
+          <MicMonitor />
         </>
       )}
     </>
