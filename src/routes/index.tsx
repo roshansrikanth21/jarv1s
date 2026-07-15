@@ -5,6 +5,7 @@ import FocusDeck from "@/decks/focus";
 import TerminalDeck from "@/decks/terminal";
 import PrimeDeck from "@/decks/prime";
 import ChatDeck from "@/decks/chat";
+import StarkDeck from "@/decks/stark";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { BootIntro } from "@/components/jarvis/BootIntro";
@@ -37,6 +38,7 @@ export const Route = createFileRoute("/")({
 // duplicate `classic` deck was retired; saved prefs pointing at it migrate below.
 const PRESETS = [
   { id: "prime", label: "Prime" },
+  { id: "stark", label: "Stark" },
   { id: "overhaul", label: "Command Deck" },
   { id: "focus", label: "Focus" },
   { id: "terminal", label: "Terminal" },
@@ -44,6 +46,7 @@ const PRESETS = [
 ];
 const DECKS = {
   prime: PrimeDeck,
+  stark: StarkDeck,
   overhaul: OverhaulDeck,
   focus: FocusDeck,
   terminal: TerminalDeck,
@@ -185,6 +188,7 @@ function BootScreen() {
 
 const PRESET_ACCENT: Record<string, string> = {
   prime: "#c4a5ff",
+  stark: "#5fdcff",
   overhaul: "#f0b060",
   focus: "#5ec8e8",
   terminal: "#41ff6e",
