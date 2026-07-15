@@ -2,7 +2,7 @@ import electron from "electron";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 
 const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage, screen, dialog } = electron;
 
@@ -156,15 +156,44 @@ function resolvePythonPath() {
   const venvPy = (root) =>
     isWindows ? path.join(root, "venv", "Scripts", "python.exe") : path.join(root, "venv", "bin", "python");
 
-  const candidates = [
-    process.env.JARVIS_PYTHON,        // explicit override
-    venvPy(appRoot),                  // venv inside the repo (portable)
-    venvPy(path.resolve(appRoot, "..")), // venv one level up (e.g. C:\Users\rosha\venv)
-    isWindows ? "py" : "python3",
-    "python",
-  ].filter(Boolean);
-  const found = candidates.find((candidate) => candidate === "py" || candidate === "python3" || candidate === "python" || fs.existsSync(candidate));
-  return { path: found, isPackaged: false };
+  // A backend interpreter is only usable if it has the native deps the voice pipeline needs
+  // (faster_whisper + webrtcvad + sounddevice). The global `py`/`python` on this machine has
+  // only partial deps AND a Smart-App-Control block on faster_whisper's DLL — launching it
+  // silently degrades voice (no local Whisper, crude VAD, noise leaks). So we PROBE each
+  // candidate and pick the first that can actually import them.
+  const hasBackendDeps = (py) => {
+    try {
+      // Stub `av` before importing faster_whisper — exactly like api.py's _import_faster_whisper.
+      // faster_whisper's __init__ pulls in PyAV, whose native DLL is Smart-App-Control-blocked on
+      // this machine; the mic hands raw PCM so PyAV is never actually needed. This probe mirrors
+      // the real import path so it accepts an interpreter that api.py can genuinely run voice on.
+      const probe = "import sys,types; sys.modules.setdefault('av', types.ModuleType('av')); "
+                  + "import faster_whisper, webrtcvad, sounddevice, openai, edge_tts";
+      const args = (py === "py" ? ["-3"] : []).concat(["-c", probe]);
+      execFileSync(py, args, { stdio: "ignore", timeout: 20000 });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const explicit = process.env.JARVIS_PYTHON;               // trust an explicit override outright
+  const venvs = [venvPy(appRoot), venvPy(path.resolve(appRoot, ".."))].filter(fs.existsSync);
+  const systemPys = isWindows ? ["py", "python"] : ["python3", "python"];
+
+  // Order: explicit override, then any real venv, then system pythons. Prefer the first that
+  // PASSES the dep probe; if none pass, fall back to the first that at least exists/runs so the
+  // app still boots (backend will surface a clear "voice deps missing" message itself).
+  const ordered = [explicit, ...venvs, ...systemPys].filter(Boolean);
+  const withDeps = ordered.find(hasBackendDeps);
+  if (withDeps) return { path: withDeps, isPackaged: false, verified: true };
+
+  const anyRunnable = ordered.find(
+    (c) => c === "py" || c === "python3" || c === "python" || fs.existsSync(c),
+  );
+  console.warn("[Electron] WARNING: no Python interpreter with full backend deps found — "
+             + "voice features may be degraded. Install requirements.txt into the venv.");
+  return { path: anyRunnable, isPackaged: false, verified: false };
 }
 
 async function isBackendReady() {
