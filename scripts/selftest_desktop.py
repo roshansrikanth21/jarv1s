@@ -258,6 +258,143 @@ def run() -> int:
     ok("injection-y id is passed as a single argv element (no shell splitting)",
        any("x; rm -rf /" in c for c in ran), str(ran))
 
+    # ── Mark-XLVIII parity: system control + mouse/keyboard + notify + webcam ──
+    section("system_volume — up/down/mute/set + validation")
+    _reset()
+    out = desktop.run("system_volume", {"action": "mute"})
+    ok("mute → powershell SendKeys VK_VOLUME_MUTE (173)",
+       _run_calls and "powershell.exe" in _run_calls[-1] and "[char]173" in _run_calls[-1][-1], out[:80])
+    _reset()
+    out = desktop.run("system_volume", {"action": "set", "level": 50})
+    ok("set 50% emits ~25 up-presses on top of the floor",
+       _run_calls[-1][-1].count("[char]175") == 25, out[:80])
+    _reset()
+    out = desktop.run("system_volume", {"action": "bogus"})
+    ok("unknown volume action errors, does not shell out",
+       "must be up|down|mute|set" in out and not _run_calls, out)
+    out = desktop.run("system_volume", {"action": "set"})
+    ok("set without level errors clearly", "requires level" in out, out)
+
+    section("brightness — up/down/set + WMI call shape")
+    _reset()
+    _run_responses[""] = (0, "", "")   # any powershell call → success stub
+    def _brightness_run(argv, capture=False, timeout=30):
+        _run_calls.append(list(argv))
+        # First call is the read (returns "60"); second is the write.
+        if "CurrentBrightness" in " ".join(argv):
+            return (0, "60", "")
+        return (0, "", "")
+    desktop._run = _brightness_run
+    out = desktop.run("brightness", {"action": "up"})
+    ok("up reads current then writes current+10 via WmiSetBrightness",
+       any("WmiSetBrightness(1, 70)" in " ".join(c) for c in _run_calls), out)
+    # Restore the standard stub for later sections
+    _install_stubs(); desktop._find_winget = lambda: "winget"
+    _reset()
+    out = desktop.run("brightness", {"action": "set", "level": 30})
+    ok("set 30 goes straight to WmiSetBrightness(1, 30)",
+       any("WmiSetBrightness(1, 30)" in " ".join(c) for c in _run_calls), out)
+    out = desktop.run("brightness", {"action": "bogus"})
+    ok("unknown brightness action errors", "must be up|down|set" in out)
+
+    section("toggle_wifi — netsh enable/disable")
+    _reset()
+    out = desktop.run("toggle_wifi", {"state": "off"})
+    ok("off → netsh interface set interface Wi-Fi disable",
+       _run_calls and _run_calls[-1][:4] == ["netsh.exe", "interface", "set", "interface"]
+       and "disable" in _run_calls[-1], str(_run_calls[-1] if _run_calls else []))
+    _reset()
+    out = desktop.run("toggle_wifi", {"state": "on", "adapter": "Ethernet"})
+    ok("custom adapter name is passed to netsh",
+       _run_calls and "Ethernet" in _run_calls[-1] and "enable" in _run_calls[-1])
+    out = desktop.run("toggle_wifi", {"state": "bogus"})
+    ok("unknown state errors, no netsh call", "state must be on|off" in out)
+
+    section("mouse + keyboard — allowlisted keys, off-screen guard, type_text confirm")
+    class _FakePA:
+        def __init__(self):
+            self.calls = []; self.FAILSAFE = True
+        def size(self): return (1920, 1080)
+        def click(self, x, y, clicks=1, button="left"): self.calls.append(("click", x, y, clicks, button))
+        def moveTo(self, x, y, duration=0): self.calls.append(("moveTo", x, y, duration))
+        def scroll(self, n): self.calls.append(("scroll", n))
+        def typewrite(self, s, interval=0): self.calls.append(("typewrite", s, interval))
+        def press(self, k): self.calls.append(("press", k))
+        def hotkey(self, *keys): self.calls.append(("hotkey", keys))
+    fake_pa = _FakePA()
+    desktop._pyautogui = lambda: fake_pa
+
+    out = desktop.run("mouse_click", {"x": 100, "y": 200, "button": "left"})
+    ok("mouse_click at valid coords records the call",
+       ("click", 100, 200, 1, "left") in fake_pa.calls, out)
+    out = desktop.run("mouse_click", {"x": 5000, "y": 5000})
+    ok("off-screen click is refused",
+       "off-screen" in out and ("click", 5000, 5000, 1, "left") not in fake_pa.calls)
+    out = desktop.run("mouse_click", {"x": 100, "y": 100, "button": "elbow"})
+    ok("unknown mouse button errors", "button must be" in out)
+
+    out = desktop.run("mouse_move", {"x": 200, "y": 300, "duration": 0.5})
+    ok("mouse_move records the call",
+       ("moveTo", 200, 300, 0.5) in fake_pa.calls)
+    out = desktop.run("mouse_scroll", {"clicks": -3})
+    ok("mouse_scroll records the call", ("scroll", -3) in fake_pa.calls)
+    out = desktop.run("mouse_scroll", {"clicks": 999})
+    ok("mouse_scroll clamps at ±20", ("scroll", 20) in fake_pa.calls)
+
+    out = desktop.run("type_text", {"text": "hello"})
+    ok("short type_text just types",
+       any(c[0] == "typewrite" and c[1] == "hello" for c in fake_pa.calls))
+    out = desktop.run("type_text", {"text": "x" * 100})
+    ok("type_text >60 chars refuses without confirm",
+       "call again with confirm=true" in out
+       and not any(c[0] == "typewrite" and c[1] == "x" * 100 for c in fake_pa.calls))
+    out = desktop.run("type_text", {"text": "x" * 100, "confirm": True})
+    ok("type_text >60 chars proceeds with confirm=true",
+       any(c[0] == "typewrite" and c[1] == "x" * 100 for c in fake_pa.calls))
+    out = desktop.run("type_text", {"text": "line1\nline2"})
+    ok("type_text with newline refuses without confirm", "newlines" in out)
+
+    out = desktop.run("key_press", {"keys": "enter"})
+    ok("single key press", ("press", "enter") in fake_pa.calls)
+    out = desktop.run("key_press", {"keys": "ctrl+shift+p"})
+    ok("hotkey combo", ("hotkey", ("ctrl", "shift", "p")) in fake_pa.calls)
+    out = desktop.run("key_press", {"keys": "ctrl+launch_missile"})
+    ok("out-of-allowlist key refused", "unknown key" in out)
+    out = desktop.run("key_press", {"keys": "F5"})
+    ok("F-keys accepted (case-insensitive)", ("press", "f5") in fake_pa.calls)
+
+    section("notify + capture_webcam — degrade gracefully when the underlying lib is missing")
+    # Force `from plyer import notification` to raise so we hit the fallback branch.
+    import builtins
+    _real_import = builtins.__import__
+    def _blocking_import(name, *a, **k):
+        if name == "plyer" or name.startswith("plyer."):
+            raise ImportError("simulated plyer-missing")
+        if name == "cv2":
+            raise ImportError("simulated opencv-missing")
+        return _real_import(name, *a, **k)
+    builtins.__import__ = _blocking_import
+    try:
+        out = desktop.run("notify", {"title": "hi", "message": "there"})
+        ok("notify without plyer returns a helpful install hint",
+           "plyer not installed" in out and "pip install plyer" in out, out)
+        out = desktop.run("capture_webcam", {})
+        ok("capture_webcam without opencv returns a clear error",
+           "opencv not available" in out, out)
+    finally:
+        builtins.__import__ = _real_import
+
+    section("dispatch — new action names are all recognized")
+    for new_act in ("system_volume", "brightness", "toggle_wifi", "mouse_click",
+                    "mouse_move", "mouse_scroll", "type_text", "key_press",
+                    "notify", "capture_webcam"):
+        # Dispatching with missing required args should return a friendly error, not
+        # a "unknown action" — proves the action is wired.
+        _reset()
+        out = desktop.run(new_act, {})
+        ok(f"{new_act:15s} is dispatched (not 'unknown action')",
+           "unknown action" not in out, out[:80])
+
     passed = sum(1 for _, c, _ in _checks if c)
     total = len(_checks)
     print()
