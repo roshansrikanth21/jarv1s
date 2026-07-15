@@ -3298,6 +3298,22 @@ async def _brain_ollama(
             obs = await _run_tool(tc.function.name, _raw_args)
             messages.append({"role": "tool", "content": obs})
 
+    # Small local models often "fumble" tools: they emit an empty answer plus a spurious tool
+    # call for a question that needed none (llama3.2:3b does this on plain Q&A). If the tool
+    # loop yielded nothing usable, ask once more WITHOUT tools so the model just answers — far
+    # better than handing the user an empty reply and dead-ending the whole fallback.
+    if not final_answer:
+        try:
+            response = await client.chat(
+                model=model,
+                messages=[{"role": "system", "content": _build_system_prompt(text)}] + history
+                         + [{"role": "user", "content": text}],
+                options=opts,
+            )
+            final_answer = (response.message.content or "").strip()
+        except Exception:
+            pass
+
     return final_answer
 
 
@@ -3404,11 +3420,16 @@ async def _run_rung(rung: str, text: str, dev: dict, decision: dict) -> str:
     return await _brain_ollama(text, list(_history), LOCAL_FAST, decision=decision, device=dev)
 
 
-def _fallback_rung(failed: str, avail: set[str]) -> str | None:
-    """The next rung to try when `failed` produced nothing: the best available alternative.
-    Never auto-escalates into council (heavy + self-emitting) — that stays an explicit choice."""
-    for r in ("cloud_deep", "cloud_fast", "local_deep", "local_fast"):
-        if r != failed and r in avail:
+def _fallback_rung(failed: str, avail: set[str], tried: set[str] | None = None) -> str | None:
+    """The next rung to try when `failed` produced nothing: the best available alternative not
+    already tried. Never auto-escalates into council (heavy + self-emitting).
+
+    local_fast is ordered BEFORE local_deep among locals: on a RAM-tight machine the bigger
+    model OOMs (Ollama 500), so the small model that actually fits should be the first local
+    fallback — otherwise the whole fallback dead-ends on an unloadable model."""
+    tried = tried or set()
+    for r in ("cloud_deep", "cloud_fast", "local_fast", "local_deep"):
+        if r != failed and r in avail and r not in tried:
             return r
     return None
 
@@ -3525,8 +3546,15 @@ async def _run_agent(text: str) -> None:
     # before giving up — instead of handing the user a dead-end "that rung failed".
     escalated = False
     if not answer:
-        fb = _fallback_rung(rung, avail)
-        if fb:
+        # Walk DOWN the lattice through every remaining rung until one answers — not just one
+        # hop. A single fallback dead-ends when e.g. cloud is rate-limited AND the big local
+        # model OOMs; we must keep going to the small local model that actually fits.
+        tried = {rung}
+        while not answer:
+            fb = _fallback_rung(rung, avail, tried)
+            if not fb:
+                break
+            tried.add(fb)
             escalated = True
             await broadcast({"type": "system",
                              "text": f"Escalating to {governor.RUNG_BY_ID.get(fb, {}).get('label', fb)}…"})
