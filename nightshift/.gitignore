@@ -1,0 +1,20 @@
+# Night Shift runtime state — never commit these; they're per-machine, per-night.
+current.json
+.lock
+*.tmp
+logs/
+runs/
+reports/
+work/
+__pycache__/
+
+# ...but keep the empty output dirs in the tree so the engine has somewhere to write.
+!runs/
+!reports/
+!work/
+runs/*
+reports/*
+work/*
+!runs/.gitkeep
+!reports/.gitkeep
+!work/.gitkeep
