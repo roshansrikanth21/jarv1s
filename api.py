@@ -10,6 +10,7 @@ Run: python api.py
 import asyncio
 import atexit
 import base64
+import glob
 import io
 import ipaddress
 import json
@@ -1344,6 +1345,68 @@ _LAUNCH_ALLOWLIST = {
 }
 
 
+def _resolve_launch_target(cmd: str) -> str | None:
+    """Resolve an allowlisted exe to a launchable full path. A bare `Popen("spotify.exe")` only
+    searches PATH, which FAILS for apps that install to per-user dirs (Spotify, Discord). We
+    consult, in order: PATH, the Windows 'App Paths' registry (where most apps register their
+    exe), and a few known per-user locations. Returns a path/command to launch, or None if the
+    app can't be found anywhere (so the caller reports honestly instead of a silent no-op)."""
+    import shutil
+    if shutil.which(cmd):
+        return cmd
+    if os.name == "nt":
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{cmd}") as k:
+                        val, _ = winreg.QueryValueEx(k, None)
+                        if val and os.path.exists(val.strip('"')):
+                            return val.strip('"')
+                except FileNotFoundError:
+                    continue
+        except Exception:
+            pass
+        appdata = os.environ.get("APPDATA", "")
+        local = os.environ.get("LOCALAPPDATA", "")
+        known: dict[str, list[str]] = {
+            "spotify.exe": [os.path.join(appdata, "Spotify", "Spotify.exe")],
+            "discord.exe": sorted(glob.glob(os.path.join(local, "Discord", "app-*", "Discord.exe")), reverse=True),
+            "code": [os.path.join(local, "Programs", "Microsoft VS Code", "Code.exe")],
+            "steam.exe": [r"C:\Program Files (x86)\Steam\steam.exe"],
+        }
+        for p in known.get(cmd, []):
+            if p and os.path.exists(p):
+                return p
+        # Microsoft Store apps (e.g. Spotify from the Store) expose an execution-alias stub here;
+        # running the stub launches the packaged app. This one path covers most Store installs.
+        alias = os.path.join(local, "Microsoft", "WindowsApps", cmd)
+        if os.path.exists(alias):
+            return alias
+    return None
+
+
+def _launch_resolved(raw: str, cmd: str) -> str:
+    """Launch an allowlisted app, resolving per-user install paths first. Reports honestly:
+    only claims success when a process was actually started."""
+    target = _resolve_launch_target(cmd)
+    try:
+        if target:
+            subprocess.Popen([target] if os.path.isabs(target) else target,
+                             shell=not os.path.isabs(target))
+            return f"Launched {raw}."
+        # Last resort: `start` uses ShellExecute, which is App-Paths-aware where a bare exec isn't.
+        if os.name == "nt":
+            rc = subprocess.run(["cmd", "/c", "start", "", cmd], capture_output=True, text=True)
+            if rc.returncode == 0:
+                return f"Launched {raw}."
+            return f"Couldn't find {raw} on this machine — it may not be installed."
+        subprocess.Popen(cmd, shell=True)
+        return f"Launched {raw}."
+    except Exception as exc:
+        return f"Failed to launch {raw}: {exc}"
+
+
 def _next_id(items: list[dict]) -> int:
     return max((int(i.get("id", 0)) for i in items), default=0) + 1
 
@@ -2081,11 +2144,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         if not cmd:
             supported = ", ".join(sorted(_LAUNCH_ALLOWLIST))
             return f"Unknown app '{raw}'. Supported: {supported}"
-        try:
-            subprocess.Popen(cmd, shell=True)
-            return f"Launched {raw}."
-        except Exception as exc:
-            return f"Failed to launch {raw}: {exc}"
+        return _launch_resolved(raw, cmd)
 
     if name == "desktop":
         # Windows-system-shaped ops: Explorer paths, Settings pages, Control Panel,
