@@ -2727,10 +2727,16 @@ def _build_system_prompt(query: str = "") -> str:
     nm = _user_name() or "the user"
     base = _BASE_PROMPT.replace("__USER__", nm)
 
+    # An explicit, authoritative clock line so the model NEVER refuses "what's the time" — it
+    # has this; the softer ambient line alone made it hedge ("I can't tell the time").
+    _now = datetime.now().strftime("%A, %B %-d %Y, %-I:%M %p") if os.name != "nt" \
+        else datetime.now().strftime("%A, %B %d %Y, %I:%M %p")
+    time_line = (f"Right now it is {_now} (local, authoritative — you DO have the current date and "
+                 f"time). Answer any date/time question directly from this; never say you can't.")
     try:
-        ambient_frag = ambient.prompt_fragment() or ""
+        ambient_frag = time_line + "\n" + (ambient.prompt_fragment() or "")
     except Exception:
-        ambient_frag = f"Today: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"
+        ambient_frag = time_line
 
     persona_block = ""
     if persona_mod.ENABLED:
@@ -3295,14 +3301,19 @@ async def _run_agent(text: str) -> None:
         await _emit_final(f"No brain available for {_gov.mode} mode.{mode_hint}")
         return
 
-    # Tool-intent guard: an action/data request must land on a tool-capable brain. The council
-    # has no tools and local models fumble tool-calls, so routing there = guaranteed
-    # hallucination. Force such requests onto cloud tools first, else the best local rung.
-    if _needs_tools(text):
+    # Routing guard. Two misfires to correct before running:
+    #  1. Tool/action requests must land on a tool-capable brain (council has none, local
+    #     models fumble tool-calls) — else hallucination.
+    #  2. The council is a slow (3-model) panel that gets neither tools NOR the ambient system
+    #     prompt, so it can't even answer "what's the time." It should ONLY fire on an explicit
+    #     "deliberate/debate" request (handled upstream in handle_command, never reaching here).
+    #     If the Governor auto-picked it for a normal query, that's a misfire → send to a fast brain.
+    if _needs_tools(text) or decision["rung"] == "council":
         tool_rungs = [r for r in ("cloud_fast", "cloud_deep", "local_deep", "local_fast") if r in avail]
         if tool_rungs and decision["rung"] not in tool_rungs:
-            decision = {**decision, "rung": tool_rungs[0],
-                        "rationale": "forced to a tool-capable brain — request needs a tool; council/other has none"}
+            why = "council auto-pick is slow + can't use tools/context" if decision["rung"] == "council" \
+                  else "request needs a tool; council/other has none"
+            decision = {**decision, "rung": tool_rungs[0], "rationale": f"routed to a fast tool-capable brain — {why}"}
 
     await broadcast({"type": "governor_decision",
                      "decision": _public_decision(decision),
