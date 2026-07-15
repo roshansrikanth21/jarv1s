@@ -590,6 +590,9 @@ _ALLOWED_KEYS = frozenset({
     "capslock", "printscreen", "scrolllock", "pause",
     *(f"f{i}" for i in range(1, 25)),
     "ctrl", "control", "alt", "shift", "cmd", "command", "win", "winleft", "winright",
+    # Media keys — control YouTube/Spotify/Netflix/system audio without opening the app.
+    "playpause", "nexttrack", "prevtrack", "stop",
+    "volumemute", "volumeup", "volumedown",
 })
 
 
@@ -678,16 +681,134 @@ def capture_webcam(save_path: str | None = None) -> str:
         cap.release()
 
 
+# ── window management (via pywin32 if installed, pyautogui.getWindowsWithTitle otherwise) ──
+def _match_windows(title_substr: str) -> list:
+    """Return list of window objects (backend-agnostic) whose title contains
+    `title_substr` (case-insensitive). Empty on no match."""
+    if not title_substr:
+        return []
+    want = title_substr.lower()
+    # Try pyautogui first (falls back through pygetwindow — cross-platform-ish).
+    try:
+        pa = _pyautogui()
+        try:
+            wins = pa.getAllWindows()
+        except Exception:
+            wins = pa.getWindowsWithTitle(title_substr) or []
+        return [w for w in wins if want in (getattr(w, "title", "") or "").lower()]
+    except Exception:
+        return []
+
+
+def _window_action(title: str, op: str) -> str:
+    """One entry point for focus/min/max/close by title substring. Uses the same
+    disambiguation pattern as uninstall_app: 0 matches → error; 2+ → refuse and
+    list; 1 → perform."""
+    if not title:
+        return f"window_{op}: needs 'title' (substring, case-insensitive)."
+    matches = _match_windows(title)
+    if not matches:
+        return f"window_{op}: no window title matched {title!r}."
+    if len(matches) > 1:
+        titles = ", ".join(f"{(getattr(w, 'title', '') or '')!r}" for w in matches[:8])
+        return (f"window_{op}: {len(matches)} windows matched {title!r}: {titles}. "
+                "Be more specific.")
+    w = matches[0]
+    try:
+        if op == "focus":
+            w.activate()
+        elif op == "minimize":
+            w.minimize()
+        elif op == "maximize":
+            w.maximize()
+        elif op == "close":
+            w.close()
+        elif op == "restore":
+            w.restore()
+        else:
+            return f"window_{op}: unknown op."
+        return f"window {op}d: {getattr(w, 'title', '')!r}"
+    except Exception as exc:
+        return f"window_{op} failed: {exc}"
+
+
+def window_focus(title: str) -> str:      return _window_action(title, "focus")
+def window_minimize(title: str) -> str:   return _window_action(title, "minimize")
+def window_maximize(title: str) -> str:   return _window_action(title, "maximize")
+def window_restore(title: str) -> str:    return _window_action(title, "restore")
+def window_close(title: str) -> str:      return _window_action(title, "close")
+
+
+def window_list() -> str:
+    """List currently visible windows — for the model to pick a target."""
+    try:
+        pa = _pyautogui()
+    except RuntimeError as exc:
+        return str(exc)
+    try:
+        wins = pa.getAllWindows()
+    except Exception as exc:
+        return f"window_list failed: {exc}"
+    titles = [(getattr(w, "title", "") or "").strip() for w in wins]
+    titles = [t for t in titles if t]
+    if not titles:
+        return "window_list: no visible windows."
+    shown = titles[:25]
+    body = "\n".join(f"  - {t}" for t in shown)
+    tail = f"\n  … and {len(titles) - len(shown)} more" if len(titles) > len(shown) else ""
+    return f"Visible windows ({len(titles)}):\n{body}{tail}"
+
+
+# ── OS-native scheduled reminders (wraps reminder.py) ───────────────────────────
+def remind(sub_action: str, args: dict) -> str:
+    """schedule / list / cancel. All calls delegated to reminder.py."""
+    try:
+        import reminder
+    except Exception as exc:
+        return f"remind: reminder module unavailable ({exc})."
+    sub = (sub_action or "").strip().lower()
+    if sub in ("", "schedule", "add", "create"):
+        r = reminder.schedule(
+            when=str(args.get("when") or ""),
+            message=str(args.get("message") or args.get("body") or ""),
+            title=str(args.get("title") or "JARVIS"),
+        )
+        if not r.get("ok"):
+            return f"remind: {r.get('error', 'unknown error')}"
+        return (f"Reminder scheduled — id={r['id']}, when={r['when']}, "
+                f"title={r['title']!r}, message={r['message']!r}")
+    if sub == "list":
+        items = reminder.list_all()
+        if not items:
+            return "remind list: no reminders scheduled."
+        lines = [f"Scheduled reminders ({len(items)}):"]
+        for it in items[:20]:
+            lines.append(f"  - id={it['id']}  next={it.get('next_run', '?')}  "
+                         f"status={it.get('status', '?')}")
+        return "\n".join(lines)
+    if sub in ("cancel", "delete", "remove"):
+        rid = str(args.get("id") or args.get("reminder_id") or "").strip()
+        if not rid:
+            return "remind cancel: needs 'id' (from schedule / list)."
+        r = reminder.cancel(rid)
+        return f"remind cancel: {r}"
+    return f"remind: unknown sub_action {sub_action!r}. Use schedule | list | cancel."
+
+
 # ── one entry point the tool dispatch calls ─────────────────────────────────────
 _ACTIONS = {
     # existing
     "open_path", "open_settings", "open_control_panel", "open_registry",
     "open_component", "list_apps", "uninstall_app",
-    # new (Mark-XLVIII parity)
+    # Mark-XLVIII parity (p1)
     "system_volume", "brightness", "toggle_wifi",
     "mouse_click", "mouse_move", "mouse_scroll",
     "type_text", "key_press",
     "notify", "capture_webcam",
+    # Mark-XLVIII parity (p2): windows + native reminders
+    "window_focus", "window_minimize", "window_maximize", "window_restore",
+    "window_close", "window_list",
+    "remind",
 }
 
 
@@ -740,4 +861,19 @@ def run(action: str, args: dict) -> str:
                       int(args.get("timeout") or 5))
     if act == "capture_webcam":
         return capture_webcam(args.get("path"))
+    # p2 dispatch — windows + reminders
+    if act == "window_focus":
+        return window_focus(str(args.get("title") or ""))
+    if act == "window_minimize":
+        return window_minimize(str(args.get("title") or ""))
+    if act == "window_maximize":
+        return window_maximize(str(args.get("title") or ""))
+    if act == "window_restore":
+        return window_restore(str(args.get("title") or ""))
+    if act == "window_close":
+        return window_close(str(args.get("title") or ""))
+    if act == "window_list":
+        return window_list()
+    if act == "remind":
+        return remind(str(args.get("sub_action") or args.get("op") or "schedule"), args)
     return f"desktop: action {act!r} was in _ACTIONS but had no handler — this is a bug."
