@@ -3133,14 +3133,20 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools)
         except _openai_mod.RateLimitError:
             # This key is throttled/exhausted — swap to the next configured key and retry the
-            # round. Only after every key has been tried do we surface the rate-limit message.
+            # round. Only after every key has been tried do we give up on Groq.
             if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat rate limit"):
                 keys_tried += 1
                 client = _openai_mod.AsyncOpenAI(
                     api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
                     timeout=GROQ_TIMEOUT, max_retries=0)
                 continue
-            return "I've hit Groq's rate limit on all configured keys. Give me a few seconds and ask again."
+            # Every Groq key is rate-limited. Return EMPTY (not a dead-end message) so the
+            # caller's escalation falls back to the local Ollama brain — Groq being throttled
+            # should never leave JARVIS mute when a local model is sitting right there.
+            if _LOCAL_OK and (LOCAL_DEEP or LOCAL_FAST):
+                await broadcast({"type": "system", "text": "Groq rate-limited — falling back to the local model."})
+                return ""
+            return "I've hit Groq's rate limit on all configured keys, and no local model is available to fall back to. Give me a few seconds and ask again."
         except _openai_mod.APIError:
             # Malformed tool call rejected mid-stream — retry forcing a text answer;
             # prior tool results stay in context.
