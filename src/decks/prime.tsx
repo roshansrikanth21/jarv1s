@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } fro
 import { Mic, MicOff, Send, X, Moon, Trash2, Volume2 } from "lucide-react";
 import { ContentPanel, type ContentPanelData } from "@/components/jarvis/ContentPanel";
 import { WindowControls } from "@/components/jarvis/WindowControls";
+import { DeckErrorBoundary } from "@/components/jarvis/DeckErrorBoundary";
 import { useJarvisSocket } from "@/hooks/useJarvisSocket";
 import "./prime.css";
 
@@ -861,7 +862,11 @@ export default function PrimeDeck() {
             <Suspense
               fallback={<div className="pr-orb-canvas pr-orb-canvas--loading" aria-hidden />}
             >
-              <CoreOrb3D state={jstate} audioLevel={micLevel} />
+              <DeckErrorBoundary
+                fallback={<div className="pr-orb-canvas pr-orb-canvas--loading" aria-hidden />}
+              >
+                <CoreOrb3D state={jstate} audioLevel={micLevel} />
+              </DeckErrorBoundary>
             </Suspense>
           </button>
 
@@ -918,15 +923,22 @@ export default function PrimeDeck() {
                     if (e.key === "Enter") submit();
                   }}
                   placeholder={`Talk to JARVIS, ${userName}…`}
+                  aria-label="Talk to JARVIS"
                 />
                 <button
                   className={`pr-mic ${listening ? "pr-mic--live" : ""}`}
                   onClick={toggleMic}
                   title={listening ? "Stop" : "Mic"}
+                  aria-label={listening ? "Stop listening" : "Start voice input"}
                 >
                   {listening ? <Mic size={15} /> : <MicOff size={15} />}
                 </button>
-                <button className="pr-send" onClick={submit} disabled={!input.trim()}>
+                <button
+                  className="pr-send"
+                  onClick={submit}
+                  disabled={!input.trim()}
+                  aria-label="Send message"
+                >
                   <Send size={12} />
                 </button>
               </div>
@@ -1721,6 +1733,7 @@ function SettingsModal({
         className="pr-modal"
         onClick={(e) => e.stopPropagation()}
         role="dialog"
+        aria-modal="true"
         aria-label="Settings"
       >
         <div className="pr-modal-head">

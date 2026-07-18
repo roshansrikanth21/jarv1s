@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install httpx
+      - name: Cortex / agent selftests
+        env:
+          JARVIS_FORCE_WORDHASH: "1"
+          JARVIS_LOG_LEVEL: WARNING
+        run: |
+          python scripts/selftest_subagents.py
+          python scripts/selftest_memory.py
+          python scripts/selftest_desktop.py
+          python scripts/selftest_browse.py
+          python scripts/selftest_affect.py
+          python scripts/selftest_security_gates.py
+          python scripts/selftest_reconnect_policy.py
+
+  frontend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint

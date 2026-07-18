@@ -126,6 +126,45 @@ def run() -> int:
     err = compile_err([{"op": "open_app", "app": "", "url": "file:///etc/passwd"}])
     ok("file:// scheme still blocked via open_app path", "scheme" in err.lower(), err)
 
+    section("SSRF — DNS rebinding / private resolution")
+    from api import _browse_allowed, _origin_allowed  # noqa: E402
+    import socket as _sock
+
+    ok("bare 127.0.0.1 blocked",
+       "private" in (_browse_allowed("http://127.0.0.1:8000/") or "").lower()
+       or "loopback" in (_browse_allowed("http://127.0.0.1:8000/") or "").lower())
+    ok("bare RFC1918 blocked",
+       "private" in (_browse_allowed("http://192.168.0.1/") or "").lower())
+    ok("metadata hostname blocked",
+       "metadata" in (_browse_allowed("http://metadata.google.internal/") or "").lower())
+
+    _real_gai = _sock.getaddrinfo
+
+    def _fake_gai(host, *args, **kwargs):
+        if host == "evil.rebinding.test":
+            return [(_sock.AF_INET, _sock.SOCK_STREAM, 0, "", ("127.0.0.1", 0))]
+        return _real_gai(host, *args, **kwargs)
+
+    _sock.getaddrinfo = _fake_gai  # type: ignore[assignment]
+    try:
+        err = _browse_allowed("http://evil.rebinding.test/admin") or ""
+        ok("hostname resolving to 127.0.0.1 blocked (DNS rebinding)",
+           "private" in err.lower() or "loopback" in err.lower(), err)
+    finally:
+        _sock.getaddrinfo = _real_gai  # type: ignore[assignment]
+
+    ok("public example.com allowed (or DNS fail message)",
+       _browse_allowed("https://example.com/") in (None,)
+       or "resolve" in (_browse_allowed("https://example.com/") or "").lower())
+
+    section("origin gate — port pin + file/app schemes")
+    ok("vite origin :8080 allowed", _origin_allowed("http://127.0.0.1:8080") is True)
+    ok("backend origin :8000 allowed", _origin_allowed("http://localhost:8000") is True)
+    ok("random localhost port blocked", _origin_allowed("http://localhost:9999") is False)
+    ok("remote origin blocked", _origin_allowed("https://evil.example") is False)
+    ok("file:// origin allowed (packaged Electron)", _origin_allowed("file:///C:/app/index.html") is True)
+    ok("app:// origin allowed", _origin_allowed("app://jarvis") is True)
+
     section("meta — length + shape checks unchanged")
     err = compile_err([])
     ok("empty actions still errors", "non-empty" in err, err)

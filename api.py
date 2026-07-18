@@ -17,6 +17,7 @@ import logging
 import os
 import random
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -646,18 +647,53 @@ def _maybe_run_briefing() -> None:
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
 # A browser on ANY website can open a WebSocket to localhost, and our agent can run
 # shell commands — so only accept connections whose Origin is a local app (the
-# Electron shell or the Vite dev server). Set JARVIS_WS_ALLOW_ALL=1 to bypass.
+# Electron shell or the Vite / packaged SPA). Set JARVIS_WS_ALLOW_ALL=1 to bypass.
+# Ports are pinned so a random malicious page on localhost:NNNN cannot drive the agent.
 WS_ALLOW_ALL = os.environ.get("JARVIS_WS_ALLOW_ALL", "0") == "1"
+_WS_ORIGIN_PORTS = {
+    int(p) for p in os.environ.get("JARVIS_WS_PORTS", "8000,8080,5173,4173").split(",")
+    if p.strip().isdigit()
+}
 
 
 def _origin_allowed(origin: str | None) -> bool:
     if WS_ALLOW_ALL or not origin:    # no Origin = native client, not a browser
         return True
     try:
-        host = urllib.parse.urlparse(origin).hostname or ""
+        parsed = urllib.parse.urlparse(origin)
+        scheme = (parsed.scheme or "").lower()
+        # Packaged Electron may load file:// or app:// — match CORS policy.
+        if scheme in ("file", "app"):
+            return True
+        host = (parsed.hostname or "").lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return False
+        port = parsed.port
+        if port is None:
+            return True
+        return port in _WS_ORIGIN_PORTS
     except Exception:
         return False
-    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _local_client(request: Request) -> bool:
+    host = (request.client.host if request.client else "") or ""
+    # "testclient" is Starlette TestClient's synthetic peer — not reachable over real TCP.
+    return host in ("127.0.0.1", "::1", "localhost", "testclient")
+
+
+def _mutating_allowed(request: Request) -> bool:
+    """Gate for endpoints that drive the agent, write disk, or change prefs.
+
+    Browser calls must carry a trusted Origin. Origin-less clients (curl, Electron
+    main, selftests) must come from loopback — never a LAN peer.
+    """
+    if WS_ALLOW_ALL:
+        return True
+    origin = request.headers.get("origin")
+    if origin:
+        return _origin_allowed(origin)
+    return _local_client(request)
 
 
 @app.websocket("/ws")
@@ -1456,10 +1492,21 @@ _BROWSE_BLOCK_SCHEMES = {"file", "about", "data", "javascript", "chrome", "chrom
                          "view-source", "ftp", "blob", "ws", "wss"}
 
 
+def _ip_unsafe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True for addresses that must never be reachable via browse (SSRF / metadata)."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return bool(
+        ip.is_loopback or ip.is_private or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
 def _browse_allowed(url: str) -> str | None:
     """Gate a navigation URL: http/https only, never loopback/private/link-local hosts (SSRF
     against the user's own machine, incl. the JARVIS backend), plus an optional host
-    allowlist. Returns an error string, or None if the URL is allowed."""
+    allowlist. Hostnames are DNS-resolved so rebinding to 127.0.0.1/RFC1918 is blocked.
+    Returns an error string, or None if the URL is allowed."""
     u = (url or "").strip()
     if not u:
         return "navigate needs a 'url'."
@@ -1477,13 +1524,29 @@ def _browse_allowed(url: str) -> str | None:
         return "URL has no host."
     if host == "localhost" or host.endswith(".localhost") or host == "localhost.localdomain":
         return "Blocked navigation to localhost."
+    # Cloud / link-local metadata hostnames even when they somehow resolve publicly.
+    if host in {"metadata.google.internal", "metadata", "kubernetes.default",
+                "kubernetes.default.svc"}:
+        return "Blocked navigation to a metadata endpoint."
     try:
         ip = ipaddress.ip_address(host)
-        if (ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        if _ip_unsafe(ip):
             return "Blocked navigation to a private/loopback address."
     except ValueError:
-        pass  # a hostname, not a bare IP — fall through to the allowlist check
+        # Hostname — resolve and reject if ANY A/AAAA is private/loopback (DNS rebinding).
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return f"Could not resolve '{host}' for browse safety check."
+        for info in infos:
+            addr = info[4][0]
+            try:
+                resolved = ipaddress.ip_address(addr)
+            except ValueError:
+                continue
+            if _ip_unsafe(resolved):
+                return ("Blocked navigation to a host that resolves to a "
+                        "private/loopback address.")
     if BH_ALLOWLIST and not any(host == a or host.endswith("." + a) for a in BH_ALLOWLIST):
         return f"'{host}' is not in the browse allowlist (JARVIS_BROWSE_ALLOWLIST)."
     return None
@@ -2142,7 +2205,14 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             supported = ", ".join(sorted(_LAUNCH_ALLOWLIST))
             return f"Unknown app '{raw}'. Supported: {supported}"
         try:
-            subprocess.Popen(cmd, shell=True)
+            # argv list — never shell=True. Allowlist entries are fixed binaries/names.
+            subprocess.Popen(
+                [cmd],
+                shell=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
             return f"Launched {raw}."
         except Exception as exc:
             return f"Failed to launch {raw}: {exc}"
@@ -2607,7 +2677,12 @@ def _is_network_block(exc: Exception) -> bool:
 def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     """Structured ICT read. Returns a dict (ok/error + signals) used by both the
     voice tool and the Markets panel / watcher. Cached ~30s to spare repeat fetches."""
-    ckey = (symbol.strip().lower(), interval)
+    raw = (symbol or "").strip()
+    # Reject junk before we hit yfinance (DoS / path-ish strings from the Markets panel).
+    if not raw or len(raw) > 32 or not re.fullmatch(r"[A-Za-z0-9.^_=-]+", raw):
+        return {"ok": False, "error": "Invalid market symbol."}
+    interval = interval if interval in {"5m", "15m", "30m", "60m", "1d"} else "15m"
+    ckey = (raw.lower(), interval)
     hit = _ict_cache.get(ckey)
     if hit and (time.time() - hit[0]) < _ICT_CACHE_TTL_SEC:
         return hit[1]
@@ -2617,8 +2692,7 @@ def _ict_analyze(symbol: str, interval: str = "15m") -> dict:
     except ImportError:
         return {"ok": False, "error": "Market deps missing (pip install yfinance pandas)."}
 
-    ysym, name = _resolve_symbol(symbol)
-    interval = interval if interval in {"5m", "15m", "30m", "60m", "1d"} else "15m"
+    ysym, name = _resolve_symbol(raw)
     period = {"5m": "5d", "15m": "1mo", "30m": "1mo", "60m": "3mo", "1d": "1y"}[interval]
     df, err = _download_candles(ysym, period, interval)
     # Bare tickers auto-map to NSE (.NS); retry without suffix for US symbols like AAPL.
@@ -4842,15 +4916,22 @@ async def agent_status() -> dict:
 
 
 @app.post("/api/command")
-async def command_endpoint(body: dict) -> dict:
+async def command_endpoint(request: Request) -> JSONResponse:
+    # Same origin/loopback gate as settings/upload — this endpoint drives the full agent
+    # (shell, desktop, browse). An ungated POST was the highest-impact CSRF surface.
+    if not _mutating_allowed(request):
+        return JSONResponse({"error": "forbidden origin"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     text = (body.get("command") or "").strip()
     if not text:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=400, detail="empty command")
+        return JSONResponse({"error": "empty command"}, status_code=400)
     # Must go through dispatch_command — same barge-in + turn-generation path as WS/voice.
     # Calling handle_command directly allowed overlapping agents and skipped interrupts.
     asyncio.create_task(dispatch_command(text))
-    return {"status": "processing"}
+    return JSONResponse({"status": "processing"})
 
 
 @app.get("/api/ict")
@@ -4880,7 +4961,7 @@ async def post_settings(request: Request) -> JSONResponse:
     """Apply a subset of non-secret prefs and broadcast changes so every connected deck
     stays in sync. API keys are NOT accepted here — they go through Electron safeStorage."""
     global _tts_voice, ALWAYS_LISTEN, STORE_OVERHEARD
-    if not _origin_allowed(request.headers.get("origin")):
+    if not _mutating_allowed(request):
         return JSONResponse({"error": "forbidden origin"}, status_code=403)
     try:
         body = await request.json()
@@ -4982,18 +5063,21 @@ async def governor_endpoint() -> dict:
 
 
 @app.get("/api/memory")
-async def memory_endpoint() -> dict:
+async def memory_endpoint(limit: int = 60) -> dict:
     """The inspectable self-model — durable memories, newest first. Reads cortex (the real
     store both explicit `remember` calls AND automatic post-turn extraction write to) rather
     than the legacy JSON mirror, which only ever saw explicit `remember`s."""
+    # Clamp — UI wants a digest, not an unbounded dump of the whole store.
+    lim = max(1, min(int(limit or 60), 200))
     all_f = cortex.store.all_facts()
     ordered = sorted(all_f, key=lambda f: f.get("created_at") or "", reverse=True)
     return {"count": len(all_f),
             "memories": [{"id": f.get("id"), "content": f.get("text"),
                           "category": f.get("category", "preference"),
                           "importance": f.get("importance", 5),
+                          "private": bool(f.get("private")),
                           "source": "extracted" if f.get("source_episode_id") else "manual"}
-                         for f in ordered[:60]]}
+                         for f in ordered[:lim]]}
 
 
 # ── Attachment uploads — images/docs the UI drops into chat ────────────────────
@@ -5063,7 +5147,7 @@ def _digest_upload(path, ext: str) -> tuple[str, str, bool]:
 async def upload_endpoint(request: Request) -> JSONResponse:
     # Same origin/loopback gate the websocket uses — this is the one endpoint that writes
     # files to disk + triggers cloud vision, so it must not be the least-protected surface.
-    if not _origin_allowed(request.headers.get("origin")):
+    if not _mutating_allowed(request):
         return JSONResponse({"error": "forbidden origin"}, status_code=403)
     # Reject oversize BEFORE buffering + base64-decoding the whole body into memory (DoS guard).
     clen = request.headers.get("content-length")

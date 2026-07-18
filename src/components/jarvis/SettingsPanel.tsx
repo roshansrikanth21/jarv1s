@@ -136,6 +136,7 @@ export function SettingsPanel({
         style={c.card}
         onMouseDown={(e) => e.stopPropagation()}
         role="dialog"
+        aria-modal="true"
         aria-label="Settings"
       >
         <div style={c.header}>

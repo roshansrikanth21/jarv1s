@@ -119,6 +119,7 @@ export default function TerminalDeck() {
         <button
           onClick={toggleMic}
           title="Voice input"
+          aria-label={listening ? "Stop listening" : "Start voice input"}
           style={{
             background: listening ? GREEN : "transparent",
             color: listening ? BG : GREEN,
@@ -140,6 +141,7 @@ export default function TerminalDeck() {
           onKeyDown={(e) => {
             if (e.key === "Enter") submit();
           }}
+          aria-label="Terminal command"
           autoFocus
           spellCheck={false}
           style={{

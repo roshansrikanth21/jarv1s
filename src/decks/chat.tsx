@@ -480,7 +480,12 @@ export default function ChatDeck() {
                 transition: "border-color 0.15s, box-shadow 0.15s",
               }}
             >
-              <button onClick={() => fileRef.current?.click()} title="Attach files" style={iconBtn}>
+              <button
+                onClick={() => fileRef.current?.click()}
+                title="Attach files"
+                aria-label="Attach files"
+                style={iconBtn}
+              >
                 <ClipIcon />
               </button>
               <textarea
@@ -493,6 +498,7 @@ export default function ChatDeck() {
                 }}
                 onKeyDown={onKey}
                 placeholder={dragging ? "Drop files to attach" : "Ask anything"}
+                aria-label="Message JARVIS"
                 autoFocus
                 style={{
                   flex: 1,
@@ -511,6 +517,7 @@ export default function ChatDeck() {
               <button
                 onClick={toggleMic}
                 title={listening ? "Stop listening" : "Voice input"}
+                aria-label={listening ? "Stop listening" : "Start voice input"}
                 style={{
                   ...iconBtn,
                   color: listening ? "#10a37f" : TEXT_DIM,

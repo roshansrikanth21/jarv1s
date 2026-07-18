@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS facts (
 CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(category);
 CREATE INDEX IF NOT EXISTS idx_facts_ns ON facts(namespace);
 CREATE INDEX IF NOT EXISTS idx_facts_conf ON facts(confidence);
+CREATE INDEX IF NOT EXISTS idx_facts_private ON facts(private);
+CREATE INDEX IF NOT EXISTS idx_facts_ns_private ON facts(namespace, private);
 
 CREATE TABLE IF NOT EXISTS prospective (
     id                 TEXT PRIMARY KEY,

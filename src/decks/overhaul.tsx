@@ -1237,12 +1237,23 @@ function CommandDeck() {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={onKeyDown}
                 placeholder="Ask, delegate, search, remember, act…"
+                aria-label="Command JARVIS"
                 autoFocus
               />
-              <IconBtn onClick={() => sendCommand()} active={speaking} title="Send [Enter]">
+              <IconBtn
+                onClick={() => sendCommand()}
+                active={speaking}
+                title="Send [Enter]"
+                aria-label="Send command"
+              >
                 <Send className="w-3.5 h-3.5" />
               </IconBtn>
-              <IconBtn onClick={toggleListen} active={listening} title="Voice input">
+              <IconBtn
+                onClick={toggleListen}
+                active={listening}
+                title="Voice input"
+                aria-label={listening ? "Stop listening" : "Start voice input"}
+              >
                 {listening ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
               </IconBtn>
             </motion.div>
@@ -3025,18 +3036,21 @@ function IconBtn({
   active = false,
   danger = false,
   children,
+  "aria-label": ariaLabel,
 }: {
   onClick?: () => void;
   title?: string;
   active?: boolean;
   danger?: boolean;
   children: React.ReactNode;
+  "aria-label"?: string;
 }) {
   return (
     <motion.button
       className={`hud-icon-btn ${active ? "hud-icon-btn--active" : ""} ${danger ? "hud-icon-btn--danger" : ""}`}
       onClick={onClick}
       title={title}
+      aria-label={ariaLabel || title}
       whileHover={{ scale: 1.08 }}
       whileTap={{ scale: 0.93 }}
     >

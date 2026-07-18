@@ -15,20 +15,35 @@ This repository is a **working beta**. Features below are implemented in code an
 
 ## Table of contents
 
-1. [Project status (beta)](#project-status-beta)
-2. [Architecture](#architecture)
-3. [What is implemented](#what-is-implemented)
-4. [User interfaces](#user-interfaces)
-5. [Tool surface](#tool-surface)
-6. [Repository layout](#repository-layout)
-7. [Requirements](#requirements)
-8. [Setup](#setup)
-9. [Run](#run)
-10. [Configuration](#configuration)
-11. [Security notes](#security-notes)
-12. [Testing & verification](#testing--verification)
-13. [Roadmap](#roadmap)
-14. [Further documentation](#further-documentation)
+- [JARVIS](#jarvis)
+  - [Table of contents](#table-of-contents)
+  - [Project status (beta)](#project-status-beta)
+  - [Architecture](#architecture)
+    - [System context](#system-context)
+    - [Request path (per turn)](#request-path-per-turn)
+    - [Governor escalation lattice](#governor-escalation-lattice)
+    - [Cortex memory (past / present / future)](#cortex-memory-past--present--future)
+  - [What is implemented](#what-is-implemented)
+    - [Cognition \& routing](#cognition--routing)
+    - [Embodiment \& affect](#embodiment--affect)
+    - [Memory](#memory)
+    - [Voice](#voice)
+    - [Desktop \& browsing](#desktop--browsing)
+    - [Markets \& trading UI hook](#markets--trading-ui-hook)
+    - [Security / research tools (experimental)](#security--research-tools-experimental)
+    - [Desktop app shell](#desktop-app-shell)
+  - [User interfaces](#user-interfaces)
+  - [Tool surface](#tool-surface)
+  - [Repository layout](#repository-layout)
+  - [Requirements](#requirements)
+  - [Setup](#setup)
+  - [Run](#run)
+  - [Configuration](#configuration)
+  - [Security notes](#security-notes)
+  - [Testing \& verification](#testing--verification)
+  - [Roadmap](#roadmap)
+  - [Further documentation](#further-documentation)
+  - [License \& contribution](#license--contribution)
 
 ---
 
@@ -354,6 +369,9 @@ Common environment overrides (full commentary in `.env.example` and module heade
 | `JARVIS_PROACTIVE*` | Optional silence-break nudges |
 | `JARVIS_WATCHLIST` / `JARVIS_WATCH_*` | ICT watcher |
 | `JARVIS_WS_ALLOW_ALL` | Disable WS origin lockdown (**unsafe**) |
+| `JARVIS_WS_PORTS` | Allowed Origin ports for local UI (default `8000,8080,5173,4173`) |
+| `JARVIS_BROWSE_ALLOWLIST` | Optional comma-separated browse hosts |
+| `JARVIS_MEMORY_TOKEN` | Bearer token for memory hub; blank = loopback only |
 | `MEM0_*` / `JARVIS_MEM0_WRITETHROUGH` | Optional cloud memory mirror |
 | `JARVIS_BH_*` | Browser-harness Chrome / CDP |
 
@@ -362,6 +380,8 @@ Common environment overrides (full commentary in `.env.example` and module heade
 ## Security notes
 
 - The agent can run shell commands, drive the desktop, and browse. The WebSocket **rejects non-local Origins** by default — override with `JARVIS_WS_ALLOW_ALL=1` only if you understand the risk.
+- Mutating HTTP (`POST /api/command`, `/api/settings`, `/api/upload`) requires a **trusted local Origin port** (`JARVIS_WS_PORTS`, default `8000,8080,5173,4173`) or a loopback client. Random `localhost:NNNN` pages cannot drive the agent.
+- Browse navigation blocks private/loopback targets **including after DNS resolution** (rebinding defense). Optional host allowlist: `JARVIS_BROWSE_ALLOWLIST`.
 - Treat `capture_screen` / `search_web` / browse page text as **untrusted** input into a tool-calling model (indirect prompt-injection surface). Hardening remains incomplete in beta.
 - API keys belong in `.env` or Electron `safeStorage` — never in the repo.
 - Pentest scope files and overheard transcripts are gitignored under `memory/`.
@@ -378,14 +398,19 @@ venv\Scripts\python.exe scripts\selftest_memory.py
 venv\Scripts\python.exe scripts\selftest_affect.py
 venv\Scripts\python.exe scripts\selftest_desktop.py
 venv\Scripts\python.exe scripts\selftest_browse.py
+venv\Scripts\python.exe scripts\selftest_security_gates.py
+venv\Scripts\python.exe scripts\selftest_reconnect_policy.py
 ```
 
-Frontend gates used in development:
+Or via npm (uses whatever `python` is on PATH):
 
 ```bash
-npx tsc --noEmit
-npx eslint src --quiet
+npm run test:selftest
+npm run typecheck
+npm run lint
 ```
+
+CI runs the same Python selftests + `tsc` + eslint on push/PR (`.github/workflows/ci.yml`).
 
 Icon assets: `python scripts/make_icon.py`.
 

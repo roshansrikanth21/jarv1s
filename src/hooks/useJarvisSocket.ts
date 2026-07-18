@@ -82,9 +82,11 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   const scheduleReconnect = useCallback((reason: string) => {
     if (manualCloseRef.current) return;
     if (reconnectTimerRef.current) return;
+    // Never permanently give up — backend restarts / sleep can exceed any fixed
+    // attempt budget. Cap backoff at 30s and keep trying (overhaul deck already
+    // reconnects forever; this hook used to stop after 12 and strand the UI).
     const attempt = reconnectAttemptRef.current;
-    if (attempt >= 12) return;
-    const base = Math.min(1000 * 2 ** attempt, 30000);
+    const base = Math.min(1000 * 2 ** Math.min(attempt, 5), 30000);
     const delay = Math.floor(base * (0.5 + Math.random() * 0.5));
     void reason;
     reconnectTimerRef.current = setTimeout(() => {
@@ -161,7 +163,10 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
       setConnected(true);
       flushPendingActions();
       fetch("/api/agent/status")
-        .then((r) => r.json())
+        .then(async (r) => {
+          if (!r.ok) throw new Error(`status ${r.status}`);
+          return r.json();
+        })
         .then((d) => {
           if (d?.emotion) setMood(d.emotion);
         })
@@ -257,6 +262,33 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
       wsRef.current?.close(1000);
     };
   }, [connect]);
+
+  // Resume immediately when the OS network returns or the window is focused again —
+  // otherwise a long offline stretch leaves the user staring at "Waking up…" until
+  // the next backoff tick (or forever, under the old 12-attempt hard stop).
+  useEffect(() => {
+    const kick = () => {
+      if (manualCloseRef.current) return;
+      const ws = wsRef.current;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))
+        return;
+      reconnectAttemptRef.current = 0;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      connRef.current();
+    };
+    const onVis = () => {
+      if (document.visibilityState === "visible") kick();
+    };
+    window.addEventListener("online", kick);
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      window.removeEventListener("online", kick);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
 
   // A disconnect only becomes user-visible after a short grace period — most
   // reconnects (a brief blip, a backend restart after saving a key) resolve

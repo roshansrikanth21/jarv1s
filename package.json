@@ -1,5 +1,5 @@
 {
-  "name": "tanstack_start_ts",
+  "name": "jarvis",
   "private": true,
   "sideEffects": false,
   "type": "module",
@@ -10,7 +10,9 @@
     "build:dev": "vite build --mode development",
     "preview": "vite preview",
     "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
+    "test:selftest": "python scripts/selftest_subagents.py && python scripts/selftest_memory.py && python scripts/selftest_affect.py && python scripts/selftest_desktop.py && python scripts/selftest_browse.py && python scripts/selftest_security_gates.py && python scripts/selftest_reconnect_policy.py",
     "desktop": "npm run build && electron .",
     "desktop:fast": "electron .",
     "desktop:dev": "set JARVIS_USE_VITE=1&& concurrently \"npm run dev -- --host 127.0.0.1 --port 8080\" \"wait-on http://127.0.0.1:8080 && electron .\"",

@@ -235,6 +235,7 @@ export default function FocusDeck() {
               if (e.key === "Enter") submit();
             }}
             placeholder="Message JARVIS…"
+            aria-label="Message JARVIS"
             autoFocus
             style={{
               flex: 1,
@@ -248,6 +249,7 @@ export default function FocusDeck() {
           />
           <button
             onClick={submit}
+            aria-label="Send message"
             style={{
               border: "none",
               background: ACCENT,
