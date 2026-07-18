@@ -90,6 +90,10 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     const targetFor = (s: AmbientState) => (s === "speaking" ? 1 : s === "listening" ? 0.62 : 0.32);
 
     const frame = (now: number) => {
+      if (document.hidden) {
+        raf = 0;
+        return;
+      }
       const dt = Math.min(48, now - last) / 16.67; // ~frames elapsed, clamped
       last = now;
 
@@ -178,10 +182,18 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
 
       raf = requestAnimationFrame(frame);
     };
-    raf = requestAnimationFrame(frame);
+    const onVis = () => {
+      if (!document.hidden && !raf) {
+        last = performance.now();
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    if (!document.hidden) raf = requestAnimationFrame(frame);
 
     return () => {
       cancelAnimationFrame(raf);
+      document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("resize", resize);
     };
   }, [rgb]);

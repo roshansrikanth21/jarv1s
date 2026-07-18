@@ -604,9 +604,15 @@ async def _run_startup_briefing(*, force: bool = False) -> None:
     try:
         await broadcast({"type": "briefing", "phase": "start"})
         # Briefing reads cortex facts (authoritative), not the legacy JSON mirror.
+        # Fact rows use `text` (cortex.store); map to briefing's `content` field.
         try:
-            _brief_mems = [{"category": f.get("category", ""), "content": f.get("content", "")}
-                           for f in cortex.store.all_facts(include_private=True)]
+            _brief_mems = [
+                {
+                    "category": f.get("category", ""),
+                    "content": (f.get("text") or f.get("content") or ""),
+                }
+                for f in cortex.store.all_facts(include_private=True)
+            ]
         except Exception:
             _brief_mems = list(memories)
         greet = briefing.greeting_text(_user_name(), _brief_mems)
@@ -3899,12 +3905,22 @@ async def _wake_ack() -> None:
 
 async def _stop_speaking() -> None:
     """Cancel any in-flight response + TTS and tell the frontend to stop audio."""
-    global _current_task, _speak_task, _speaking_text
+    global _current_task, _speak_task, _speaking_text, _tts_playing, _tts_ended_at
     if _speak_task and not _speak_task.done():
         _speak_task.cancel()
+        try:
+            await _speak_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     if _current_task and not _current_task.done():
         _current_task.cancel()
     _speaking_text = ""
+    # Clear mute immediately — don't wait for a client tts_end that may never arrive
+    # (disconnect, barge-in race). Frontend still gets tts_stop to halt local audio.
+    _tts_playing = False
+    _tts_ended_at = time.time()
     await broadcast({"type": "tts_stop"})
     await broadcast({"type": "state", "status": "idle"})
 
@@ -4277,8 +4293,15 @@ def _get_local_whisper():
             return _whisper_model
         try:
             WhisperModel = _import_faster_whisper().WhisperModel
+            # Cap threads to physical cores (max 4) — over-allocating bloats RSS on CTranslate2.
+            _phys = psutil.cpu_count(logical=False) or 2
+            _threads = max(1, min(4, int(os.environ.get("JARVIS_STT_THREADS", str(_phys)))))
             _whisper_model = WhisperModel(
-                os.environ.get("JARVIS_STT_MODEL", "tiny.en"), device="cpu", compute_type="int8",
+                os.environ.get("JARVIS_STT_MODEL", "tiny.en"),
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=_threads,
+                num_workers=1,
             )
         except Exception as exc:
             _whisper_load_failed = True
@@ -4510,12 +4533,16 @@ def _voice_worker() -> None:
         if _main_loop and not _main_loop.is_closed():
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
-    MIN_UTTER_SAMPLES = int(0.30 * 16000)   # ignore sub-0.3s blips (input is already 16 kHz mono)
+    MIN_UTTER_SAMPLES = int(float(os.environ.get("JARVIS_MIN_UTTER_SEC", "0.55")) * 16000)
+    # Reject low-energy "speech" (fan hiss / keyboard) before Whisper — biggest idle-CPU saver.
+    MIN_UTTER_ENERGY = int(os.environ.get("JARVIS_MIN_UTTER_ENERGY", "480"))
 
     def _flush(pcm16) -> None:
         """Transcribe one utterance. `pcm16` is a 1-D int16 numpy array, 16 kHz mono."""
         global _audio_arousal, _awake_until
         if pcm16 is None or len(pcm16) < MIN_UTTER_SAMPLES:
+            return
+        if int(np.abs(pcm16).mean()) < MIN_UTTER_ENERGY:
             return
         audio = pcm16.astype(np.float32)
         try:
@@ -4630,12 +4657,12 @@ def _voice_worker() -> None:
     # package is missing (it's in requirements). Aggressiveness 0..3 via JARVIS_VAD_AGGR.
     try:
         import webrtcvad
-        _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "2")))))
+        _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "3")))))
     except Exception:
         _vad = None
 
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
-    START_PAD, START_VOICED = 5, 3       # trigger FAST: 3 of the last 5 frames (~150 ms) voiced,
+    START_PAD, START_VOICED = 6, 4       # need ~4/6 voiced frames (~120–180 ms) before opening
     #                                      so a quick "Jarvis" is caught on the first try
     END_PAD, END_UNVOICED = 12, 10       # end only on a clean ~360 ms pause (won't cut a sentence)
     RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
@@ -4693,7 +4720,7 @@ def _voice_worker() -> None:
                     leftover = leftover[FRAME:]
 
                     level_tick += 1
-                    if level_tick % 3 == 0:          # ~every 90 ms, drive the orb
+                    if level_tick % 6 == 0:          # ~every 180 ms, drive the orb (was 90 ms)
                         broadcast_from_thread({"type": "audio_level",
                                                "level": min(int(np.abs(frame).mean()) * 6, 32767)})
 
@@ -4743,6 +4770,10 @@ async def agent_status() -> dict:
     cpu  = psutil.cpu_percent(interval=0)
     vm   = psutil.virtual_memory()
     disk = psutil.disk_usage(_disk_root())
+    try:
+        _rss_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+    except Exception:
+        _rss_mb = None
     return {
         "brain": {
             "primary_llm":          _routing_label(),
@@ -4802,7 +4833,10 @@ async def agent_status() -> dict:
         "sys": {
             "cpu":  round(cpu),
             "ram":  round(vm.percent),
+            # Host volume fill (not JARVIS I/O). Free space is the actionable signal.
             "disk": round(disk.percent),
+            "disk_free_gb": round(disk.free / (1024 ** 3), 1),
+            "jarvis_rss_mb": _rss_mb,
         },
     }
 
@@ -4813,7 +4847,9 @@ async def command_endpoint(body: dict) -> dict:
     if not text:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail="empty command")
-    asyncio.create_task(handle_command(text))
+    # Must go through dispatch_command — same barge-in + turn-generation path as WS/voice.
+    # Calling handle_command directly allowed overlapping agents and skipped interrupts.
+    asyncio.create_task(dispatch_command(text))
     return {"status": "processing"}
 
 

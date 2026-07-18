@@ -87,7 +87,7 @@ type AgentStatus = {
   tools?: ToolInfo[];
   tasks?: Task[];
   trace?: AgentTrace[];
-  sys?: { cpu: number; ram: number; disk: number };
+  sys?: { cpu: number; ram: number; disk: number; disk_free_gb?: number; jarvis_rss_mb?: number };
 };
 type InstalledModel = {
   name: string;
@@ -768,7 +768,7 @@ export default function PrimeDeck() {
         <aside className="pr-wing pr-wing--left">
           <section className="pr-card">
             <div className="pr-card-head">
-              <span className="pr-lab">vitals</span>
+              <span className="pr-lab">host vitals</span>
               <span className="pr-lab">{status.device_tier ?? "node"}</span>
             </div>
             <div className="pr-tele">
@@ -776,7 +776,7 @@ export default function PrimeDeck() {
                 [
                   ["cpu", sys.cpu],
                   ["ram", sys.ram],
-                  ["disk", sys.disk],
+                  ["disk fill", sys.disk],
                 ] as const
               ).map(([k, v]) => (
                 <div className="pr-tele-row" key={k}>
@@ -794,6 +794,22 @@ export default function PrimeDeck() {
                   </div>
                 </div>
               ))}
+              {(sys.disk_free_gb != null || sys.jarvis_rss_mb != null) && (
+                <div className="pr-tele-row">
+                  <div className="pr-tele-head">
+                    <span className="pr-lab">jarvis rss</span>
+                    <span className="pr-num">
+                      {sys.jarvis_rss_mb != null ? `${sys.jarvis_rss_mb} MB` : "—"}
+                    </span>
+                  </div>
+                  <div className="pr-tele-head" style={{ marginTop: 4 }}>
+                    <span className="pr-lab">disk free</span>
+                    <span className="pr-num">
+                      {sys.disk_free_gb != null ? `${sys.disk_free_gb} GB` : "—"}
+                    </span>
+                  </div>
+                </div>
+              )}
             </div>
           </section>
 

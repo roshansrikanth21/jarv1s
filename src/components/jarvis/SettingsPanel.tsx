@@ -55,7 +55,10 @@ export function SettingsPanel({
     setAnthropicKey("");
     setMem0Key("");
     fetch("/api/settings")
-      .then((r) => r.json())
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`Settings load failed (${r.status})`);
+        return r.json();
+      })
       .then(setS)
       .catch(() => setS(null));
     if (hasElectron)

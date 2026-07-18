@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Iterable
 
 from . import embeddings, paths, store
@@ -48,7 +49,15 @@ def _try_chroma():
         paths.CHROMA_DIR.mkdir(parents=True, exist_ok=True)
         client = chromadb.PersistentClient(
             path=str(paths.CHROMA_DIR),
-            settings=Settings(anonymized_telemetry=False, allow_reset=True),
+            settings=Settings(
+                anonymized_telemetry=False,
+                allow_reset=True,
+                # Bound segment cache so personal DBs don't retain unbounded HNSW pages in RSS.
+                chroma_segment_cache_policy="LRU",
+                chroma_memory_limit_bytes=int(
+                    os.environ.get("JARVIS_CHROMA_MEMORY_BYTES", str(256 * 1024 * 1024))
+                ),
+            ),
         )
         facts = client.get_or_create_collection(FACTS_COLLECTION)
         eps = client.get_or_create_collection(EPISODES_COLLECTION)

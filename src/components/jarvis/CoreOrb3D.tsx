@@ -160,28 +160,14 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
     let rpm = 0;
     let raf = 0;
     let t0 = performance.now();
-    let paused = document.hidden;
-
-    const onVis = () => {
-      paused = document.hidden;
-    };
-    document.addEventListener("visibilitychange", onVis);
-
-    const onMove = (e: PointerEvent) => {
-      const rect = mount.getBoundingClientRect();
-      pointerRef.current = {
-        x: ((e.clientX - rect.left) / rect.width - 0.5) * 2,
-        y: ((e.clientY - rect.top) / rect.height - 0.5) * 2,
-      };
-      targetRy = pointerRef.current.x * 0.85;
-      targetRx = pointerRef.current.y * 0.55;
-    };
-
-    mount.addEventListener("pointermove", onMove);
 
     const animate = (now: number) => {
+      // Don't schedule the next frame while hidden — keeps GPU/CPU idle in background tabs.
+      if (document.hidden) {
+        raf = 0;
+        return;
+      }
       raf = requestAnimationFrame(animate);
-      if (paused) return;
       const dt = Math.min(0.05, (now - t0) / 1000);
       t0 = now;
 
@@ -243,7 +229,27 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
       });
     };
 
-    raf = requestAnimationFrame(animate);
+    const onVis = () => {
+      if (!document.hidden && !raf) {
+        t0 = performance.now();
+        raf = requestAnimationFrame(animate);
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+
+    const onMove = (e: PointerEvent) => {
+      const rect = mount.getBoundingClientRect();
+      pointerRef.current = {
+        x: ((e.clientX - rect.left) / rect.width - 0.5) * 2,
+        y: ((e.clientY - rect.top) / rect.height - 0.5) * 2,
+      };
+      targetRy = pointerRef.current.x * 0.85;
+      targetRx = pointerRef.current.y * 0.55;
+    };
+
+    mount.addEventListener("pointermove", onMove);
+
+    if (!document.hidden) raf = requestAnimationFrame(animate);
 
     const ro = new ResizeObserver(() => {
       const nw = mount.clientWidth;
