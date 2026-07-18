@@ -49,6 +49,11 @@ debug-*.log
 
 # Local editor / agent settings (machine-specific)
 .claude/settings.local.json
+.serena/
+
+# Playwright
+test-results/
+playwright-report/
 
 # Authorized-target allowlist for the pentest tool (engagement-sensitive)
 memory/jarvis_scope.json

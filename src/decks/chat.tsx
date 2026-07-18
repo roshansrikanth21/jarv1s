@@ -13,6 +13,7 @@
 // All backend I/O goes through useJarvisSocket — view-only, no protocol here.
 import { useCallback, useEffect, useRef, useState } from "react";
 import { WindowControls } from "@/components/jarvis/WindowControls";
+import { ToolApprovalBanner } from "@/components/jarvis/ToolApprovalBanner";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
 // Pitch-black chat theme — keeps the familiar ChatGPT layout, but on a true-black (AMOLED)
@@ -51,6 +52,8 @@ export default function ChatDeck() {
     addLine,
     sendAction,
     showReconnectHint,
+    pendingApproval,
+    respondApproval,
   } = useJarvisSocket("How can I help you today?");
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -230,6 +233,7 @@ export default function ChatDeck() {
         onFiles(e.dataTransfer?.files ?? null);
       }}
     >
+      <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* ── sidebar ── */}
       {sidebarOpen && (
         <div

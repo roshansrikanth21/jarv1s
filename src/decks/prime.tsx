@@ -10,6 +10,7 @@ import { Mic, MicOff, Send, X, Moon, Trash2, Volume2 } from "lucide-react";
 import { ContentPanel, type ContentPanelData } from "@/components/jarvis/ContentPanel";
 import { WindowControls } from "@/components/jarvis/WindowControls";
 import { DeckErrorBoundary } from "@/components/jarvis/DeckErrorBoundary";
+import { ToolApprovalBanner } from "@/components/jarvis/ToolApprovalBanner";
 import { useJarvisSocket } from "@/hooks/useJarvisSocket";
 import "./prime.css";
 
@@ -246,6 +247,8 @@ export default function PrimeDeck() {
     subscribe,
     mood,
     showReconnectHint,
+    pendingApproval,
+    respondApproval,
   } = useJarvisSocket("Ready. Speak or type below.");
 
   const [feed, setFeed] = useState<Feed[]>([
@@ -712,6 +715,7 @@ export default function PrimeDeck() {
 
   return (
     <div className="pr-root" data-jstate={jstate} style={{ paddingBottom: 48 }}>
+      <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* ═══ header ═══ */}
       <header className="pr-header drag">
         <div className="no-drag" style={{ display: "flex", alignItems: "baseline", gap: 10 }}>

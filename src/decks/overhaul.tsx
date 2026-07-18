@@ -33,12 +33,13 @@ import {
   GitBranch,
   Boxes,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { HudAmbient } from "@/components/jarvis/HudAmbient";
 import { ShaderBackdrop } from "@/components/jarvis/ShaderBackdrop";
 import { OpsConsole } from "@/components/jarvis/OpsConsole";
-import { notifyNative } from "@/lib/utils";
+import { ToolApprovalBanner } from "@/components/jarvis/ToolApprovalBanner";
+import { useJarvisSocket } from "@/hooks/useJarvisSocket";
 
 // Rendered as a UI preset by src/routes/index.tsx (not a standalone route).
 
@@ -277,11 +278,11 @@ const ITEM_VARIANTS = {
   show: { opacity: 1, y: 0, transition: { duration: 0.35, ease: "easeOut" as const } },
 };
 
-function mkLine(role: LineRole, text: string): Line {
+function toDisplayLine(l: { id: string; role: LineRole; text: string }): Line {
   return {
-    id: `${Date.now()}-${Math.random()}`,
-    role,
-    text,
+    id: l.id,
+    role: l.role,
+    text: l.text,
     at: new Date().toLocaleTimeString("en-US", { hour12: false }),
   };
 }
@@ -319,16 +320,26 @@ function BootScreen() {
 function CommandDeck() {
   const reduced = useReducedMotion();
 
-  const [connected, setConnected] = useState(false);
-  const [connecting, setConnecting] = useState(false);
-  const [speaking, setSpeaking] = useState(false);
-  const [listening, setListening] = useState(false);
-  const [audioLevel, setAudioLevel] = useState(0);
+  const {
+    connected,
+    listening,
+    speaking,
+    lines,
+    stream,
+    mood,
+    level: audioLevel,
+    showReconnectHint,
+    pendingApproval,
+    send,
+    toggleMic,
+    sendAction,
+    respondApproval,
+    subscribe,
+    addLine,
+  } = useJarvisSocket("Ready. Type a command or use the mic.");
+
+  const [lineCut, setLineCut] = useState(0);
   const [input, setInput] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [lines, setLines] = useState<Line[]>([
-    mkLine("system", "Ready. Type a command or use the mic."),
-  ]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [agentStatus, setAgentStatus] = useState<AgentStatus>({});
   const [sysStats, setSysStats] = useState({ cpu: 0, ram: 0, disk: 0 });
@@ -341,7 +352,6 @@ function CommandDeck() {
   const [opsOpen, setOpsOpen] = useState(false);
   const [runningTool, setRunningTool] = useState<{ action: string } | null>(null);
   const [reactorFlash, setReactorFlash] = useState(false);
-  const [streamLine, setStreamLine] = useState("");
   const [maximized, setMaximized] = useState(false);
   const [council, setCouncil] = useState<CouncilState>({
     active: false,
@@ -374,34 +384,19 @@ function CommandDeck() {
   const [bench, setBench] = useState<Record<string, { tok?: number; status: string }>>({});
   const [sleepMsg, setSleepMsg] = useState<string | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const speakTmr = useRef<number | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const fetchModelsRef = useRef<() => void>(null!);
   const fetchMemRef = useRef<() => void>(null!);
-  // Reconnect guards: dedup onclose/onerror both firing for one dropped
-  // connection, and suppress reconnect once we've intentionally closed the
-  // socket on unmount (otherwise a 5s-later reconnect opens a WebSocket
-  // nothing will ever close).
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // A disconnect only becomes user-visible after a short grace period — most
-  // reconnects resolve within it, so brief blips never flash an error.
-  const reconnectHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const manualCloseRef = useRef(false);
-
-  // Stable refs so callbacks never recreate (avoids useEffect re-run loop)
-  const addLineRef = useRef<(role: LineRole, text: string) => void>(null!);
   const flashReactorRef = useRef<() => void>(null!);
   const refreshRef = useRef<() => Promise<void>>(null!);
-  const connectWsRef = useRef<() => void>(null!);
 
-  const addLine = useCallback((role: LineRole, text: string) => {
-    if (!text.trim()) return;
-    setLines((prev) => [...prev.slice(-150), mkLine(role, text)]);
-  }, []);
-  addLineRef.current = addLine;
+  const visibleLines = useMemo(
+    () => lines.slice(lineCut).map((l) => toDisplayLine({ ...l, role: l.role as LineRole })),
+    [lines, lineCut],
+  );
+
+  const error = showReconnectHint ? "Waking up…" : null;
 
   const flashReactor = useCallback(() => {
     setReactorFlash(true);
@@ -424,282 +419,156 @@ function CommandDeck() {
   }, []);
   refreshRef.current = refreshStatus;
 
-  // Stable — uses refs internally, never recreates
-  const connectWs = useCallback(() => {
-    const cur = wsRef.current;
-    if (cur && (cur.readyState === WebSocket.OPEN || cur.readyState === WebSocket.CONNECTING))
-      return;
-    if (cur) {
-      cur.onclose = null;
-      cur.onerror = null;
-      try {
-        cur.close();
-      } catch {
-        /* stale socket */
-      }
-      wsRef.current = null;
-    }
-    setConnecting(true);
-    // Always go through Vite proxy (or same-host in prod) — avoids cross-origin WS issues
-    const url = `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      setConnected(true);
-      setConnecting(false);
-      setError(null);
-      if (reconnectHintTimerRef.current) {
-        clearTimeout(reconnectHintTimerRef.current);
-        reconnectHintTimerRef.current = null;
-      }
-      refreshRef.current();
-    };
-    const scheduleReconnect = () => {
-      if (!reconnectHintTimerRef.current) {
-        reconnectHintTimerRef.current = setTimeout(() => {
-          reconnectHintTimerRef.current = null;
-          setError("Waking up…");
-        }, 2500);
-      }
-      if (manualCloseRef.current || reconnectTimerRef.current) return;
-      reconnectTimerRef.current = setTimeout(() => {
-        reconnectTimerRef.current = null;
-        connectWsRef.current();
-      }, 5000);
-    };
-    ws.onclose = () => {
-      setConnected(false);
-      setListening(false);
-      setSpeaking(false);
-      setConnecting(false);
-      scheduleReconnect();
-    };
-    ws.onerror = () => {
-      setConnecting(false);
-      scheduleReconnect();
-    };
-    ws.onmessage = (ev) => {
-      try {
-        const d = JSON.parse(ev.data);
-        const txt: string = d.text ?? d.message ?? "";
-        if (d.type === "state" || d.type === "status") {
-          if (d.status === "speaking") setSpeaking(true);
-          else if (!audioRef.current) setSpeaking(false);
-          if (txt) addLineRef.current("system", txt);
-          // "Running <tool>…" → show it as an in-flight step in the Ops console.
-          const rm = /Running\s+([a-z_]+)/i.exec(txt || "");
-          if (rm) {
-            setRunningTool({ action: rm[1] });
-            if (["recon", "pentest", "scope", "browse", "report", "bugbounty"].includes(rm[1]))
-              setOpsOpen(true);
-          } else if (d.status === "idle") {
-            setRunningTool(null);
-          }
-        }
-        if (d.type === "emotion" && d.emotion) {
-          setAgentStatus((prev) => ({ ...prev, emotion: d.emotion }));
-        }
-        if (d.type === "transcription" || d.type === "transcript") addLineRef.current("user", txt);
-        if (d.type === "llm_chunk" && d.text) {
-          setStreamLine((prev) => prev + (d.text as string));
-        }
-        if (d.type === "llm_reset") setStreamLine(""); // model dumped a tool-call as text; discard it
-        if (d.type === "llm_response" || d.type === "response") {
-          setStreamLine("");
-          flashReactorRef.current();
-          addLineRef.current("agent", txt);
-          refreshRef.current();
-        }
-        if (d.type === "tts_audio" && d.data) {
-          if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current = null;
-          }
-          const blob = new Blob([Uint8Array.from(atob(d.data as string), (c) => c.charCodeAt(0))], {
-            type: "audio/mpeg",
-          });
-          const url = URL.createObjectURL(blob);
-          const audio = new Audio(url);
-          audioRef.current = audio;
-          setSpeaking(true);
-          // Tell the backend the exact playback window so it mutes the mic and
-          // never transcribes JARVIS's own voice (feedback-loop prevention).
-          const ttsEnd = () => {
-            setSpeaking(false);
-            URL.revokeObjectURL(url);
-            audioRef.current = null;
-            wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
-          };
-          audio.onended = ttsEnd;
-          audio.onerror = ttsEnd;
-          audio
-            .play()
-            .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
-            .catch(() => ttsEnd());
-        }
-        if (d.type === "tts_stop") {
-          if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current = null;
-          }
-          setSpeaking(false);
-          setStreamLine("");
-          wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
-        }
-        if (d.type === "system" && txt.trim()) {
-          addLineRef.current("system", txt);
-        }
-        if (d.type === "content_panel" && d.title) {
-          addLineRef.current("system", d.body ? `${d.title}\n${d.body}` : String(d.title));
-        }
-        if (d.type === "system_alert" && d.text) {
-          notifyNative("JARVIS", String(d.text));
-        }
-        if (d.type === "council_start") {
-          setCouncil({
-            active: true,
-            panel: (d.panel as string[]) ?? [],
-            proposals: [],
-            verdict: "",
-          });
-          addLineRef.current(
-            "system",
-            `Convening panel: ${((d.panel as string[]) ?? []).join(", ")}`,
-          );
-        }
-        if (d.type === "council_proposal") {
-          setCouncil((c) => ({
-            ...c,
-            proposals: [...c.proposals, { model: String(d.model), text: txt }],
-          }));
-          addLineRef.current("tool", `[${d.model}] ${txt}`);
-        }
-        if (d.type === "council_verdict") {
-          setCouncil((c) => ({ ...c, active: false, verdict: txt }));
-        }
-        if (d.type === "voice_changed" && d.voice) setVoiceId(String(d.voice));
-        if (d.type === "open_trading") {
-          window?.electronAPI
-            ?.openTrading?.()
-            .then((r) => {
-              if (r?.ok === false && r.error) addLineRef.current("system", r.error);
-              else addLineRef.current("system", "Opening trading terminal…");
-            })
-            .catch(() => addLineRef.current("system", "Could not open the trading terminal."));
-        }
-        if (d.type === "name_changed" && d.name) {
-          setAgentStatus((prev) => ({ ...prev, user: { name: String(d.name), onboarded: true } }));
-          addLineRef.current("system", `Operator set to ${d.name}.`);
-        }
-        if (d.type === "watch_state") setWatching(Boolean(d.watching));
-        if (d.type === "ict_alert") {
-          const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-          setAlerts((a) => [{ symbol: String(d.symbol), text: txt, at }, ...a].slice(0, 8));
-          flashReactorRef.current();
-        }
-        if (d.type === "governor_decision") {
-          if (d.decision) setGovDecision(d.decision as GovDecision);
-          if (d.homeostasis) setHomeostasis(d.homeostasis as Homeostasis);
-          if (d.device) setDeviceBrief(d.device as DeviceBrief);
-          flashReactorRef.current();
-        }
-        if (d.type === "governor_mode" && d.mode) setGovMode(String(d.mode));
-        if (d.type === "model_pull") {
-          setPulls((p) => ({
-            ...p,
-            [String(d.model)]: { status: String(d.status ?? ""), pct: Number(d.pct) || 0 },
-          }));
-          const done = d.status === "success" || d.status === "done" || (Number(d.pct) || 0) >= 100;
-          if (d.status === "error" && d.error) addLineRef.current("system", String(d.error));
-          if (done) fetchModelsRef.current?.();
-        }
-        if (d.type === "model_bench")
-          setBench((b) => ({
-            ...b,
-            [String(d.model)]: {
-              tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined,
-              status: String(d.status ?? ""),
-            },
-          }));
-        if (d.type === "model_delete" || d.type === "local_model_set") {
-          if (d.type === "local_model_set" && d.ok === false && d.error) {
-            addLineRef.current("system", String(d.error));
-          }
-          fetchModelsRef.current?.();
-        }
-        if (d.type === "sleep") {
-          setSleepMsg(d.state === "start" ? "Consolidating memory…" : txt || "rested");
-          if (d.state === "done") {
-            fetchMemRef.current?.();
-            window.setTimeout(() => setSleepMsg(null), 6000);
-          }
-        }
-        if (d.type === "memory_update") fetchMemRef.current?.();
-        if (d.type === "audio_level") setAudioLevel(Number(d.level) || 0);
-        // Authoritative mic state — keeps Always-on listening in sync with the UI.
-        if (d.type === "mic") setListening(Boolean(d.listening));
-        if (d.type === "tasks" && Array.isArray(d.tasks)) setTasks(d.tasks);
-        if (d.type === "agent_tool" && d.step) {
-          const s = d.step as AgentTrace;
-          addLineRef.current("tool", `[${s.action}] ${s.observation}`);
-          setAgentStatus((prev) => ({
-            ...prev,
-            trace: [...(prev.trace ?? []), s].slice(-30),
-          }));
-          setRightTab("trace");
-          setRunningTool(null);
-          // Security work belongs in the big Ops console, not a side tab — pop it open.
-          if (
-            ["recon", "pentest", "scope", "browse", "report", "bugbounty"].includes(s.action) ||
-            s.action.startsWith("bugbounty")
-          )
-            setOpsOpen(true);
-        }
-      } catch {
-        addLineRef.current("system", "Malformed backend packet.");
-      }
-    };
-  }, []); // empty deps — stable forever
-  connectWsRef.current = connectWs;
-
-  // Run once on mount only — no dependency array churn
   useEffect(() => {
-    connectWs();
+    if (connected) refreshStatus();
+  }, [connected, refreshStatus]);
+
+  useEffect(() => {
     const id = setInterval(() => refreshRef.current(), 15000);
-    // Capture ref objects (not .current) so cleanup clears the latest timers
-    const speakTimerRef = speakTmr;
-    const reconnectTimerRefLocal = reconnectTimerRef;
-    const reconnectHintTimerRefLocal = reconnectHintTimerRef;
-    const audioLocal = audioRef;
-    const wsLocal = wsRef;
-    return () => {
-      clearInterval(id);
-      if (speakTimerRef.current) clearTimeout(speakTimerRef.current);
-      if (audioLocal.current) {
-        audioLocal.current.pause();
-        audioLocal.current = null;
-      }
-      manualCloseRef.current = true;
-      if (reconnectTimerRefLocal.current) {
-        clearTimeout(reconnectTimerRefLocal.current);
-        reconnectTimerRefLocal.current = null;
-      }
-      if (reconnectHintTimerRefLocal.current) {
-        clearTimeout(reconnectHintTimerRefLocal.current);
-        reconnectHintTimerRefLocal.current = null;
-      }
-      if (wsLocal.current) {
-        wsLocal.current.onclose = null;
-        wsLocal.current.onerror = null;
-        wsLocal.current.close();
-      }
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(
+    () =>
+      subscribe((d) => {
+        const txt: string = String(d.text ?? d.message ?? "");
+        switch (d.type) {
+          case "state":
+          case "status":
+            if (txt.trim()) addLine("system", txt);
+            {
+              const rm = /Running\s+([a-z_]+)/i.exec(txt || "");
+              if (rm) {
+                setRunningTool({ action: rm[1] });
+                if (["recon", "pentest", "scope", "browse", "report", "bugbounty"].includes(rm[1]))
+                  setOpsOpen(true);
+              } else if (d.status === "idle") {
+                setRunningTool(null);
+              }
+            }
+            break;
+          case "llm_response":
+          case "response":
+            flashReactorRef.current();
+            refreshRef.current();
+            break;
+          case "content_panel":
+            if (d.title) addLine("system", d.body ? `${d.title}\n${d.body}` : String(d.title));
+            break;
+          case "council_start":
+            setCouncil({
+              active: true,
+              panel: (d.panel as string[]) ?? [],
+              proposals: [],
+              verdict: "",
+            });
+            addLine("system", `Convening panel: ${((d.panel as string[]) ?? []).join(", ")}`);
+            break;
+          case "council_proposal":
+            setCouncil((c) => ({
+              ...c,
+              proposals: [...c.proposals, { model: String(d.model), text: txt }],
+            }));
+            addLine("system", `[${d.model}] ${txt}`);
+            break;
+          case "council_verdict":
+            setCouncil((c) => ({ ...c, active: false, verdict: txt }));
+            break;
+          case "voice_changed":
+            if (d.voice) setVoiceId(String(d.voice));
+            break;
+          case "name_changed":
+            if (d.name) {
+              setAgentStatus((prev) => ({
+                ...prev,
+                user: { name: String(d.name), onboarded: true },
+              }));
+              addLine("system", `Operator set to ${d.name}.`);
+            }
+            break;
+          case "watch_state":
+            setWatching(Boolean(d.watching));
+            break;
+          case "ict_alert": {
+            const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+            setAlerts((a) => [{ symbol: String(d.symbol), text: txt, at }, ...a].slice(0, 8));
+            flashReactorRef.current();
+            break;
+          }
+          case "governor_decision":
+            if (d.decision) setGovDecision(d.decision as GovDecision);
+            if (d.homeostasis) setHomeostasis(d.homeostasis as Homeostasis);
+            if (d.device) setDeviceBrief(d.device as DeviceBrief);
+            flashReactorRef.current();
+            break;
+          case "governor_mode":
+            if (d.mode) setGovMode(String(d.mode));
+            break;
+          case "model_pull": {
+            setPulls((p) => ({
+              ...p,
+              [String(d.model)]: { status: String(d.status ?? ""), pct: Number(d.pct) || 0 },
+            }));
+            const done =
+              d.status === "success" || d.status === "done" || (Number(d.pct) || 0) >= 100;
+            if (d.status === "error" && d.error) addLine("system", String(d.error));
+            if (done) fetchModelsRef.current?.();
+            break;
+          }
+          case "model_bench":
+            setBench((b) => ({
+              ...b,
+              [String(d.model)]: {
+                tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined,
+                status: String(d.status ?? ""),
+              },
+            }));
+            break;
+          case "model_delete":
+          case "local_model_set":
+            if (d.type === "local_model_set" && d.ok === false && d.error) {
+              addLine("system", String(d.error));
+            }
+            fetchModelsRef.current?.();
+            break;
+          case "sleep":
+            setSleepMsg(d.state === "start" ? "Consolidating memory…" : txt || "rested");
+            if (d.state === "done") {
+              fetchMemRef.current?.();
+              window.setTimeout(() => setSleepMsg(null), 6000);
+            }
+            break;
+          case "memory_update":
+            fetchMemRef.current?.();
+            break;
+          case "tasks":
+            if (Array.isArray(d.tasks)) setTasks(d.tasks as Task[]);
+            break;
+          case "agent_tool": {
+            const s = d.step as AgentTrace | undefined;
+            if (!s?.action) break;
+            addLine("system", `[${s.action}] ${s.observation}`);
+            setAgentStatus((prev) => ({
+              ...prev,
+              trace: [...(prev.trace ?? []), s].slice(-30),
+            }));
+            setRightTab("trace");
+            setRunningTool(null);
+            if (
+              ["recon", "pentest", "scope", "browse", "report", "bugbounty"].includes(s.action) ||
+              s.action.startsWith("bugbounty")
+            )
+              setOpsOpen(true);
+            break;
+          }
+        }
+      }),
+    [subscribe, addLine],
+  );
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 9e6, behavior: reduced ? "auto" : "smooth" });
-  }, [lines.length, reduced]);
+  }, [visibleLines.length, stream, reduced]);
 
   // Keep the maximize/restore icon in sync with the actual window state.
   useEffect(() => {
@@ -789,93 +658,73 @@ function CommandDeck() {
     if (agentStatus.homeostasis) setHomeostasis(agentStatus.homeostasis);
   }, [agentStatus.homeostasis]);
 
-  const setMode = useCallback((m: string) => {
-    setGovMode(m);
-    wsRef.current?.send(JSON.stringify({ action: "set_mode", mode: m }));
-  }, []);
+  const setMode = useCallback(
+    (m: string) => {
+      setGovMode(m);
+      sendAction("set_mode", { mode: m });
+    },
+    [sendAction],
+  );
   const onPull = useCallback(
     (tag: string) => {
       const ok = models?.recommended?.some((r) => r.tag === tag);
       if (!ok) return;
-      wsRef.current?.send(JSON.stringify({ action: "pull_model", model: tag }));
+      sendAction("pull_model", { model: tag });
     },
-    [models?.recommended],
+    [models?.recommended, sendAction],
   );
-  const onBench = useCallback((name: string) => {
-    wsRef.current?.send(JSON.stringify({ action: "benchmark_model", model: name }));
-  }, []);
+  const onBench = useCallback(
+    (name: string) => {
+      sendAction("benchmark_model", { model: name });
+    },
+    [sendAction],
+  );
   const onUse = useCallback(
     (name: string) => {
       const mod = models?.installed?.find((m) => m.name === name);
       if (mod && mod.runnable === false) return;
-      wsRef.current?.send(JSON.stringify({ action: "set_local_model", model: name }));
+      sendAction("set_local_model", { model: name });
     },
-    [models?.installed],
+    [models?.installed, sendAction],
   );
-  const onDelete = useCallback((name: string) => {
-    if (!window.confirm(`Delete ${name} from disk? You'll need to download it again to use it.`))
-      return;
-    wsRef.current?.send(JSON.stringify({ action: "delete_model", model: name }));
-    setBench((b) => {
-      const n = { ...b };
-      delete n[name];
-      return n;
-    });
-  }, []);
-  const onForget = useCallback((id: number) => {
-    wsRef.current?.send(JSON.stringify({ action: "forget_memory", id }));
-    setMemItems((prev) => prev.filter((m) => m.id !== id));
-  }, []);
+  const onDelete = useCallback(
+    (name: string) => {
+      if (!window.confirm(`Delete ${name} from disk? You'll need to download it again to use it.`))
+        return;
+      sendAction("delete_model", { model: name });
+      setBench((b) => {
+        const n = { ...b };
+        delete n[name];
+        return n;
+      });
+    },
+    [sendAction],
+  );
+  const onForget = useCallback(
+    (id: number) => {
+      sendAction("forget_memory", { id });
+      setMemItems((prev) => prev.filter((m) => m.id !== id));
+    },
+    [sendAction],
+  );
   const onSleep = useCallback(() => {
-    wsRef.current?.send(JSON.stringify({ action: "trigger_sleep" }));
-  }, []);
+    sendAction("trigger_sleep");
+  }, [sendAction]);
 
   const sendCommand = useCallback(
-    async (cmd = input) => {
+    (cmd = input) => {
       const text = cmd.trim();
       if (!text) return;
-      addLine("user", text);
       setInput("");
       setHistIdx(-1);
       setCmdHistory((h) => [text, ...h.slice(0, 49)]);
       inputRef.current?.focus();
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ action: "command", text }));
-        return;
-      }
-      try {
-        const r = await fetch("/api/command", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ command: text }),
-        });
-        if (!r.ok) throw new Error();
-        // /api/command only acknowledges — the reply streams back over the WebSocket,
-        // which is down if we're on this path. Bring the uplink back to receive it.
-        addLine("system", "Got it — one moment, then I'll reply.");
-        connectWsRef.current?.();
-      } catch {
-        setError("Waking up…");
-      }
+      send(text);
     },
-    [addLine, input],
+    [input, send],
   );
 
-  const toggleListen = () => {
-    if (!connected) {
-      connectWs();
-      return;
-    }
-    // While JARVIS is speaking, tapping mic means "stop talking," not "start
-    // listening over you" — surfaces the backend's dedicated interrupt action.
-    if (speaking) {
-      wsRef.current?.send(JSON.stringify({ action: "stop" }));
-      return;
-    }
-    const next = !listening;
-    setListening(next);
-    wsRef.current?.send(JSON.stringify({ action: next ? "start_listening" : "stop_listening" }));
-  };
+  const toggleListen = toggleMic;
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
@@ -911,23 +760,24 @@ function CommandDeck() {
     .slice(-4)
     .reverse();
 
-  const connTone: Tone = connected ? "online" : connecting ? "warn" : "idle";
+  const connTone: Tone = connected ? "online" : showReconnectHint ? "idle" : "warn";
   const connLabel = connected
     ? listening
       ? "listening"
       : "online"
-    : connecting
-      ? "linking…"
-      : "offline";
+    : showReconnectHint
+      ? "offline"
+      : "linking…";
 
   const cloudOn = (agentStatus.governor?.available ?? []).some(
     (r) => r === "cloud_fast" || r === "cloud_deep" || r === "council",
   );
   const localOn = Boolean(agentStatus.local?.enabled);
+  const displayEmotion = (mood as AgentStatus["emotion"]) ?? agentStatus.emotion;
   const brainSummary = !connected
-    ? connecting
-      ? "connecting…"
-      : "offline"
+    ? showReconnectHint
+      ? "offline"
+      : "connecting…"
     : cloudOn
       ? "cloud + local AI"
       : localOn
@@ -942,7 +792,7 @@ function CommandDeck() {
         <div className="hud-bg-grid" />
         <HudAmbient
           state={speaking ? "speaking" : listening ? "listening" : "idle"}
-          intensity={agentStatus.emotion?.enabled ? (agentStatus.emotion.intensity ?? 0.5) : 0.4}
+          intensity={displayEmotion?.enabled ? (displayEmotion.intensity ?? 0.5) : 0.4}
         />
         <div className="hud-bg-scanline" />
         <motion.div
@@ -966,16 +816,23 @@ function CommandDeck() {
 
         <div className="hud-statusbar no-drag">
           <StatusDot tone={connTone} pulse />
-          <span className="hud-statusbar-main">{brainSummary}</span>
+          <span className="hud-statusbar-main" aria-live="polite">
+            {brainSummary}
+          </span>
           {connected && !cloudOn && (
-            <button className="hud-statusbar-nudge" onClick={() => setSettingsOpen(true)}>
+            <button
+              type="button"
+              className="hud-statusbar-nudge"
+              aria-label="Open settings to add a free API key for faster, smarter answers"
+              onClick={() => setSettingsOpen(true)}
+            >
               add a free API key for faster, smarter answers →
             </button>
           )}
         </div>
 
         <div className="hud-header-controls no-drag">
-          <MoodChip emotion={agentStatus.emotion} />
+          <MoodChip emotion={displayEmotion} />
           <IconBtn
             onClick={() => setOpsOpen((o) => !o)}
             title="Live Ops — pentest console (step-by-step tool activity)"
@@ -1112,7 +969,7 @@ function CommandDeck() {
         </motion.aside>
 
         {/* ── CENTER: TERMINAL ── */}
-        <section className="hud-center" style={{ position: "relative" }}>
+        <main id="hud-main" className="hud-center" style={{ position: "relative" }}>
           {/* Live Ops console — the pentest cockpit. Overlays the conversation when a
               security tool runs; toggle with the Ops button in the header. */}
           <AnimatePresence>
@@ -1132,7 +989,7 @@ function CommandDeck() {
             <div className="flex items-center gap-2">
               <span className="text-amber text-[10px]">›</span>
               <span className="hud-label">Conversation</span>
-              <span className="hud-badge">{lines.length}</span>
+              <span className="hud-badge">{visibleLines.length}</span>
             </div>
             <div className="flex items-center gap-2">
               <motion.span
@@ -1143,7 +1000,10 @@ function CommandDeck() {
                 {speaking ? "TX" : connected ? "RX" : "IDLE"}
               </motion.span>
               <IconBtn
-                onClick={() => setLines([mkLine("system", "Terminal cleared.")])}
+                onClick={() => {
+                  setLineCut(lines.length);
+                  addLine("system", "Terminal cleared.");
+                }}
                 title="Clear"
               >
                 <Trash2 className="w-3 h-3" />
@@ -1152,9 +1012,15 @@ function CommandDeck() {
           </div>
 
           {/* Messages */}
-          <div ref={scrollRef} className="hud-messages">
+          <div
+            ref={scrollRef}
+            className="hud-messages"
+            role="log"
+            aria-live="polite"
+            aria-relevant="additions"
+          >
             <AnimatePresence initial={false}>
-              {lines.map((line) => (
+              {visibleLines.map((line) => (
                 <motion.div
                   key={line.id}
                   className={`hud-msg hud-msg--${line.role}`}
@@ -1172,12 +1038,12 @@ function CommandDeck() {
               ))}
             </AnimatePresence>
 
-            {streamLine && (
+            {stream && (
               <div className="hud-msg hud-msg--agent" style={{ opacity: 0.85 }}>
                 <span className="hud-msg-time">{new Date().toTimeString().slice(0, 8)}</span>
                 <span className="hud-msg-role hud-msg-role--amber">JARVIS</span>
                 <span className="hud-msg-text">
-                  {streamLine}
+                  {stream}
                   <motion.span
                     animate={{ opacity: [1, 0] }}
                     transition={{ duration: 0.6, repeat: Infinity, ease: "easeInOut" }}
@@ -1231,6 +1097,7 @@ function CommandDeck() {
             >
               <ChevronRight className="w-3.5 h-3.5 text-amber shrink-0" />
               <input
+                id="hud-composer"
                 ref={inputRef}
                 className="hud-input"
                 value={input}
@@ -1262,6 +1129,8 @@ function CommandDeck() {
               {error && (
                 <motion.p
                   className="hud-error"
+                  role="status"
+                  aria-live="polite"
                   initial={{ opacity: 0, height: 0 }}
                   animate={{ opacity: 1, height: "auto" }}
                   exit={{ opacity: 0, height: 0 }}
@@ -1272,12 +1141,12 @@ function CommandDeck() {
             </AnimatePresence>
             <p className="hud-hint">Enter · send &nbsp;|&nbsp; ↑↓ · history</p>
           </div>
-        </section>
+        </main>
 
         {/* ── RIGHT: TABBED PANEL ── */}
         <aside className="hud-right">
           {/* Tab bar */}
-          <div className="hud-tabs">
+          <div className="hud-tabs" role="tablist" aria-label="Command deck panels">
             {(
               [
                 { id: "governor", icon: Cpu, label: "Brain", badge: undefined },
@@ -1310,6 +1179,11 @@ function CommandDeck() {
             ).map((tab) => (
               <button
                 key={tab.id}
+                type="button"
+                role="tab"
+                id={`hud-tab-${tab.id}`}
+                aria-selected={rightTab === tab.id}
+                aria-controls={`hud-panel-${tab.id}`}
                 className={`hud-tab ${rightTab === tab.id ? "hud-tab--active" : ""}`}
                 onClick={() => setRightTab(tab.id)}
                 title={tab.label}
@@ -1327,6 +1201,9 @@ function CommandDeck() {
               {rightTab === "tasks" && (
                 <motion.div
                   key="tasks"
+                  role="tabpanel"
+                  id="hud-panel-tasks"
+                  aria-labelledby="hud-tab-tasks"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1359,6 +1236,9 @@ function CommandDeck() {
               {rightTab === "trace" && (
                 <motion.div
                   key="trace"
+                  role="tabpanel"
+                  id="hud-panel-trace"
+                  aria-labelledby="hud-tab-trace"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1391,6 +1271,9 @@ function CommandDeck() {
               {rightTab === "governor" && (
                 <motion.div
                   key="governor"
+                  role="tabpanel"
+                  id="hud-panel-governor"
+                  aria-labelledby="hud-tab-governor"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1410,6 +1293,9 @@ function CommandDeck() {
               {rightTab === "rig" && (
                 <motion.div
                   key="rig"
+                  role="tabpanel"
+                  id="hud-panel-rig"
+                  aria-labelledby="hud-tab-rig"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1431,6 +1317,9 @@ function CommandDeck() {
               {rightTab === "memory" && (
                 <motion.div
                   key="memory"
+                  role="tabpanel"
+                  id="hud-panel-memory"
+                  aria-labelledby="hud-tab-memory"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1450,6 +1339,9 @@ function CommandDeck() {
               {rightTab === "markets" && (
                 <motion.div
                   key="markets"
+                  role="tabpanel"
+                  id="hud-panel-markets"
+                  aria-labelledby="hud-tab-markets"
                   className="hud-tab-panel"
                   initial={{ opacity: 0, x: 12 }}
                   animate={{ opacity: 1, x: 0 }}
@@ -1467,11 +1359,7 @@ function CommandDeck() {
                     intervalMin={agentStatus.watch?.interval_min ?? 5}
                     alerts={alerts}
                     onRefresh={() => fetchMarket(mktSymbol)}
-                    onToggleWatch={() =>
-                      wsRef.current?.send(
-                        JSON.stringify({ action: watching ? "stop_watch" : "start_watch" }),
-                      )
-                    }
+                    onToggleWatch={() => sendAction(watching ? "stop_watch" : "start_watch")}
                     onDeliberate={(q) => sendCommand(`deliberate: ${q}`)}
                   />
                 </motion.div>
@@ -1488,15 +1376,15 @@ function CommandDeck() {
         currentVoice={currentVoice}
         onClose={() => setSettingsOpen(false)}
         onSave={(nm, voice) => {
-          if (nm && nm !== userName)
-            wsRef.current?.send(JSON.stringify({ action: "set_name", name: nm }));
+          if (nm && nm !== userName) sendAction("set_name", { name: nm });
           if (voice && voice !== currentVoice) {
             setVoiceId(voice);
-            wsRef.current?.send(JSON.stringify({ action: "set_voice", voice }));
+            sendAction("set_voice", { voice });
           }
           setSettingsOpen(false);
         }}
       />
+      <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       <HelpModal
         open={helpOpen}
         onClose={() => setHelpOpen(false)}
@@ -2899,6 +2787,9 @@ function HelpModal({
       {open && (
         <motion.div
           className="hud-modal-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="hud-help-title"
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
@@ -2913,7 +2804,7 @@ function HelpModal({
             onClick={(e) => e.stopPropagation()}
           >
             <div className="hud-modal-header">
-              <span>What is JARVIS?</span>
+              <span id="hud-help-title">What is JARVIS?</span>
               <IconBtn onClick={onClose} title="Close">
                 <X className="w-3 h-3" />
               </IconBtn>
@@ -2948,6 +2839,7 @@ function HelpModal({
             </div>
             <div className="hud-modal-footer">
               <button
+                type="button"
                 className="hud-modal-btn hud-modal-btn--ghost"
                 onClick={() => {
                   onClose();
@@ -2956,7 +2848,11 @@ function HelpModal({
               >
                 Open Settings
               </button>
-              <button className="hud-modal-btn hud-modal-btn--primary" onClick={onClose}>
+              <button
+                type="button"
+                className="hud-modal-btn hud-modal-btn--primary"
+                onClick={onClose}
+              >
                 Got it
               </button>
             </div>
@@ -3047,10 +2943,11 @@ function IconBtn({
 }) {
   return (
     <motion.button
+      type="button"
       className={`hud-icon-btn ${active ? "hud-icon-btn--active" : ""} ${danger ? "hud-icon-btn--danger" : ""}`}
       onClick={onClick}
       title={title}
-      aria-label={ariaLabel || title}
+      aria-label={ariaLabel ?? title}
       whileHover={{ scale: 1.08 }}
       whileTap={{ scale: 0.93 }}
     >

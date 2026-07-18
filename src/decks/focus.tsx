@@ -5,6 +5,7 @@
 // Rendered by src/routes/index.tsx as a plain component.
 import { useEffect, useRef, useState } from "react";
 import { WindowControls } from "@/components/jarvis/WindowControls";
+import { ToolApprovalBanner } from "@/components/jarvis/ToolApprovalBanner";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
 const ACCENT = "oklch(0.74 0.13 205)"; // cool cyan — distinct from the amber decks
@@ -22,6 +23,8 @@ export default function FocusDeck() {
     send,
     toggleMic,
     showReconnectHint,
+    pendingApproval,
+    respondApproval,
   } = useJarvisSocket("JARVIS online. Ask, or tap the orb to speak.");
   const [input, setInput] = useState("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -52,6 +55,7 @@ export default function FocusDeck() {
         paddingBottom: 48, // reserve room for the global UI switcher docked at the bottom
       }}
     >
+      <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* full-width header — controls pinned to window top-right */}
       <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>
         <div

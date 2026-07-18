@@ -60,7 +60,10 @@ export function SettingsPanel({
         return r.json();
       })
       .then(setS)
-      .catch(() => setS(null));
+      .catch((e) => {
+        setS(null);
+        setErr(e instanceof Error ? e.message : "Couldn't load settings from the backend.");
+      });
     if (hasElectron)
       window.electronAPI!.getApiKeyStatus!()
         .then(setKeyStatus)
@@ -87,7 +90,10 @@ export function SettingsPanel({
   };
 
   const save = useCallback(async () => {
-    if (!s) return;
+    if (!s) {
+      setErr("Settings haven't loaded — is the backend running? Close and reopen Settings.");
+      return;
+    }
     setSaving(true);
     setErr("");
     try {

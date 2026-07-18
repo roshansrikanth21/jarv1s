@@ -29,11 +29,21 @@ export type JarvisSocket = {
    *  the UI show a calm "waking up" state instead of flashing an error on
    *  every brief, self-healing blip. Never mention backend/WebSocket/retry. */
   showReconnectHint: boolean;
+  /** Privileged-tool confirm prompt from the backend (shell, etc.). */
+  pendingApproval: {
+    id: string;
+    tool: string;
+    summary: string;
+    args?: Record<string, unknown>;
+    timeoutSec?: number;
+  } | null;
   send: (text: string) => void;
   toggleMic: () => void;
   addLine: (role: Role, text: string) => void;
   /** Send any protocol action (set_mode, pull_model, trigger_sleep, …). */
   sendAction: (action: string, payload?: Record<string, unknown>) => void;
+  /** Approve or deny a pending tool_approval prompt. */
+  respondApproval: (id: string, approved: boolean) => void;
   /** Tap the raw message stream (governor_decision, model_pull, …) beyond the
    *  core routing above. Returns an unsubscribe function. */
   subscribe: (handler: (msg: Record<string, unknown>) => void) => () => void;
@@ -48,6 +58,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   const [mood, setMood] = useState<Mood>(null);
   const [level, setLevel] = useState(0);
   const [showReconnectHint, setShowReconnectHint] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState<JarvisSocket["pendingApproval"]>(null);
   const reconnectHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -235,6 +246,18 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         if (d.type === "mic") setListening(Boolean(d.listening));
         if (d.type === "audio_level") setLevel(Number(d.level) || 0);
         if (d.type === "system_alert" && txt.trim()) notifyNative("JARVIS", txt);
+        if (d.type === "tool_approval" && d.id) {
+          setPendingApproval({
+            id: String(d.id),
+            tool: String(d.tool || "tool"),
+            summary: String(d.summary || "Privileged action requested."),
+            args: (d.args as Record<string, unknown>) || undefined,
+            timeoutSec: typeof d.timeout_sec === "number" ? d.timeout_sec : undefined,
+          });
+        }
+        if (d.type === "tool_approval_resolved") {
+          setPendingApproval(null);
+        }
         tapsRef.current.forEach((fn) => {
           try {
             fn(d);
@@ -358,6 +381,18 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
     connRef.current();
   }, []);
 
+  const respondApproval = useCallback((id: string, approved: boolean) => {
+    setPendingApproval(null);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action: "tool_approve", id, approved }));
+      return;
+    }
+    if (pendingActionsRef.current.length < 24) {
+      pendingActionsRef.current.push({ action: "tool_approve", payload: { id, approved } });
+    }
+    connRef.current();
+  }, []);
+
   const subscribe = useCallback((handler: (msg: Record<string, unknown>) => void) => {
     tapsRef.current.add(handler);
     return () => {
@@ -374,10 +409,12 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
     mood,
     level,
     showReconnectHint,
+    pendingApproval,
     send,
     toggleMic,
     addLine: add,
     sendAction,
+    respondApproval,
     subscribe,
   };
 }

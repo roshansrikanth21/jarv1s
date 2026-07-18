@@ -4,6 +4,7 @@
 // hook (no protocol re-implementation). Rendered by src/routes/index.tsx.
 import { useEffect, useRef, useState } from "react";
 import { WindowControls } from "@/components/jarvis/WindowControls";
+import { ToolApprovalBanner } from "@/components/jarvis/ToolApprovalBanner";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
 const GREEN = "#41ff6e";
@@ -21,6 +22,8 @@ export default function TerminalDeck() {
     send,
     toggleMic,
     showReconnectHint,
+    pendingApproval,
+    respondApproval,
   } = useJarvisSocket("JARVIS terminal ready. Type a command or [speak].");
   const [input, setInput] = useState("");
   const [userName, setUserName] = useState("guest");
@@ -59,6 +62,7 @@ export default function TerminalDeck() {
         paddingBottom: 48, // reserve room for the global UI switcher docked at the bottom
       }}
     >
+      <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* title line (drag region for the frameless window) */}
       <div style={{ position: "relative", width: "100%", flexShrink: 0 }}>
         <div

@@ -81,16 +81,29 @@ TRADING_ROOT = Path(os.environ.get("C0MR4DES_DIR", str(BASE_DIR.parent / "c0mr4d
 
 # Load .env from repo root if present
 _env_file = BASE_DIR / ".env"
+# Security toggles: an explicit .env value must win over ambient process env (e.g. a parent
+# shell that exported JARVIS_SHELL_APPROVAL=0 for selftests would otherwise silently disable
+# the shell gate forever via setdefault).
+_ENV_FORCE = {
+    "JARVIS_SHELL_APPROVAL",
+    "JARVIS_APPROVAL_TOOLS",
+    "JARVIS_WS_ALLOW_ALL",
+    "JARVIS_WS_PORTS",
+}
 if _env_file.exists():
     # utf-8-sig strips a Windows/PowerShell BOM so "GROQ_API_KEY" isn't read as "\ufeffGROQ_API_KEY".
     for _line in _env_file.read_text(encoding="utf-8-sig").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
+            _k = _k.strip().lstrip("\ufeff")
             _v = _v.strip()
             if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
                 _v = _v[1:-1]
-            os.environ.setdefault(_k.strip().lstrip("\ufeff"), _v)
+            if _k in _ENV_FORCE:
+                os.environ[_k] = _v
+            else:
+                os.environ.setdefault(_k, _v)
 
 # ── Brain config ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -197,6 +210,15 @@ VOICE_OPTIONS = [
 FILLERS = ["On it.", "One sec.", "Let me check.", "Looking now.",
            "Give me a moment.", "Checking that."]
 SLOW_TOOLS = {"capture_screen", "search_web", "run_command", "ict_scan", "analyze_image", "watch_video", "get_weather", "browse", "recon", "pentest", "bugbounty"}
+# Tools that pause for an explicit UI confirm before executing. Off with JARVIS_SHELL_APPROVAL=0
+# (selftests / headless). Default on — shell is the highest-blast-radius tool.
+APPROVAL_TOOLS = {
+    t.strip() for t in os.environ.get("JARVIS_APPROVAL_TOOLS", "run_command").split(",") if t.strip()
+}
+SHELL_APPROVAL = os.environ.get("JARVIS_SHELL_APPROVAL", "1") != "0"
+_APPROVAL_TIMEOUT_SEC = float(os.environ.get("JARVIS_APPROVAL_TIMEOUT", "90"))
+# id → (asyncio.Event, result_box) where result_box is a one-element list [bool|None]
+_pending_approvals: dict[str, tuple[asyncio.Event, list]] = {}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
@@ -777,6 +799,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 asyncio.create_task(_start_watch())
             elif action == "stop_watch":
                 asyncio.create_task(_stop_watch())
+            elif action == "tool_approve":
+                # UI response to a tool_approval prompt (shell / privileged tools).
+                aid = str(data.get("id") or "")
+                pending = _pending_approvals.get(aid)
+                if pending:
+                    ev, box = pending
+                    box[0] = bool(data.get("approved"))
+                    ev.set()
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -3060,6 +3090,51 @@ async def _subagent_brain(messages: list[dict], tools: list[dict], max_tokens: i
     raise RuntimeError("no brain available for sub-agents (need GROQ_API_KEY or Ollama)")
 
 
+async def _request_tool_approval(name: str, args: dict) -> bool:
+    """Ask the connected UI to confirm a privileged tool. Returns True if approved.
+
+    No live client → deny (safer than silently running shell). Selftests set
+    JARVIS_SHELL_APPROVAL=0 so this path is skipped entirely.
+    """
+    if not SHELL_APPROVAL or name not in APPROVAL_TOOLS:
+        return True
+    if not active_connections:
+        return False
+    aid = uuid.uuid4().hex[:12]
+    summary = _approval_summary(name, args)
+    # Never ship full argv dumps that could include secrets — truncate + redact.
+    safe_args = {k: (str(v)[:200] if not isinstance(v, (dict, list)) else str(v)[:200])
+                 for k, v in (args or {}).items()}
+    ev = asyncio.Event()
+    box: list = [None]
+    _pending_approvals[aid] = (ev, box)
+    try:
+        await broadcast({
+            "type": "tool_approval",
+            "id": aid,
+            "tool": name,
+            "summary": summary,
+            "args": safe_args,
+            "timeout_sec": _APPROVAL_TIMEOUT_SEC,
+        })
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=_APPROVAL_TIMEOUT_SEC)
+        except asyncio.TimeoutError:
+            return False
+        return bool(box[0])
+    finally:
+        _pending_approvals.pop(aid, None)
+
+
+def _approval_summary(name: str, args: dict) -> str:
+    if name == "run_command":
+        cmd = str(args.get("command") or "").strip()
+        cwd = str(args.get("cwd") or "").strip()
+        tail = f" (cwd {cwd})" if cwd else ""
+        return f"Run shell command{tail}:\n{cmd[:400]}"
+    return f"Allow tool `{name}` with args {json.dumps(args)[:300]}"
+
+
 async def _run_tool(name: str, args: dict) -> str:
     global _filler_sent, _pending_content_panel
     # A slow tool means a real wait — bridge the dead air with a quick spoken
@@ -3070,6 +3145,25 @@ async def _run_tool(name: str, args: dict) -> str:
     await broadcast({"type": "state", "status": "thinking", "text": f"Running {name}..."})
     my_gen = _turn_generation
     try:
+        if name in APPROVAL_TOOLS and SHELL_APPROVAL:
+            approved = await _request_tool_approval(name, args)
+            if not approved:
+                observation = (
+                    f"Tool `{name}` was not approved — the operator declined or the "
+                    "approval timed out. Do not retry the same privileged action unless "
+                    "they explicitly ask again."
+                )
+                entry = {
+                    "step": len(agent_trace) + 1,
+                    "action": name,
+                    "args": args,
+                    "observation": observation,
+                }
+                agent_trace.append(entry)
+                agent_trace[:] = agent_trace[-25:]
+                await broadcast({"type": "agent_tool", "step": entry})
+                await broadcast({"type": "tool_approval_resolved", "id": None, "approved": False, "tool": name})
+                return observation
         if name == "spawn_agents":
             # Native async path — execute_tool is sync and can't await sub-agent gathering.
             # subagents.run_all is bounded (max 5 agents, 6 tool iterations each, 90s wall
@@ -3248,14 +3342,37 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools)
+        except _openai_mod.AuthenticationError:
+            return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
+                    "in Settings (Electron) or `.env`, then restart the backend.")
         except _openai_mod.RateLimitError:
             return "I've hit Groq's per-minute rate limit. Give me a few seconds and ask again."
-        except _openai_mod.APIError:
+        except _openai_mod.APIError as exc:
+            status = getattr(exc, "status_code", None)
+            if status in (401, 403):
+                return ("Groq auth failed — the API key looks invalid or revoked. "
+                        "Update GROQ_API_KEY and restart.")
+            # Groq free tier often returns 413 for TPM (tokens/min), not 429 RateLimitError.
+            if status in (413, 429):
+                return ("Groq rate/token limit hit (HTTP "
+                        f"{status}). Wait about a minute, say 'reset' to shrink context, "
+                        "then try again.")
             # Malformed tool call rejected mid-stream — retry forcing a text answer;
             # prior tool results stay in context.
             try:
                 full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
-            except _openai_mod.APIError:
+            except _openai_mod.AuthenticationError:
+                return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
+                        "and restart the backend.")
+            except _openai_mod.APIError as exc2:
+                status2 = getattr(exc2, "status_code", None)
+                if status2 in (401, 403):
+                    return ("Groq auth failed — the API key looks invalid or revoked. "
+                            "Update GROQ_API_KEY and restart.")
+                if status2 in (413, 429):
+                    return ("Groq rate/token limit hit (HTTP "
+                            f"{status2}). Wait about a minute, say 'reset' to shrink context, "
+                            "then try again.")
                 break
 
         if not tool_calls_raw:
@@ -3624,7 +3741,8 @@ async def _run_agent(text: str) -> None:
         answer = (await _run_rung(rung, text, dev, decision) or "").strip()
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        logging.getLogger("jarvis").warning("rung %s failed: %s: %s", rung, type(exc).__name__, exc)
         answer = ""
 
     # Escalation-on-failure: the lattice exists so a task that stumps the cheap rung can climb
@@ -3641,7 +3759,9 @@ async def _run_agent(text: str) -> None:
                 answer = (await _run_rung(fb, text, dev, decision) or "").strip()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                logging.getLogger("jarvis").warning(
+                    "fallback rung %s failed: %s: %s", fb, type(exc).__name__, exc)
                 answer = ""
             if answer:
                 rung = fb                            # the rung that actually answered
@@ -4838,445 +4958,15 @@ def _voice_worker() -> None:
     _voice_stopped()
 
 
-# ── HTTP API ───────────────────────────────────────────────────────────────────
-@app.get("/api/agent/status")
-async def agent_status() -> dict:
-    cpu  = psutil.cpu_percent(interval=0)
-    vm   = psutil.virtual_memory()
-    disk = psutil.disk_usage(_disk_root())
-    try:
-        _rss_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
-    except Exception:
-        _rss_mb = None
-    return {
-        "brain": {
-            "primary_llm":          _routing_label(),
-            "configured_default":   _active_model(),
-            "last_rung":            (_last_decision or {}).get("rung"),
-            "local_model":          (_settings.get("local_model") or LOCAL_DEEP or LOCAL_FAST or None),
-            "reasoning":            GROQ_REASONING if "gpt-oss" in GROQ_MODEL else "—",
-            "max_agent_steps":      8,
-        },
-        "conversation": {
-            "turns": len(_history) // 2,
-        },
-        "council": {
-            "panel": [_short_model(m) for m in MOA_PROPOSERS],
-            "chair": _short_model(MOA_AGGREGATOR),
-        },
-        "voice": {
-            "current": _tts_voice,
-            "options": VOICE_OPTIONS,
-            "tts": True,
-            "stt": _stt_available(),
-            "stt_hint": None if _stt_available() else
-                        "Mic input needs faster-whisper (local, offline) or a free Groq API key. Speech output does not.",
-        },
-        "user": {
-            "name":      _user_name(),
-            "onboarded": bool(_user_name()),
-        },
-        "watch": {
-            "watching":     _watching,
-            "watchlist":    WATCHLIST,
-            "interval_min": WATCH_INTERVAL_MIN,
-            "tf":           WATCH_TF,
-        },
-        "memory": {
-            "available": True,
-            "count":     cortex.stats().get("facts", 0),
-        },
-        "governor": {
-            "mode":      _gov.mode,
-            "available": sorted(_available_rungs()),
-            "metrics":   _gov.metrics(),
-        },
-        "emotion": _persona.snapshot() if persona_mod.ENABLED else {"enabled": False},
-        "ambient": _ambient_brief(ambient.snapshot()),
-        "perception": _last_read.summary() if _last_read else None,
-        "homeostasis": _homeostasis(_last_device) if _last_device else None,
-        "device_tier": (_last_device or {}).get("tier"),
-        "local": {"enabled": _LOCAL_OK, "fast": LOCAL_FAST, "deep": LOCAL_DEEP,
-                  "pinned": _settings.get("local_model")},
-        "tools": [
-            {"name": t["function"]["name"], "description": t["function"]["description"]}
-            for t in TOOLS
-        ],
-        "tasks": task_list,
-        "trace": agent_trace[-25:],
-        "sys": {
-            "cpu":  round(cpu),
-            "ram":  round(vm.percent),
-            # Host volume fill (not JARVIS I/O). Free space is the actionable signal.
-            "disk": round(disk.percent),
-            "disk_free_gb": round(disk.free / (1024 ** 3), 1),
-            "jarvis_rss_mb": _rss_mb,
-        },
-    }
-
-
-@app.post("/api/command")
-async def command_endpoint(request: Request) -> JSONResponse:
-    # Same origin/loopback gate as settings/upload — this endpoint drives the full agent
-    # (shell, desktop, browse). An ungated POST was the highest-impact CSRF surface.
-    if not _mutating_allowed(request):
-        return JSONResponse({"error": "forbidden origin"}, status_code=403)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    text = (body.get("command") or "").strip()
-    if not text:
-        return JSONResponse({"error": "empty command"}, status_code=400)
-    # Must go through dispatch_command — same barge-in + turn-generation path as WS/voice.
-    # Calling handle_command directly allowed overlapping agents and skipped interrupts.
-    asyncio.create_task(dispatch_command(text))
-    return JSONResponse({"status": "processing"})
-
-
-@app.get("/api/ict")
-async def ict_endpoint(symbol: str = "nifty", interval: str = "15m") -> dict:
-    """Structured ICT read for the Markets panel."""
-    return await asyncio.to_thread(_ict_analyze, symbol, interval)
-
-
-# ── Global settings (the shared Settings panel talks to these; keys are separate,
-#    handled by Electron safeStorage — never sent here) ──────────────────────────
-@app.get("/api/settings")
-async def get_settings() -> dict:
-    return {
-        "user_name":       _user_name(),
-        "voice":           _tts_voice,
-        "voice_options":   VOICE_OPTIONS,
-        "mode":            _gov.mode,
-        "modes":           list(governor.MODES),
-        "always_listen":   ALWAYS_LISTEN,
-        "store_overheard": STORE_OVERHEARD,
-        "stt":             _stt_available(),
-    }
-
-
-@app.post("/api/settings")
-async def post_settings(request: Request) -> JSONResponse:
-    """Apply a subset of non-secret prefs and broadcast changes so every connected deck
-    stays in sync. API keys are NOT accepted here — they go through Electron safeStorage."""
-    global _tts_voice, ALWAYS_LISTEN, STORE_OVERHEARD
-    if not _mutating_allowed(request):
-        return JSONResponse({"error": "forbidden origin"}, status_code=403)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-
-    if "name" in body:
-        nm = (str(body.get("name") or "")).strip()[:40]
-        if nm:
-            _settings["user_name"] = nm
-            await broadcast({"type": "name_changed", "name": nm})
-    if "voice" in body:
-        vid = body.get("voice", "")
-        if vid in {v["id"] for v in VOICE_OPTIONS}:
-            _tts_voice = vid
-            _settings["voice"] = vid
-            await broadcast({"type": "voice_changed", "voice": vid})
-    if "mode" in body:
-        mode = (str(body.get("mode") or "")).strip()
-        if mode in governor.MODES:
-            _gov.mode = mode
-            _save_json(GOVERNOR_FILE, _gov.to_dict())
-            await broadcast({"type": "governor_mode", "mode": mode})
-    if "always_listen" in body:
-        ALWAYS_LISTEN = bool(body["always_listen"])
-        _settings["always_listen"] = ALWAYS_LISTEN
-        if not ALWAYS_LISTEN and _listening:
-            _stop_voice()                      # honor "off" immediately
-        elif ALWAYS_LISTEN and not _listening and active_connections:
-            asyncio.create_task(_start_voice())
-    if "store_overheard" in body:
-        STORE_OVERHEARD = bool(body["store_overheard"])
-        _settings["store_overheard"] = STORE_OVERHEARD
-    _save_settings()
-    return JSONResponse({"ok": True})
-
-
-# ── Device / Models / Governor / Memory APIs ─────────────────────────────────────
-@app.get("/api/device")
-async def device_endpoint() -> dict:
-    """Hardware profile + live power state + homeostasis."""
-    global _last_device
-    dev = await asyncio.to_thread(device.profile)
-    _last_device = dev
-    return {**dev, "homeostasis": _homeostasis(dev)}
-
-
-@app.get("/api/models")
-async def models_endpoint() -> dict:
-    """Model Advisor: what's installed, running, and recommended for this machine."""
-    def _gather() -> dict:
-        up, ver = models_advisor.ollama_up()
-        dev = device.profile()
-        budget = models_advisor.model_budget(dev)
-        ranked = models_advisor.ranked_for_device(dev, set())
-        if not up:
-            return {"ollama": False, "tier": dev.get("tier"), "budget": budget,
-                    "recommended": models_advisor.recommend_for_device(dev, set()),
-                    "ranked": ranked,
-                    "benchmarks": models_advisor.load_benchmarks(),
-                    "allowed_count": len(models_advisor.allowed_models(dev))}
-        inst = models_advisor.annotate_installed(dev, models_advisor.installed(with_caps=True))
-        names = {m["name"] for m in inst}
-        ranked = models_advisor.ranked_for_device(dev, names)
-        out = {"ollama": True, "version": ver, "tier": dev.get("tier"),
-                "installed": inst, "running": models_advisor.running(),
-                "recommended": models_advisor.recommend_for_device(dev, names),
-                "ranked": ranked,
-                "benchmarks": models_advisor.load_benchmarks(),
-                "budget": budget,
-                "allowed_count": len(models_advisor.allowed_models(dev)),
-                "active": {"fast": LOCAL_FAST, "deep": LOCAL_DEEP, "enabled": _LOCAL_OK},
-                "pinned": _settings.get("local_model")}
-        return out
-    return await asyncio.to_thread(_gather)
-
-
-@app.get("/api/models/loaded")
-async def models_loaded_endpoint() -> dict:
-    """Live snapshot of models Ollama currently has in memory (poll-friendly)."""
-    running = await asyncio.to_thread(models_advisor.running)
-    return {"running": running, "ts": time.time()}
-
 
 async def _broadcast_models_loaded() -> None:
     running = await asyncio.to_thread(models_advisor.running)
     await broadcast({"type": "models_loaded", "running": running, "ts": time.time()})
 
 
-@app.get("/api/governor")
-async def governor_endpoint() -> dict:
-    """The Governor's policy, lattice, learned metrics, and recent decisions."""
-    dev = _last_device or await asyncio.to_thread(device.profile)
-    avail = _available_rungs()
-    rungs = [{**r, "available": r["id"] in avail} for r in governor.RUNGS]
-    return {"mode": _gov.mode, "modes": list(governor.MODES), "rungs": rungs,
-            "available": sorted(avail), "metrics": _gov.metrics(),
-            "recent": _gov.log[-12:], "homeostasis": _homeostasis(dev)}
-
-
-@app.get("/api/memory")
-async def memory_endpoint(limit: int = 60) -> dict:
-    """The inspectable self-model — durable memories, newest first. Reads cortex (the real
-    store both explicit `remember` calls AND automatic post-turn extraction write to) rather
-    than the legacy JSON mirror, which only ever saw explicit `remember`s."""
-    # Clamp — UI wants a digest, not an unbounded dump of the whole store.
-    lim = max(1, min(int(limit or 60), 200))
-    all_f = cortex.store.all_facts()
-    ordered = sorted(all_f, key=lambda f: f.get("created_at") or "", reverse=True)
-    return {"count": len(all_f),
-            "memories": [{"id": f.get("id"), "content": f.get("text"),
-                          "category": f.get("category", "preference"),
-                          "importance": f.get("importance", 5),
-                          "private": bool(f.get("private")),
-                          "source": "extracted" if f.get("source_episode_id") else "manual"}
-                         for f in ordered[:lim]]}
-
-
-# ── Attachment uploads — images/docs the UI drops into chat ────────────────────
-# The endpoint extracts a plain-text digest at upload time (vision for images,
-# text extraction for documents), so by the time the user hits send, the brain
-# receives ready-made context and can answer without the user explaining the file.
-UPLOADS_DIR = BASE_DIR / "uploads"
-_UPLOAD_MAX = 15 * 1024 * 1024          # 15 MB
-_DIGEST_CAP = 6000                      # chars of extracted content passed to the brain
-_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
-_TEXT_EXTS = {".txt", ".md", ".csv", ".json", ".xml", ".yaml", ".yml", ".log",
-              ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".cpp", ".h", ".java",
-              ".go", ".rs", ".sh", ".ps1", ".html", ".css", ".sql", ".ini", ".toml"}
-
-
-def _extract_docx(path) -> str:
-    """DOCX body text via stdlib only — a .docx is a zip with word/document.xml."""
-    import zipfile
-    with zipfile.ZipFile(path) as z:
-        xml = z.read("word/document.xml").decode("utf-8", "ignore")
-    paras = re.split(r"</w:p>", xml)
-    out = [re.sub(r"<[^>]+>", "", p).strip() for p in paras]
-    return "\n".join(p for p in out if p)
-
-
-def _extract_pdf(path) -> str:
-    from pypdf import PdfReader
-    reader = PdfReader(str(path))
-    chunks = []
-    total = 0
-    for page in reader.pages:
-        t = (page.extract_text() or "").strip()
-        if t:
-            chunks.append(t)
-            total += len(t)
-        if total > _DIGEST_CAP * 2:
-            break
-    return "\n\n".join(chunks)
-
-
-def _digest_upload(path, ext: str) -> tuple[str, str, bool]:
-    """(kind, extracted text, extracted?) for a saved upload. Runs in a worker thread.
-    `extracted` is False when we couldn't get real content — unsupported type, empty file,
-    or image vision unavailable — so the caller flags it instead of feeding the brain a stub
-    (e.g. the 'Vision needs a Groq API key.' sentence) as if it were the file's content."""
-    if ext in _IMAGE_EXTS:
-        if not USE_GROQ:
-            return "image", "", False        # no vision backend — don't pass a stub off as content
-        desc = _analyze_image(str(path),
-                              "Describe this image thoroughly. Transcribe ALL visible "
-                              "text exactly as written. Note anything unusual or "
-                              "noteworthy — the user attached it for a reason.")
-        return "image", desc, bool((desc or "").strip())
-    if ext == ".pdf":
-        t = _extract_pdf(path)
-        return "pdf", t, bool(t.strip())
-    if ext == ".docx":
-        t = _extract_docx(path)
-        return "docx", t, bool(t.strip())
-    if ext in _TEXT_EXTS:
-        t = path.read_text(encoding="utf-8", errors="ignore")
-        return "text", t, bool(t.strip())
-    return "binary", "", False
-
-
-@app.post("/api/upload")
-async def upload_endpoint(request: Request) -> JSONResponse:
-    # Same origin/loopback gate the websocket uses — this is the one endpoint that writes
-    # files to disk + triggers cloud vision, so it must not be the least-protected surface.
-    if not _mutating_allowed(request):
-        return JSONResponse({"error": "forbidden origin"}, status_code=403)
-    # Reject oversize BEFORE buffering + base64-decoding the whole body into memory (DoS guard).
-    clen = request.headers.get("content-length")
-    if clen and clen.isdigit() and int(clen) > _UPLOAD_MAX * 2:
-        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
-                            status_code=413)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    name = os.path.basename(str(body.get("name") or "file"))
-    b64 = body.get("data_b64") or ""
-    if not isinstance(b64, str) or len(b64) > _UPLOAD_MAX * 4 // 3 + 1024:   # b64 ≈ 4/3 of raw
-        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
-                            status_code=413)
-    try:
-        raw = base64.b64decode(b64, validate=True)
-    except Exception:
-        return JSONResponse({"error": "data_b64 is not valid base64"}, status_code=400)
-    if not raw:
-        return JSONResponse({"error": "empty file"}, status_code=400)
-    if len(raw) > _UPLOAD_MAX:
-        return JSONResponse({"error": f"file too large (max {_UPLOAD_MAX // (1024*1024)} MB)"},
-                            status_code=413)
-
-    UPLOADS_DIR.mkdir(exist_ok=True)
-    ext = Path(name).suffix.lower()
-    # uuid prefix: unique per upload so near-simultaneous drops never collide/overwrite.
-    safe = f"{int(time.time())}_{uuid.uuid4().hex[:8]}_{re.sub(r'[^A-Za-z0-9._-]', '_', name)}"
-    dest = UPLOADS_DIR / safe
-    dest.write_bytes(raw)
-
-    # Only the extracted digest is ever used again — never the file itself — so delete it
-    # after extraction (in a finally) to keep uploads/ from growing without bound.
-    try:
-        kind, text, extracted = await asyncio.to_thread(_digest_upload, dest, ext)
-    except Exception as exc:
-        return JSONResponse({"ok": True, "name": name, "kind": "binary", "digest": "",
-                             "extracted": False,
-                             "note": f"attached, but its content couldn't be read: {exc}"})
-    finally:
-        try:
-            dest.unlink(missing_ok=True)
-        except Exception:
-            pass
-    digest = (text or "").strip()
-    truncated = len(digest) > _DIGEST_CAP
-    if truncated:
-        digest = digest[:_DIGEST_CAP] + "\n…[truncated]"
-    note = None
-    if not extracted:
-        note = ("image vision unavailable — add a Groq key in Settings"
-                if kind == "image" else "no readable content could be extracted")
-    return JSONResponse({"ok": True, "name": name, "kind": kind, "digest": digest,
-                         "extracted": extracted, "truncated": truncated, "note": note})
-
-
-# ── Memory hub — cross-model remember/recall over HTTP ─────────────────────────
-# External models (Claude / ChatGPT / Gemini via the memory_mcp.py shim) read and
-# write the SAME store as JARVIS itself. JARVIS's process stays the single writer;
-# these endpoints reuse execute_tool so decay bookkeeping, category normalisation,
-# and broadcasts happen in exactly one place.
-MEMORY_HUB_TOKEN = os.environ.get("JARVIS_MEMORY_TOKEN", "")
-
-
-def _hub_authed(request: Request) -> bool:
-    if not MEMORY_HUB_TOKEN:
-        # No token configured → allow loopback only, never remote.
-        return (request.client is None) or request.client.host in ("127.0.0.1", "::1")
-    auth = request.headers.get("authorization", "")
-    return auth == f"Bearer {MEMORY_HUB_TOKEN}"
-
-
-@app.post("/api/memory/remember")
-async def hub_remember(request: Request) -> JSONResponse:
-    if not _hub_authed(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    content = (body.get("content") or "").strip()
-    if not content:
-        return JSONResponse({"error": "content is required"}, status_code=400)
-    args = {
-        "content": content,
-        "category": body.get("category", "fact"),
-        "importance": body.get("importance", 5),
-        "namespace": body.get("namespace", "personal"),
-        "private": bool(body.get("private", False)),
-        "source_model": body.get("source_model", "external"),
-    }
-    # execute_tool writes to cortex (SQLite + vector) and the legacy JSON mirror.
-    # It does blocking disk I/O — run it off the event loop.
-    result = await asyncio.to_thread(execute_tool, "remember", args)
-    return JSONResponse({"ok": True, "result": result, "count": len(memories)})
-
-
-@app.get("/api/memory/recall")
-async def hub_recall(request: Request, q: str, k: int = 6,
-                     namespace: str | None = None) -> JSONResponse:
-    if not _hub_authed(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
-
-    def _do_recall():
-        # External callers NEVER see private memories — that filter is not optional here.
-        return cortex.recall(q, k=max(1, min(k, 20)),
-                             namespace=namespace, include_private=False)
-
-    hits = await asyncio.to_thread(_do_recall)
-    return JSONResponse({"count": len(hits), "memories": [
-        {"content": m.get("text"), "category": m.get("category", "preference"),
-         "importance": m.get("importance", 5),
-         "confidence": m.get("confidence", 0.7),
-         "source_model": m.get("source_model", "jarvis"),
-         "namespace": m.get("namespace", "personal")}
-        for m in hits
-    ]})
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {
-        "status":   "ok",
-        "model":    _active_model(),
-        "time":     datetime.now().isoformat(),
-        "memories": cortex.stats().get("facts", 0),
-    }
-
+# ── HTTP API (routers/rest.py) ───────────────────────────────────────────────────
+from routers.rest import register as _register_rest  # noqa: E402
+_register_rest(app)
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
