@@ -14,6 +14,9 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      # Lockfile is generated with npm 10 (Node 22 default). npm 11 can emit
+      # optional-peer entries that make `npm ci` fail with Missing: lru-cache@…
+      - run: npm install -g npm@10
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
@@ -27,6 +30,7 @@ jobs:
         with:
           node-version: "22"
           cache: npm
+      - run: npm install -g npm@10
       - run: npm ci
       - name: Install Playwright Chromium
         run: npx playwright install chromium
