@@ -55,7 +55,9 @@ function Page() {
     try {
       const saved = localStorage.getItem("jarvis_ui_preset");
       // `classic` was folded into the single "Command Deck" (overhaul).
-      return saved === "classic" ? "overhaul" : saved || "prime";
+      if (saved === "classic") return "overhaul";
+      if (saved && saved in DECKS) return saved;
+      return "prime";
     } catch {
       return "prime";
     }
@@ -191,7 +193,15 @@ const PRESET_ACCENT: Record<string, string> = {
   chat: "#10a37f",
 };
 
-function PresetSwitcher({ value, onChange, onSettings }: { value: string; onChange: (v: string) => void; onSettings?: () => void }) {
+function PresetSwitcher({
+  value,
+  onChange,
+  onSettings,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSettings?: () => void;
+}) {
   return (
     <div
       className="no-drag"
@@ -215,7 +225,14 @@ function PresetSwitcher({ value, onChange, onSettings }: { value: string; onChan
         boxShadow: "0 4px 24px rgba(0, 0, 0, 0.45)",
       }}
     >
-      <span style={{ fontSize: 8, color: "rgba(232, 236, 240, 0.5)", letterSpacing: "0.18em", padding: "0 6px 0 4px" }}>
+      <span
+        style={{
+          fontSize: 8,
+          color: "rgba(232, 236, 240, 0.5)",
+          letterSpacing: "0.18em",
+          padding: "0 6px 0 4px",
+        }}
+      >
         UI
       </span>
       {PRESETS.map((p) => {
@@ -252,7 +269,14 @@ function PresetSwitcher({ value, onChange, onSettings }: { value: string; onChan
       {/* Global settings entry — same gear on every deck, opens the one shared panel. */}
       {onSettings && (
         <>
-          <span style={{ width: 1, alignSelf: "stretch", background: "rgba(255,255,255,0.12)", margin: "3px 3px" }} />
+          <span
+            style={{
+              width: 1,
+              alignSelf: "stretch",
+              background: "rgba(255,255,255,0.12)",
+              margin: "3px 3px",
+            }}
+          />
           <button
             onClick={onSettings}
             title="Settings (Ctrl+,)"
@@ -268,8 +292,12 @@ function PresetSwitcher({ value, onChange, onSettings }: { value: string; onChan
               color: "rgba(232, 236, 240, 0.7)",
               transition: "color 0.15s",
             }}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "#fff"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(232, 236, 240, 0.7)"; }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.color = "#fff";
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.color = "rgba(232, 236, 240, 0.7)";
+            }}
           >
             ⚙
           </button>

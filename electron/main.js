@@ -4,7 +4,18 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 
-const { app, BrowserWindow, Menu, Tray, globalShortcut, ipcMain, shell, safeStorage, screen, dialog } = electron;
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  Tray,
+  globalShortcut,
+  ipcMain,
+  shell,
+  safeStorage,
+  screen,
+  dialog,
+} = electron;
 
 // Pin a stable app identity BEFORE anything touches userData (the single-instance lock below
 // does). Without this the name comes from package.json ("tanstack_start_ts") when run
@@ -17,15 +28,15 @@ app.setName("JARVIS");
 const isDev = !app.isPackaged;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const uiRoot  = path.resolve(__dirname, "..");
+const uiRoot = path.resolve(__dirname, "..");
 const appRoot = uiRoot; // api.py lives in the repo root
 const backendUrl = process.env.JARVIS_BACKEND_URL ?? "http://127.0.0.1:8000";
 const devUiUrl = process.env.JARVIS_DEV_UI_URL ?? "http://127.0.0.1:8080";
 
 // c0mr4des trading terminal — a separate app JARVIS launches in its own window.
 const tradingRoot = process.env.C0MR4DES_DIR ?? path.resolve(appRoot, "..", "c0mr4des_terminal");
-const tradingApiPort = 8100;          // its backend (kept off JARVIS's :8000)
-const tradingUiPort = 5173;           // its Vite frontend
+const tradingApiPort = 8100; // its backend (kept off JARVIS's :8000)
+const tradingUiPort = 5173; // its Vite frontend
 const tradingUiUrl = `http://127.0.0.1:${tradingUiPort}`;
 
 let mainWindow;
@@ -82,8 +93,10 @@ function loadDecryptedKeys() {
       // (a different app identity/userData wrote it, or the key was regenerated). Don't
       // silently retry it forever: drop the dead entry so status is honest and the user is
       // cleanly prompted to re-enter, rather than "forgetting" the key with no explanation.
-      console.warn(`[Electron] API key "${id}" could not be decrypted — dropping the stale ` +
-                   `entry. Re-enter it in Settings (it will persist from now on).`);
+      console.warn(
+        `[Electron] API key "${id}" could not be decrypted — dropping the stale ` +
+          `entry. Re-enter it in Settings (it will persist from now on).`,
+      );
       delete enc[id];
       dropped = true;
     }
@@ -91,7 +104,9 @@ function loadDecryptedKeys() {
   if (dropped) {
     try {
       fs.writeFileSync(keysFilePath(), JSON.stringify(enc), { mode: 0o600 });
-    } catch { /* best-effort cleanup */ }
+    } catch {
+      /* best-effort cleanup */
+    }
   }
   return out;
 }
@@ -120,8 +135,10 @@ function saveEncryptedKeys(keys) {
   for (const id of KEY_IDS) {
     const want = String(keys[id] ?? "").trim();
     if (want && check[id] !== want) {
-      throw new Error("The key was written but couldn't be read back — it may not persist. " +
-                      "Please try again.");
+      throw new Error(
+        "The key was written but couldn't be read back — it may not persist. " +
+          "Please try again.",
+      );
     }
   }
 }
@@ -154,16 +171,24 @@ function resolvePythonPath() {
   }
 
   const venvPy = (root) =>
-    isWindows ? path.join(root, "venv", "Scripts", "python.exe") : path.join(root, "venv", "bin", "python");
+    isWindows
+      ? path.join(root, "venv", "Scripts", "python.exe")
+      : path.join(root, "venv", "bin", "python");
 
   const candidates = [
-    process.env.JARVIS_PYTHON,        // explicit override
-    venvPy(appRoot),                  // venv inside the repo (portable)
+    process.env.JARVIS_PYTHON, // explicit override
+    venvPy(appRoot), // venv inside the repo (portable)
     venvPy(path.resolve(appRoot, "..")), // venv one level up (e.g. C:\Users\rosha\venv)
     isWindows ? "py" : "python3",
     "python",
   ].filter(Boolean);
-  const found = candidates.find((candidate) => candidate === "py" || candidate === "python3" || candidate === "python" || fs.existsSync(candidate));
+  const found = candidates.find(
+    (candidate) =>
+      candidate === "py" ||
+      candidate === "python3" ||
+      candidate === "python" ||
+      fs.existsSync(candidate),
+  );
   return { path: found, isPackaged: false };
 }
 
@@ -336,8 +361,14 @@ function createWindow() {
   });
 
   // Notify the renderer so the maximize/restore button shows the right icon.
-  mainWindow.on("maximize", () => { mainWindow?.webContents.send("window-maximized", true); saveWindowState(); });
-  mainWindow.on("unmaximize", () => { mainWindow?.webContents.send("window-maximized", false); saveWindowState(); });
+  mainWindow.on("maximize", () => {
+    mainWindow?.webContents.send("window-maximized", true);
+    saveWindowState();
+  });
+  mainWindow.on("unmaximize", () => {
+    mainWindow?.webContents.send("window-maximized", false);
+    saveWindowState();
+  });
 
   // Debounced — resize/move fire continuously while dragging.
   let boundsSaveTimer;
@@ -399,7 +430,9 @@ function createTray() {
 async function restartBackend() {
   await stopPythonBackend();
   await startPythonBackend();
-  await mainWindow?.loadURL(backendUrl);
+  // Must match loadApp() — Vite-dev serves the UI on :8080, not the FastAPI port.
+  const targetUrl = isDev && process.env.JARVIS_USE_VITE === "1" ? devUiUrl : backendUrl;
+  await mainWindow?.loadURL(targetUrl);
 }
 
 // A real application menu — mainly for its keyboard accelerators (Ctrl+R,
@@ -410,14 +443,28 @@ function createAppMenu() {
     {
       label: "JARVIS",
       submenu: [
-        { label: "Restart Backend", accelerator: "CmdOrCtrl+Shift+R", click: () => restartBackend() },
+        {
+          label: "Restart Backend",
+          accelerator: "CmdOrCtrl+Shift+R",
+          click: () => restartBackend(),
+        },
         { type: "separator" },
         { label: "About JARVIS", click: () => showAboutDialog() },
         { type: "separator" },
-        { label: "Quit", accelerator: "CmdOrCtrl+Q", click: () => { appIsQuitting = true; app.quit(); } },
+        {
+          label: "Quit",
+          accelerator: "CmdOrCtrl+Q",
+          click: () => {
+            appIsQuitting = true;
+            app.quit();
+          },
+        },
       ],
     },
-    { label: "View", submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }] },
+    {
+      label: "View",
+      submenu: [{ role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" }],
+    },
     { label: "Window", submenu: [{ role: "minimize" }, { role: "close" }] },
   ];
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
@@ -445,7 +492,12 @@ function stopPythonBackend() {
   ownsBackend = false;
   return new Promise((resolve) => {
     let settled = false;
-    const done = () => { if (!settled) { settled = true; resolve(); } };
+    const done = () => {
+      if (!settled) {
+        settled = true;
+        resolve();
+      }
+    };
     proc.once("exit", done);
     setTimeout(done, 5000); // don't let a stuck kill hang the restart forever
     try {
@@ -466,7 +518,12 @@ async function isUrlReady(url) {
   // r.ok (2xx) only — a transient 404/other 4xx while a dev server is mid-boot
   // must not be treated as "ready", or the caller loads a broken page and stops
   // polling instead of waiting for the real response.
-  try { const r = await fetch(url); return r.ok; } catch { return false; }
+  try {
+    const r = await fetch(url);
+    return r.ok;
+  } catch {
+    return false;
+  }
 }
 
 function spawnAndLog(cmd, args, opts, tag) {
@@ -478,11 +535,13 @@ function spawnAndLog(cmd, args, opts, tag) {
 }
 
 const LOADING_HTML = (msg, color = "#f59e0b") =>
-  "data:text/html," + encodeURIComponent(
+  "data:text/html," +
+  encodeURIComponent(
     `<body style="background:#0a0705;color:${color};font-family:ui-monospace,monospace;display:flex;` +
-    `align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">` +
-    `<div><div style="font-size:18px">${msg}</div>` +
-    `<div style="opacity:.55;margin-top:10px;font-size:12px">c0mr4des terminal · backend :${tradingApiPort} · ui :${tradingUiPort}</div></div></body>`);
+      `align-items:center;justify-content:center;height:100vh;margin:0;text-align:center">` +
+      `<div><div style="font-size:18px">${msg}</div>` +
+      `<div style="opacity:.55;margin-top:10px;font-size:12px">c0mr4des terminal · backend :${tradingApiPort} · ui :${tradingUiPort}</div></div></body>`,
+  );
 
 async function openTradingTerminal() {
   if (tradingWindow && !tradingWindow.isDestroyed()) {
@@ -495,8 +554,11 @@ async function openTradingTerminal() {
   }
 
   tradingWindow = new BrowserWindow({
-    width: 1500, height: 920, backgroundColor: "#0a0705",
-    title: "JARVIS · Trading Terminal", autoHideMenuBar: true,
+    width: 1500,
+    height: 920,
+    backgroundColor: "#0a0705",
+    title: "JARVIS · Trading Terminal",
+    autoHideMenuBar: true,
     webPreferences: { nodeIntegration: false, contextIsolation: true, sandbox: true },
   });
   // Same popup/navigation hardening as mainWindow — this window loads content
@@ -505,48 +567,89 @@ async function openTradingTerminal() {
     shell.openExternal(url);
     return { action: "deny" };
   });
-  tradingWindow.on("closed", () => { tradingWindow = undefined; });
+  tradingWindow.on("closed", () => {
+    tradingWindow = undefined;
+  });
   tradingWindow.loadURL(LOADING_HTML("⟳ Spinning up the trading terminal…"));
 
-  if (await isUrlReady(tradingUiUrl)) { tradingWindow.loadURL(tradingUiUrl); return { ok: true }; }
+  if (await isUrlReady(tradingUiUrl)) {
+    tradingWindow.loadURL(tradingUiUrl);
+    return { ok: true };
+  }
 
   const isWin = process.platform === "win32";
   const venvPy = path.join(tradingRoot, ".venv", "Scripts", isWin ? "python.exe" : "python");
-  const py = fs.existsSync(venvPy) ? venvPy : (isWin ? "py" : "python3");
-  const env = { ...process.env, PYTHONUNBUFFERED: "1", C0MR4DES_API: `http://127.0.0.1:${tradingApiPort}` };
+  const py = fs.existsSync(venvPy) ? venvPy : isWin ? "py" : "python3";
+  const env = {
+    ...process.env,
+    PYTHONUNBUFFERED: "1",
+    C0MR4DES_API: `http://127.0.0.1:${tradingApiPort}`,
+  };
   const npm = isWin ? "npm.cmd" : "npm";
 
-  spawnAndLog(py, ["-m", "uvicorn", "backend.main:app", "--port", String(tradingApiPort)],
-    { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }, "Trading-BE");
+  spawnAndLog(
+    py,
+    ["-m", "uvicorn", "backend.main:app", "--port", String(tradingApiPort)],
+    { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
+    "Trading-BE",
+  );
 
   // First run: install frontend deps before starting Vite.
   if (!fs.existsSync(path.join(tradingRoot, "node_modules"))) {
     tradingWindow.loadURL(LOADING_HTML("⟳ Installing trading UI deps (first run, ~1–2 min)…"));
     await new Promise((resolve) => {
-      const inst = spawnAndLog(npm, ["install"], { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: isWin }, "Trading-npm");
+      const inst = spawnAndLog(
+        npm,
+        ["install"],
+        {
+          cwd: tradingRoot,
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+          shell: isWin,
+        },
+        "Trading-npm",
+      );
       inst.on("exit", resolve);
       inst.on("error", resolve);
     });
-    if (tradingWindow?.isDestroyed()) return { ok: true };
+    if (tradingWindow?.isDestroyed())
+      return { ok: false, error: "Trading window was closed before it finished starting." };
     tradingWindow?.loadURL(LOADING_HTML("⟳ Starting the trading terminal…"));
   }
 
-  spawnAndLog(npm, ["run", "dev"], { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: isWin }, "Trading-FE");
+  spawnAndLog(
+    npm,
+    ["run", "dev"],
+    { cwd: tradingRoot, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true, shell: isWin },
+    "Trading-FE",
+  );
 
   const deadline = Date.now() + 180000;
   while (Date.now() < deadline) {
-    if (!tradingWindow || tradingWindow.isDestroyed()) return { ok: true };
-    if (await isUrlReady(tradingUiUrl)) { tradingWindow.loadURL(tradingUiUrl); return { ok: true }; }
+    if (!tradingWindow || tradingWindow.isDestroyed()) {
+      return { ok: false, error: "Trading window was closed before it finished starting." };
+    }
+    if (await isUrlReady(tradingUiUrl)) {
+      tradingWindow.loadURL(tradingUiUrl);
+      return { ok: true };
+    }
     await new Promise((r) => setTimeout(r, 1500));
   }
   if (tradingWindow && !tradingWindow.isDestroyed()) {
-    tradingWindow.loadURL(LOADING_HTML("Trading terminal didn't start in time — check deps + console.", "#ff6b6b"));
+    tradingWindow.loadURL(
+      LOADING_HTML("Trading terminal didn't start in time — check deps + console.", "#ff6b6b"),
+    );
   }
   return { ok: false, error: "timeout" };
 }
 
 function stopTrading() {
-  tradingProcs.forEach((p) => { try { p.kill(); } catch (_) {} });
+  tradingProcs.forEach((p) => {
+    try {
+      p.kill();
+    } catch (_) {}
+  });
   tradingProcs = [];
 }
 

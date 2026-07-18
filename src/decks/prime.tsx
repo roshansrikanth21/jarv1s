@@ -233,8 +233,19 @@ const BACKEND_HINT: Record<string, string> = {
 
 /* ═══════════════════════════════════════════════════════════ */
 export default function PrimeDeck() {
-  const { connected, listening, speaking, stream, level, send, toggleMic, sendAction, subscribe, mood, showReconnectHint } =
-    useJarvisSocket("Ready. Speak or type below.");
+  const {
+    connected,
+    listening,
+    speaking,
+    stream,
+    level,
+    send,
+    toggleMic,
+    sendAction,
+    subscribe,
+    mood,
+    showReconnectHint,
+  } = useJarvisSocket("Ready. Speak or type below.");
 
   const [feed, setFeed] = useState<Feed[]>([
     { id: fid(), at: now(), kind: "system", text: "Ready. Speak or type below." },
@@ -516,7 +527,8 @@ export default function PrimeDeck() {
             if (d.phase === "done") push({ kind: "system", text: "Briefing complete." });
             break;
           case "open_trading":
-            window.electronAPI?.openTrading?.()
+            window.electronAPI
+              ?.openTrading?.()
               .then((r) => {
                 if (r?.ok === false && r.error) push({ kind: "system", text: r.error });
                 else push({ kind: "system", text: "Opening trading terminal…" });
@@ -612,7 +624,9 @@ export default function PrimeDeck() {
       : busyText !== null
         ? "thinking"
         : !connected
-          ? (showReconnectHint ? "waking up" : "ready")
+          ? showReconnectHint
+            ? "waking up"
+            : "ready"
           : energy < 0.33
             ? "low power"
             : "ready";
@@ -634,7 +648,9 @@ export default function PrimeDeck() {
   );
   const localOn = Boolean(status.local?.enabled);
   const brainLine = !connected
-    ? (showReconnectHint ? "waking up" : "…")
+    ? showReconnectHint
+      ? "waking up"
+      : "…"
     : cloudOn && localOn
       ? "cloud + local"
       : cloudOn
@@ -766,10 +782,15 @@ export default function PrimeDeck() {
                 <div className="pr-tele-row" key={k}>
                   <div className="pr-tele-head">
                     <span className="pr-lab">{k}</span>
-                    <span className={`pr-num ${v > 90 ? "is-bad" : v > 75 ? "is-warn" : ""}`}>{v}%</span>
+                    <span className={`pr-num ${v > 90 ? "is-bad" : v > 75 ? "is-warn" : ""}`}>
+                      {v}%
+                    </span>
                   </div>
                   <div className="pr-meter">
-                    <i className={v > 90 ? "is-bad" : v > 75 ? "is-warn" : ""} style={{ width: `${v}%` }} />
+                    <i
+                      className={v > 90 ? "is-bad" : v > 75 ? "is-warn" : ""}
+                      style={{ width: `${v}%` }}
+                    />
                   </div>
                 </div>
               ))}
@@ -783,7 +804,11 @@ export default function PrimeDeck() {
             </div>
             <div className="pr-modes">
               {MODES.map((m) => (
-                <button key={m} className={`pr-mode ${govMode === m ? "pr-mode--on" : ""}`} onClick={() => setMode(m)}>
+                <button
+                  key={m}
+                  className={`pr-mode ${govMode === m ? "pr-mode--on" : ""}`}
+                  onClick={() => setMode(m)}
+                >
                   {m}
                 </button>
               ))}
@@ -817,7 +842,9 @@ export default function PrimeDeck() {
                 pushed the orb up). pointer-events:none keeps the whole stage clickable. */}
             <div className="pr-reticle" aria-hidden />
             {pulseKey > 0 && <span key={pulseKey} className="pr-orb-flash" aria-hidden />}
-            <Suspense fallback={<div className="pr-orb-canvas pr-orb-canvas--loading" aria-hidden />}>
+            <Suspense
+              fallback={<div className="pr-orb-canvas pr-orb-canvas--loading" aria-hidden />}
+            >
               <CoreOrb3D state={jstate} audioLevel={micLevel} />
             </Suspense>
           </button>
@@ -831,7 +858,13 @@ export default function PrimeDeck() {
                 {busyText}
               </p>
             )}
-            {agentCaption && <p className="pr-arena-voice">{agentCaption.slice(0, 220)}{agentCaption.length > 220 ? "…" : ""}{stream && <span className="pr-caret" />}</p>}
+            {agentCaption && (
+              <p className="pr-arena-voice">
+                {agentCaption.slice(0, 220)}
+                {agentCaption.length > 220 ? "…" : ""}
+                {stream && <span className="pr-caret" />}
+              </p>
+            )}
             {!agentCaption && !busyText && (
               <p className="pr-arena-idle">Tap the core to speak · type in the activity panel</p>
             )}
@@ -851,7 +884,9 @@ export default function PrimeDeck() {
               ))}
               {busyText !== null && !stream && (
                 <div className="pr-thinking">
-                  <i /><i /><i />
+                  <i />
+                  <i />
+                  <i />
                   <span>{busyText}</span>
                 </div>
               )}
@@ -868,7 +903,11 @@ export default function PrimeDeck() {
                   }}
                   placeholder={`Talk to JARVIS, ${userName}…`}
                 />
-                <button className={`pr-mic ${listening ? "pr-mic--live" : ""}`} onClick={toggleMic} title={listening ? "Stop" : "Mic"}>
+                <button
+                  className={`pr-mic ${listening ? "pr-mic--live" : ""}`}
+                  onClick={toggleMic}
+                  title={listening ? "Stop" : "Mic"}
+                >
                   {listening ? <Mic size={15} /> : <MicOff size={15} />}
                 </button>
                 <button className="pr-send" onClick={submit} disabled={!input.trim()}>
@@ -876,255 +915,357 @@ export default function PrimeDeck() {
                 </button>
               </div>
               <div className="pr-composer-hint">
-                <span className={sendErr ? "is-bad" : ""}>{sendErr ?? (connected ? "Connected" : showReconnectHint ? "Waking up…" : "")}</span>
+                <span className={sendErr ? "is-bad" : ""}>
+                  {sendErr ?? (connected ? "Connected" : showReconnectHint ? "Waking up…" : "")}
+                </span>
               </div>
             </div>
           </div>
 
           <div className="pr-tools-col">
-          <nav className="pr-tabs">
-            {TABS.map((t) => (
-              <button
-                key={t}
-                className={`pr-tab ${tab === t ? "pr-tab--on" : ""}`}
-                onClick={() => setTab(t)}
-              >
-                {TAB_LABELS[t]}
-              </button>
-            ))}
-          </nav>
+            <nav className="pr-tabs">
+              {TABS.map((t) => (
+                <button
+                  key={t}
+                  className={`pr-tab ${tab === t ? "pr-tab--on" : ""}`}
+                  onClick={() => setTab(t)}
+                >
+                  {TAB_LABELS[t]}
+                </button>
+              ))}
+            </nav>
 
-          {tab === "governor" && (
-            <div className="pr-pane">
-              {lastRoute ? (
-                <div className="pr-card pr-brain-summary">
-                  <p className="pr-brain-last">
-                    Last reply: <strong>{lastRoute.label}</strong>
-                  </p>
-                  {metrics?.avg_latency_s != null && metrics.decisions > 0 && (
-                    <p className="pr-brain-meta">
-                      Avg {metrics.avg_latency_s.toFixed(0)}s over {metrics.decisions} message
-                      {metrics.decisions === 1 ? "" : "s"}
+            {tab === "governor" && (
+              <div className="pr-pane">
+                {lastRoute ? (
+                  <div className="pr-card pr-brain-summary">
+                    <p className="pr-brain-last">
+                      Last reply: <strong>{lastRoute.label}</strong>
                     </p>
-                  )}
+                    {metrics?.avg_latency_s != null && metrics.decisions > 0 && (
+                      <p className="pr-brain-meta">
+                        Avg {metrics.avg_latency_s.toFixed(0)}s over {metrics.decisions} message
+                        {metrics.decisions === 1 ? "" : "s"}
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <div className="pr-empty">Send a message to see which backend answers.</div>
+                )}
+
+                <div className="pr-sec">
+                  <span className="pr-lab">backends</span>
                 </div>
-              ) : (
-                <div className="pr-empty">Send a message to see which backend answers.</div>
-              )}
+                {rungs.length === 0 && <div className="pr-empty">Loading…</div>}
+                <ul className="pr-backend-list">
+                  {rungs.map((r) => (
+                    <li key={r.id} className={r.available ? "is-on" : "is-off"}>
+                      <span className="pr-backend-name">{r.label}</span>
+                      <span className="pr-backend-state">
+                        {r.available ? "ready" : (BACKEND_HINT[r.id] ?? "offline")}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
 
-              <div className="pr-sec">
-                <span className="pr-lab">backends</span>
+                {!cloudOn && localOn && (
+                  <p className="pr-pane-hint">
+                    Only local models are active. Add a Groq key in Settings (Ctrl+,) for much
+                    faster replies.
+                  </p>
+                )}
               </div>
-              {rungs.length === 0 && <div className="pr-empty">Loading…</div>}
-              <ul className="pr-backend-list">
-                {rungs.map((r) => (
-                  <li key={r.id} className={r.available ? "is-on" : "is-off"}>
-                    <span className="pr-backend-name">{r.label}</span>
-                    <span className="pr-backend-state">
-                      {r.available ? "ready" : BACKEND_HINT[r.id] ?? "offline"}
-                    </span>
-                  </li>
-                ))}
-              </ul>
+            )}
 
-              {!cloudOn && localOn && (
-                <p className="pr-pane-hint">
-                  Only local models are active. Add a Groq key in Settings (Ctrl+,) for much faster replies.
-                </p>
-              )}
-            </div>
-          )}
-
-          {tab === "rig" && (
-            <div className="pr-pane">
-              {!models && <div className="pr-empty">Loading models…</div>}
-              {models && (
-                <>
-                  {models.budget && (
-                    <div className="pr-card pr-budget pr-budget--profile">
-                      <div className="pr-budget-title">Your machine</div>
-                      {models.budget.instant_tight && (
-                        <p className="pr-budget-warn">
-                          RAM is tight ({models.budget.ram_available_gb?.toFixed(1)}GB free) —
-                          close apps before downloading or switching models.
-                        </p>
-                      )}
-                      <div className="pr-kv">
-                        <span className="pr-lab">system</span>
-                        <span className="pr-num">
-                          {models.budget.compute_label ?? "—"}
-                          {models.budget.headroom != null
-                            ? ` · ${Math.round(models.budget.headroom * 100)}% headroom`
-                            : ""}
-                        </span>
-                      </div>
-                      <div className="pr-kv">
-                        <span className="pr-lab">cpu</span>
-                        <span className="pr-num">
-                          {models.budget.cpu_cores ?? "—"} cores
-                          {models.budget.cpu_ghz ? ` @ ${models.budget.cpu_ghz}GHz` : ""}
-                        </span>
-                      </div>
-                      <div className="pr-kv">
-                        <span className="pr-lab">gpu</span>
-                        <span className="pr-num">
-                          {models.budget.gpu_accel && models.budget.gpu_name
-                            ? models.budget.gpu_name
-                            : "cpu only"}
-                        </span>
-                      </div>
-                      <div className="pr-kv">
-                        <span className="pr-lab">ram free</span>
-                        <span className="pr-num">
-                          {models.budget.ram_available_gb?.toFixed(1)} /{" "}
-                          {models.budget.ram_total_gb?.toFixed(0)} GB
-                        </span>
-                      </div>
-                      <div className="pr-kv">
-                        <span className="pr-lab">live for models</span>
-                        <span className="pr-num">{models.budget.live_gb?.toFixed(1) ?? "—"} GB</span>
-                      </div>
-                      <div className="pr-kv">
-                        <span className="pr-lab">capacity</span>
-                        <span className="pr-num">{models.budget.budget_gb?.toFixed(1)} GB</span>
-                      </div>
-                      {models.budget.disk_free_gb != null && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">disk free</span>
-                          <span className="pr-num">{models.budget.disk_free_gb.toFixed(1)} GB</span>
-                        </div>
-                      )}
-                      {models.budget.gpu_accel && models.budget.vram_gb > 0 && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">vram</span>
-                          <span className="pr-num">{models.budget.vram_gb?.toFixed(0)} GB</span>
-                        </div>
-                      )}
-                      {models.allowed_count != null && (
-                        <p className="pr-budget-note">
-                          {models.allowed_count} catalog model
-                          {models.allowed_count === 1 ? "" : "s"} fit this hardware
-                        </p>
-                      )}
-                    </div>
-                  )}
-                  {!models.ollama && (
-                    <div className="pr-card pr-empty">
-                      Ollama isn't running — local models are offline. Cloud rungs still work.
-                    </div>
-                  )}
-                  {models.active?.enabled && (
-                    <div className="pr-card" style={{ padding: "8px 10px" }}>
-                      <div className="pr-kv">
-                        <span className="pr-lab">fast lane</span>
-                        <span className="pr-num">{short(models.active.fast)}</span>
-                      </div>
-                      <div className="pr-kv" style={{ marginTop: 5 }}>
-                        <span className="pr-lab">deep lane</span>
-                        <span className="pr-num">{short(models.active.deep)}</span>
-                      </div>
-                    </div>
-                  )}
-                  {models.ollama && (
-                    <>
-                      <div className="pr-sec pr-sec--live">
-                        <span className="pr-lab">loaded in memory</span>
-                        <span className="pr-live-dot" title="Updates every 2s" />
-                      </div>
-                      <div className="pr-card pr-loaded">
-                        {(models.running?.length ?? 0) === 0 ? (
-                          <p className="pr-loaded-empty">
-                            Nothing in RAM — Ollama unloads idle models after a few minutes.
+            {tab === "rig" && (
+              <div className="pr-pane">
+                {!models && <div className="pr-empty">Loading models…</div>}
+                {models && (
+                  <>
+                    {models.budget && (
+                      <div className="pr-card pr-budget pr-budget--profile">
+                        <div className="pr-budget-title">Your machine</div>
+                        {models.budget.instant_tight && (
+                          <p className="pr-budget-warn">
+                            RAM is tight ({models.budget.ram_available_gb?.toFixed(1)}GB free) —
+                            close apps before downloading or switching models.
                           </p>
-                        ) : (
-                          models.running!.map((r) => (
-                            <div className="pr-kv pr-loaded-row" key={r.name}>
-                              <span className="pr-num pr-loaded-name">{r.name}</span>
-                              <span className="pr-num">
-                                {r.gb != null ? `${r.gb.toFixed(1)} GB` : "—"} ·{" "}
-                                {r.on_gpu ? "gpu" : "cpu"}
-                              </span>
-                            </div>
-                          ))
                         )}
-                        {loadedTs != null && (
-                          <p className="pr-loaded-ts">
-                            live · {new Date(loadedTs * 1000).toLocaleTimeString()}
+                        <div className="pr-kv">
+                          <span className="pr-lab">system</span>
+                          <span className="pr-num">
+                            {models.budget.compute_label ?? "—"}
+                            {models.budget.headroom != null
+                              ? ` · ${Math.round(models.budget.headroom * 100)}% headroom`
+                              : ""}
+                          </span>
+                        </div>
+                        <div className="pr-kv">
+                          <span className="pr-lab">cpu</span>
+                          <span className="pr-num">
+                            {models.budget.cpu_cores ?? "—"} cores
+                            {models.budget.cpu_ghz ? ` @ ${models.budget.cpu_ghz}GHz` : ""}
+                          </span>
+                        </div>
+                        <div className="pr-kv">
+                          <span className="pr-lab">gpu</span>
+                          <span className="pr-num">
+                            {models.budget.gpu_accel && models.budget.gpu_name
+                              ? models.budget.gpu_name
+                              : "cpu only"}
+                          </span>
+                        </div>
+                        <div className="pr-kv">
+                          <span className="pr-lab">ram free</span>
+                          <span className="pr-num">
+                            {models.budget.ram_available_gb?.toFixed(1)} /{" "}
+                            {models.budget.ram_total_gb?.toFixed(0)} GB
+                          </span>
+                        </div>
+                        <div className="pr-kv">
+                          <span className="pr-lab">live for models</span>
+                          <span className="pr-num">
+                            {models.budget.live_gb?.toFixed(1) ?? "—"} GB
+                          </span>
+                        </div>
+                        <div className="pr-kv">
+                          <span className="pr-lab">capacity</span>
+                          <span className="pr-num">{models.budget.budget_gb?.toFixed(1)} GB</span>
+                        </div>
+                        {models.budget.disk_free_gb != null && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">disk free</span>
+                            <span className="pr-num">
+                              {models.budget.disk_free_gb.toFixed(1)} GB
+                            </span>
+                          </div>
+                        )}
+                        {models.budget.gpu_accel && models.budget.vram_gb > 0 && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">vram</span>
+                            <span className="pr-num">{models.budget.vram_gb?.toFixed(0)} GB</span>
+                          </div>
+                        )}
+                        {models.allowed_count != null && (
+                          <p className="pr-budget-note">
+                            {models.allowed_count} catalog model
+                            {models.allowed_count === 1 ? "" : "s"} fit this hardware
                           </p>
                         )}
                       </div>
-                    </>
-                  )}
-                  {rankedList.length > 0 && (
-                    <>
-                      <div className="pr-sec">
-                        <span className="pr-lab">ranked for this machine</span>
+                    )}
+                    {!models.ollama && (
+                      <div className="pr-card pr-empty">
+                        Ollama isn't running — local models are offline. Cloud rungs still work.
                       </div>
-                      {rankedList.map((r) => {
-                        const inst = findInstalled(r.tag);
-                        const isInstalled = Boolean(r.installed || inst);
-                        const isActive =
-                          inst &&
-                          (inst.name === models.active?.fast || inst.name === models.active?.deep);
-                        const pull = pulls[r.tag];
-                        const pulling =
-                          pull &&
-                          pull.status !== "done" &&
-                          pull.status !== "error" &&
-                          pull.pct < 100;
-                        const b = inst ? bench[inst.name] : undefined;
-                        return (
-                          <div
-                            key={r.tag}
-                            className={`pr-card pr-model pr-model--ranked ${r.best ? "pr-model--best" : ""} ${isActive ? "pr-model--active" : ""}`}
-                          >
-                            <div className="pr-rank-col" aria-hidden>
-                              <span className="pr-rank-badge">#{r.rank}</span>
-                            </div>
-                            <div className="pr-model-body">
-                              <div className="pr-model-head">
-                                <span className="pr-model-name">{r.tag}</span>
-                                <span className="pr-model-meta">
-                                  {r.gb} GB · {r.params}
-                                  {r.needs_gb != null ? ` · ~${r.needs_gb}GB` : ""}
+                    )}
+                    {models.active?.enabled && (
+                      <div className="pr-card" style={{ padding: "8px 10px" }}>
+                        <div className="pr-kv">
+                          <span className="pr-lab">fast lane</span>
+                          <span className="pr-num">{short(models.active.fast)}</span>
+                        </div>
+                        <div className="pr-kv" style={{ marginTop: 5 }}>
+                          <span className="pr-lab">deep lane</span>
+                          <span className="pr-num">{short(models.active.deep)}</span>
+                        </div>
+                      </div>
+                    )}
+                    {models.ollama && (
+                      <>
+                        <div className="pr-sec pr-sec--live">
+                          <span className="pr-lab">loaded in memory</span>
+                          <span className="pr-live-dot" title="Updates every 2s" />
+                        </div>
+                        <div className="pr-card pr-loaded">
+                          {(models.running?.length ?? 0) === 0 ? (
+                            <p className="pr-loaded-empty">
+                              Nothing in RAM — Ollama unloads idle models after a few minutes.
+                            </p>
+                          ) : (
+                            models.running!.map((r) => (
+                              <div className="pr-kv pr-loaded-row" key={r.name}>
+                                <span className="pr-num pr-loaded-name">{r.name}</span>
+                                <span className="pr-num">
+                                  {r.gb != null ? `${r.gb.toFixed(1)} GB` : "—"} ·{" "}
+                                  {r.on_gpu ? "gpu" : "cpu"}
                                 </span>
                               </div>
-                              {r.fit_note && <div className="pr-model-fit">{r.fit_note}</div>}
-                              {r.best_for && <div className="pr-model-desc">{r.best_for}</div>}
+                            ))
+                          )}
+                          {loadedTs != null && (
+                            <p className="pr-loaded-ts">
+                              live · {new Date(loadedTs * 1000).toLocaleTimeString()}
+                            </p>
+                          )}
+                        </div>
+                      </>
+                    )}
+                    {rankedList.length > 0 && (
+                      <>
+                        <div className="pr-sec">
+                          <span className="pr-lab">ranked for this machine</span>
+                        </div>
+                        {rankedList.map((r) => {
+                          const inst = findInstalled(r.tag);
+                          const isInstalled = Boolean(r.installed || inst);
+                          const isActive =
+                            inst &&
+                            (inst.name === models.active?.fast ||
+                              inst.name === models.active?.deep);
+                          const pull = pulls[r.tag];
+                          const pulling =
+                            pull &&
+                            pull.status !== "done" &&
+                            pull.status !== "error" &&
+                            pull.pct < 100;
+                          const b = inst ? bench[inst.name] : undefined;
+                          return (
+                            <div
+                              key={r.tag}
+                              className={`pr-card pr-model pr-model--ranked ${r.best ? "pr-model--best" : ""} ${isActive ? "pr-model--active" : ""}`}
+                            >
+                              <div className="pr-rank-col" aria-hidden>
+                                <span className="pr-rank-badge">#{r.rank}</span>
+                              </div>
+                              <div className="pr-model-body">
+                                <div className="pr-model-head">
+                                  <span className="pr-model-name">{r.tag}</span>
+                                  <span className="pr-model-meta">
+                                    {r.gb} GB · {r.params}
+                                    {r.needs_gb != null ? ` · ~${r.needs_gb}GB` : ""}
+                                  </span>
+                                </div>
+                                {r.fit_note && <div className="pr-model-fit">{r.fit_note}</div>}
+                                {r.best_for && <div className="pr-model-desc">{r.best_for}</div>}
+                                <div className="pr-model-badges">
+                                  {r.best && (
+                                    <span className="pr-badge pr-badge--accent">top pick</span>
+                                  )}
+                                  {isInstalled && (
+                                    <span className="pr-badge pr-badge--good">installed</span>
+                                  )}
+                                  {r.tok_per_sec != null && (
+                                    <span className="pr-badge pr-badge--good">
+                                      {r.tok_per_sec.toFixed(1)} tok/s
+                                    </span>
+                                  )}
+                                  {r.runnable_now === false && !isInstalled && (
+                                    <span
+                                      className="pr-badge pr-badge--warn"
+                                      title={r.block_reason_now ?? ""}
+                                    >
+                                      close apps first
+                                    </span>
+                                  )}
+                                  {inst?.runnable === false && (
+                                    <span
+                                      className="pr-badge pr-badge--warn"
+                                      title={inst.block_reason ?? ""}
+                                    >
+                                      ram tight
+                                    </span>
+                                  )}
+                                  {r.tools && (
+                                    <span className="pr-badge pr-badge--good">tools</span>
+                                  )}
+                                  {isActive && (
+                                    <span className="pr-badge pr-badge--accent">active</span>
+                                  )}
+                                  {b?.status === "running" && (
+                                    <span className="pr-badge">benching…</span>
+                                  )}
+                                  {b?.tok != null && (
+                                    <span className="pr-badge pr-badge--good">
+                                      {b.tok.toFixed(1)} tok/s
+                                    </span>
+                                  )}
+                                </div>
+                                {pulling ? (
+                                  <div className="pr-pull">
+                                    <span className="pr-meter">
+                                      <i style={{ width: `${pull.pct}%` }} />
+                                    </span>
+                                    <span className="pr-num">{Math.round(pull.pct)}%</span>
+                                  </div>
+                                ) : isInstalled && inst ? (
+                                  <div className="pr-model-actions">
+                                    <button
+                                      className="pr-btn pr-btn--accent"
+                                      disabled={inst.runnable === false || Boolean(isActive)}
+                                      onClick={() =>
+                                        sendAction("set_local_model", { model: inst.name })
+                                      }
+                                    >
+                                      use
+                                    </button>
+                                    <button
+                                      className="pr-btn"
+                                      onClick={() =>
+                                        sendAction("benchmark_model", { model: inst.name })
+                                      }
+                                    >
+                                      bench
+                                    </button>
+                                    <button
+                                      className="pr-btn pr-btn--danger"
+                                      onClick={() => onDeleteModel(inst.name)}
+                                    >
+                                      delete
+                                    </button>
+                                  </div>
+                                ) : (
+                                  <div className="pr-model-actions">
+                                    <button
+                                      className="pr-btn pr-btn--accent"
+                                      disabled={r.runnable_now === false}
+                                      title={
+                                        r.runnable_now === false
+                                          ? (r.block_reason_now ?? "Not enough free RAM")
+                                          : undefined
+                                      }
+                                      onClick={() => onPullModel(r.tag)}
+                                    >
+                                      download
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </>
+                    )}
+                    {orphanInstalled.length > 0 && (
+                      <>
+                        <div className="pr-sec">
+                          <span className="pr-lab">other installed</span>
+                        </div>
+                        {orphanInstalled.map((m) => {
+                          const isActive =
+                            m.name === models.active?.fast || m.name === models.active?.deep;
+                          const b = bench[m.name];
+                          return (
+                            <div
+                              key={m.name}
+                              className={`pr-card pr-model ${isActive ? "pr-model--active" : ""}`}
+                            >
+                              <div className="pr-model-head">
+                                <span className="pr-model-name">{m.name}</span>
+                                <span className="pr-model-meta">
+                                  {m.gb != null ? `${m.gb.toFixed(1)} GB` : ""}
+                                  {m.params ? ` · ${m.params}` : ""}
+                                </span>
+                              </div>
                               <div className="pr-model-badges">
-                                {r.best && (
-                                  <span className="pr-badge pr-badge--accent">top pick</span>
-                                )}
-                                {isInstalled && (
-                                  <span className="pr-badge pr-badge--good">installed</span>
-                                )}
-                                {r.tok_per_sec != null && (
-                                  <span className="pr-badge pr-badge--good">
-                                    {r.tok_per_sec.toFixed(1)} tok/s
-                                  </span>
-                                )}
-                                {r.runnable_now === false && !isInstalled && (
+                                {m.tools && <span className="pr-badge pr-badge--good">tools</span>}
+                                {m.runnable === false && (
                                   <span
                                     className="pr-badge pr-badge--warn"
-                                    title={r.block_reason_now ?? ""}
-                                  >
-                                    close apps first
-                                  </span>
-                                )}
-                                {inst?.runnable === false && (
-                                  <span
-                                    className="pr-badge pr-badge--warn"
-                                    title={inst.block_reason ?? ""}
+                                    title={m.block_reason ?? ""}
                                   >
                                     ram tight
                                   </span>
-                                )}
-                                {r.tools && <span className="pr-badge pr-badge--good">tools</span>}
-                                {isActive && (
-                                  <span className="pr-badge pr-badge--accent">active</span>
-                                )}
-                                {b?.status === "running" && (
-                                  <span className="pr-badge">benching…</span>
                                 )}
                                 {b?.tok != null && (
                                   <span className="pr-badge pr-badge--good">
@@ -1132,399 +1273,322 @@ export default function PrimeDeck() {
                                   </span>
                                 )}
                               </div>
-                              {pulling ? (
-                                <div className="pr-pull">
-                                  <span className="pr-meter">
-                                    <i style={{ width: `${pull.pct}%` }} />
-                                  </span>
-                                  <span className="pr-num">{Math.round(pull.pct)}%</span>
-                                </div>
-                              ) : isInstalled && inst ? (
-                                <div className="pr-model-actions">
-                                  <button
-                                    className="pr-btn pr-btn--accent"
-                                    disabled={inst.runnable === false || Boolean(isActive)}
-                                    onClick={() => sendAction("set_local_model", { model: inst.name })}
-                                  >
-                                    use
-                                  </button>
-                                  <button
-                                    className="pr-btn"
-                                    onClick={() => sendAction("benchmark_model", { model: inst.name })}
-                                  >
-                                    bench
-                                  </button>
-                                  <button
-                                    className="pr-btn pr-btn--danger"
-                                    onClick={() => onDeleteModel(inst.name)}
-                                  >
-                                    delete
-                                  </button>
-                                </div>
-                              ) : (
-                                <div className="pr-model-actions">
-                                  <button
-                                    className="pr-btn pr-btn--accent"
-                                    disabled={r.runnable_now === false}
-                                    title={
-                                      r.runnable_now === false
-                                        ? r.block_reason_now ?? "Not enough free RAM"
-                                        : undefined
-                                    }
-                                    onClick={() => onPullModel(r.tag)}
-                                  >
-                                    download
-                                  </button>
-                                </div>
-                              )}
+                              <div className="pr-model-actions">
+                                <button
+                                  className="pr-btn pr-btn--accent"
+                                  disabled={m.runnable === false || isActive}
+                                  onClick={() => sendAction("set_local_model", { model: m.name })}
+                                >
+                                  use
+                                </button>
+                                <button
+                                  className="pr-btn"
+                                  onClick={() => sendAction("benchmark_model", { model: m.name })}
+                                >
+                                  bench
+                                </button>
+                                <button
+                                  className="pr-btn pr-btn--danger"
+                                  onClick={() => onDeleteModel(m.name)}
+                                >
+                                  delete
+                                </button>
+                              </div>
                             </div>
+                          );
+                        })}
+                      </>
+                    )}
+                    {models.ollama && (
+                      <>
+                        <div className="pr-sec">
+                          <span className="pr-lab">add any ollama model</span>
+                        </div>
+                        <div className="pr-card pr-add-model">
+                          <p className="pr-add-model-hint">
+                            Pull any Ollama tag. Blocked if disk or free RAM is too low.
+                          </p>
+                          <div className="pr-add-model-row">
+                            <input
+                              className="pr-add-model-input"
+                              type="text"
+                              placeholder="name:tag"
+                              value={customModel}
+                              onChange={(e) => setCustomModel(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && customModel.trim()) {
+                                  onPullModel(customModel.trim());
+                                }
+                              }}
+                            />
+                            <button
+                              className="pr-btn pr-btn--accent"
+                              disabled={!customModel.trim()}
+                              onClick={() => onPullModel(customModel.trim())}
+                            >
+                              pull
+                            </button>
                           </div>
-                        );
-                      })}
-                    </>
-                  )}
-                  {orphanInstalled.length > 0 && (
-                    <>
-                      <div className="pr-sec">
-                        <span className="pr-lab">other installed</span>
-                      </div>
-                      {orphanInstalled.map((m) => {
-                        const isActive =
-                          m.name === models.active?.fast || m.name === models.active?.deep;
-                        const b = bench[m.name];
-                        return (
-                          <div
-                            key={m.name}
-                            className={`pr-card pr-model ${isActive ? "pr-model--active" : ""}`}
-                          >
-                            <div className="pr-model-head">
-                              <span className="pr-model-name">{m.name}</span>
-                              <span className="pr-model-meta">
-                                {m.gb != null ? `${m.gb.toFixed(1)} GB` : ""}
-                                {m.params ? ` · ${m.params}` : ""}
+                          {customModel.trim() && pulls[customModel.trim()] && (
+                            <div className="pr-pull" style={{ marginTop: 6 }}>
+                              <span className="pr-meter">
+                                <i
+                                  style={{
+                                    width: `${pulls[customModel.trim()].pct}%`,
+                                  }}
+                                />
+                              </span>
+                              <span className="pr-num">
+                                {Math.round(pulls[customModel.trim()].pct)}%
                               </span>
                             </div>
-                            <div className="pr-model-badges">
-                              {m.tools && <span className="pr-badge pr-badge--good">tools</span>}
-                              {m.runnable === false && (
-                                <span className="pr-badge pr-badge--warn" title={m.block_reason ?? ""}>
-                                  ram tight
-                                </span>
-                              )}
-                              {b?.tok != null && (
-                                <span className="pr-badge pr-badge--good">{b.tok.toFixed(1)} tok/s</span>
-                              )}
-                            </div>
-                            <div className="pr-model-actions">
-                              <button
-                                className="pr-btn pr-btn--accent"
-                                disabled={m.runnable === false || isActive}
-                                onClick={() => sendAction("set_local_model", { model: m.name })}
-                              >
-                                use
-                              </button>
-                              <button
-                                className="pr-btn"
-                                onClick={() => sendAction("benchmark_model", { model: m.name })}
-                              >
-                                bench
-                              </button>
-                              <button
-                                className="pr-btn pr-btn--danger"
-                                onClick={() => onDeleteModel(m.name)}
-                              >
-                                delete
-                              </button>
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </>
-                  )}
-                  {models.ollama && (
-                    <>
-                      <div className="pr-sec">
-                        <span className="pr-lab">add any ollama model</span>
-                      </div>
-                      <div className="pr-card pr-add-model">
-                        <p className="pr-add-model-hint">
-                          Pull any Ollama tag. Blocked if disk or free RAM is too low.
-                        </p>
-                        <div className="pr-add-model-row">
-                          <input
-                            className="pr-add-model-input"
-                            type="text"
-                            placeholder="name:tag"
-                            value={customModel}
-                            onChange={(e) => setCustomModel(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter" && customModel.trim()) {
-                                onPullModel(customModel.trim());
-                              }
-                            }}
-                          />
-                          <button
-                            className="pr-btn pr-btn--accent"
-                            disabled={!customModel.trim()}
-                            onClick={() => onPullModel(customModel.trim())}
-                          >
-                            pull
-                          </button>
+                          )}
                         </div>
-                        {customModel.trim() && pulls[customModel.trim()] && (
-                          <div className="pr-pull" style={{ marginTop: 6 }}>
-                            <span className="pr-meter">
-                              <i
-                                style={{
-                                  width: `${pulls[customModel.trim()].pct}%`,
-                                }}
-                              />
-                            </span>
+                      </>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
+            {tab === "memory" && (
+              <div className="pr-pane">
+                <div
+                  className="pr-card"
+                  style={{
+                    padding: "9px 10px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: 8,
+                  }}
+                >
+                  <span className="pr-lab">{mems.length} durable memories</span>
+                  <button
+                    className="pr-btn pr-btn--accent"
+                    onClick={() => sendAction("trigger_sleep")}
+                  >
+                    <Moon size={11} style={{ verticalAlign: -2, marginRight: 5 }} />
+                    sleep cycle
+                  </button>
+                </div>
+                {sleepMsg && (
+                  <p className="pr-pane-note" style={{ color: "var(--p-accent-text)" }}>
+                    {sleepMsg}
+                  </p>
+                )}
+                {mems.length === 0 && (
+                  <div className="pr-empty">
+                    Nothing remembered yet. Say "remember that…" and it lands here — inspectable,
+                    deletable, yours.
+                  </div>
+                )}
+                {mems.map((m) => (
+                  <div key={m.id} className="pr-card pr-mem">
+                    <span
+                      className="pr-mem-imp"
+                      title={`importance ${m.importance}/10`}
+                      aria-hidden
+                    >
+                      {Array.from({ length: 5 }, (_, i) => (
+                        <i key={i} className={i < Math.round(m.importance / 2) ? "on" : ""} />
+                      ))}
+                    </span>
+                    <div className="pr-mem-text">
+                      {m.content}
+                      <div className="pr-mem-cat">
+                        {m.category} · {m.source}
+                      </div>
+                    </div>
+                    <button className="pr-mem-x" title="Forget this" onClick={() => onForget(m.id)}>
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {tab === "ops" && (
+              <div className="pr-pane">
+                <div className="pr-sec">
+                  <span className="pr-lab">tasks</span>
+                </div>
+                {tasks.length === 0 && (
+                  <div className="pr-empty">
+                    No tasks queued. Ask JARVIS to "remind me to…" or "queue a task".
+                  </div>
+                )}
+                {[...activeTasks, ...queuedTasks].map((t) => (
+                  <div
+                    key={t.id}
+                    className={`pr-card pr-task ${t.status === "active" ? "pr-task--active" : ""}`}
+                  >
+                    <span className="pr-task-dot" />
+                    <div>
+                      <div className="pr-task-label">{t.t}</div>
+                      <div className="pr-task-meta">
+                        {t.status}
+                        {t.eta ? ` · ${t.eta}` : ""}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+                {doneTasks.map((t) => (
+                  <div key={t.id} className="pr-card pr-task pr-task--done">
+                    <span className="pr-task-dot" />
+                    <div>
+                      <div className="pr-task-label">{t.t}</div>
+                    </div>
+                  </div>
+                ))}
+                <div className="pr-sec">
+                  <span className="pr-lab">recent tool activity</span>
+                </div>
+                {trace.length === 0 && (
+                  <div className="pr-empty">No tool runs yet this session.</div>
+                )}
+                {trace.map((s, i) => (
+                  <div key={`${s.step}-${i}`} className="pr-card pr-trace">
+                    <div className="pr-trace-head">
+                      <span className="pr-trace-step">#{s.step}</span>
+                      <span className="pr-trace-action">{s.action}</span>
+                    </div>
+                    {s.observation && (
+                      <div className="pr-trace-obs">{s.observation.slice(0, 220)}</div>
+                    )}
+                  </div>
+                ))}
+                <div className="pr-sec">
+                  <span className="pr-lab">{tools.length} capabilities</span>
+                </div>
+                <div className="pr-caps">
+                  {tools.map((t) => (
+                    <span key={t.name} className="pr-cap" title={t.description}>
+                      {t.name}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {tab === "markets" && (
+              <div className="pr-pane">
+                <div className="pr-mkt-syms">
+                  {SYMBOLS.map((s) => (
+                    <button
+                      key={s}
+                      className={`pr-mode ${mktSym === s ? "pr-mode--on" : ""}`}
+                      onClick={() => setMktSym(s)}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  className={`pr-btn ${watching ? "pr-btn--accent" : ""}`}
+                  style={{ alignSelf: "stretch" }}
+                  onClick={() => sendAction(watching ? "stop_watch" : "start_watch")}
+                >
+                  {watching
+                    ? `watcher live · ${status.watch?.interval_min ?? "?"}m ${status.watch?.tf ?? ""}`
+                    : "start ict watcher"}
+                </button>
+                {mktLoading && !mkt && <div className="pr-empty">reading price…</div>}
+                {mkt && !mkt.ok && (
+                  <div className="pr-card pr-empty">{mkt.error ?? "Market read failed."}</div>
+                )}
+                {mkt?.ok && (
+                  <>
+                    <div className="pr-card">
+                      <div className="pr-mkt-bias">
+                        <span className="pr-num">{mkt.last?.toLocaleString("en-IN") ?? "—"}</span>
+                        <span className={`pr-bias-word pr-bias-word--${mkt.bias ?? "neutral"}`}>
+                          {mkt.bias ?? "neutral"}
+                          {typeof mkt.score === "number" ? ` · ${mkt.score}` : ""}
+                        </span>
+                      </div>
+                      {mkt.read && <div className="pr-mkt-read">{mkt.read}</div>}
+                      <div className="pr-mkt-rows">
+                        {mkt.structure && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">structure</span>
+                            <span className="pr-num">{mkt.structure}</span>
+                          </div>
+                        )}
+                        {mkt.zone && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">zone</span>
                             <span className="pr-num">
-                              {Math.round(pulls[customModel.trim()].pct)}%
+                              {mkt.zone}
+                              {mkt.equilibrium
+                                ? ` · eq ${mkt.equilibrium.toLocaleString("en-IN")}`
+                                : ""}
+                            </span>
+                          </div>
+                        )}
+                        {mkt.htf_bias && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">htf bias</span>
+                            <span className="pr-num">{mkt.htf_bias}</span>
+                          </div>
+                        )}
+                        {mkt.sweep && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">sweep</span>
+                            <span className="pr-num">{mkt.sweep}</span>
+                          </div>
+                        )}
+                        {mkt.order_block && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">order block</span>
+                            <span className="pr-num">{mkt.order_block}</span>
+                          </div>
+                        )}
+                        {mkt.session && (
+                          <div className="pr-kv">
+                            <span className="pr-lab">session</span>
+                            <span className="pr-num">
+                              {mkt.session.open ? "open" : "closed"} · {mkt.session.ist}
                             </span>
                           </div>
                         )}
                       </div>
-                    </>
-                  )}
-                </>
-              )}
-            </div>
-          )}
-
-          {tab === "memory" && (
-            <div className="pr-pane">
-              <div
-                className="pr-card"
-                style={{
-                  padding: "9px 10px",
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 8,
-                }}
-              >
-                <span className="pr-lab">{mems.length} durable memories</span>
-                <button
-                  className="pr-btn pr-btn--accent"
-                  onClick={() => sendAction("trigger_sleep")}
-                >
-                  <Moon size={11} style={{ verticalAlign: -2, marginRight: 5 }} />
-                  sleep cycle
-                </button>
-              </div>
-              {sleepMsg && (
-                <p className="pr-pane-note" style={{ color: "var(--p-accent-text)" }}>
-                  {sleepMsg}
-                </p>
-              )}
-              {mems.length === 0 && (
-                <div className="pr-empty">
-                  Nothing remembered yet. Say "remember that…" and it lands here — inspectable,
-                  deletable, yours.
-                </div>
-              )}
-              {mems.map((m) => (
-                <div key={m.id} className="pr-card pr-mem">
-                  <span className="pr-mem-imp" title={`importance ${m.importance}/10`} aria-hidden>
-                    {Array.from({ length: 5 }, (_, i) => (
-                      <i key={i} className={i < Math.round(m.importance / 2) ? "on" : ""} />
-                    ))}
-                  </span>
-                  <div className="pr-mem-text">
-                    {m.content}
-                    <div className="pr-mem-cat">
-                      {m.category} · {m.source}
                     </div>
-                  </div>
-                  <button className="pr-mem-x" title="Forget this" onClick={() => onForget(m.id)}>
-                    <Trash2 size={12} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {tab === "ops" && (
-            <div className="pr-pane">
-              <div className="pr-sec">
-                <span className="pr-lab">tasks</span>
-              </div>
-              {tasks.length === 0 && (
-                <div className="pr-empty">
-                  No tasks queued. Ask JARVIS to "remind me to…" or "queue a task".
-                </div>
-              )}
-              {[...activeTasks, ...queuedTasks].map((t) => (
-                <div
-                  key={t.id}
-                  className={`pr-card pr-task ${t.status === "active" ? "pr-task--active" : ""}`}
-                >
-                  <span className="pr-task-dot" />
-                  <div>
-                    <div className="pr-task-label">{t.t}</div>
-                    <div className="pr-task-meta">
-                      {t.status}
-                      {t.eta ? ` · ${t.eta}` : ""}
-                    </div>
-                  </div>
-                </div>
-              ))}
-              {doneTasks.map((t) => (
-                <div key={t.id} className="pr-card pr-task pr-task--done">
-                  <span className="pr-task-dot" />
-                  <div>
-                    <div className="pr-task-label">{t.t}</div>
-                  </div>
-                </div>
-              ))}
-              <div className="pr-sec">
-                <span className="pr-lab">recent tool activity</span>
-              </div>
-              {trace.length === 0 && <div className="pr-empty">No tool runs yet this session.</div>}
-              {trace.map((s, i) => (
-                <div key={`${s.step}-${i}`} className="pr-card pr-trace">
-                  <div className="pr-trace-head">
-                    <span className="pr-trace-step">#{s.step}</span>
-                    <span className="pr-trace-action">{s.action}</span>
-                  </div>
-                  {s.observation && (
-                    <div className="pr-trace-obs">{s.observation.slice(0, 220)}</div>
-                  )}
-                </div>
-              ))}
-              <div className="pr-sec">
-                <span className="pr-lab">{tools.length} capabilities</span>
-              </div>
-              <div className="pr-caps">
-                {tools.map((t) => (
-                  <span key={t.name} className="pr-cap" title={t.description}>
-                    {t.name}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {tab === "markets" && (
-            <div className="pr-pane">
-              <div className="pr-mkt-syms">
-                {SYMBOLS.map((s) => (
-                  <button
-                    key={s}
-                    className={`pr-mode ${mktSym === s ? "pr-mode--on" : ""}`}
-                    onClick={() => setMktSym(s)}
-                  >
-                    {s}
-                  </button>
-                ))}
-              </div>
-              <button
-                className={`pr-btn ${watching ? "pr-btn--accent" : ""}`}
-                style={{ alignSelf: "stretch" }}
-                onClick={() => sendAction(watching ? "stop_watch" : "start_watch")}
-              >
-                {watching
-                  ? `watcher live · ${status.watch?.interval_min ?? "?"}m ${status.watch?.tf ?? ""}`
-                  : "start ict watcher"}
-              </button>
-              {mktLoading && !mkt && <div className="pr-empty">reading price…</div>}
-              {mkt && !mkt.ok && (
-                <div className="pr-card pr-empty">{mkt.error ?? "Market read failed."}</div>
-              )}
-              {mkt?.ok && (
-                <>
-                  <div className="pr-card">
-                    <div className="pr-mkt-bias">
-                      <span className="pr-num">{mkt.last?.toLocaleString("en-IN") ?? "—"}</span>
-                      <span className={`pr-bias-word pr-bias-word--${mkt.bias ?? "neutral"}`}>
-                        {mkt.bias ?? "neutral"}
-                        {typeof mkt.score === "number" ? ` · ${mkt.score}` : ""}
-                      </span>
-                    </div>
-                    {mkt.read && <div className="pr-mkt-read">{mkt.read}</div>}
-                    <div className="pr-mkt-rows">
-                      {mkt.structure && (
+                    {mkt.plan && (
+                      <div className="pr-card" style={{ padding: "9px 10px" }}>
                         <div className="pr-kv">
-                          <span className="pr-lab">structure</span>
-                          <span className="pr-num">{mkt.structure}</span>
-                        </div>
-                      )}
-                      {mkt.zone && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">zone</span>
+                          <span className="pr-lab">plan · {mkt.plan.side}</span>
                           <span className="pr-num">
-                            {mkt.zone}
-                            {mkt.equilibrium
-                              ? ` · eq ${mkt.equilibrium.toLocaleString("en-IN")}`
-                              : ""}
+                            {mkt.plan.entry ? `in ${mkt.plan.entry}` : ""}
+                            {mkt.plan.sl ? ` · sl ${mkt.plan.sl}` : ""}
+                            {mkt.plan.tp ? ` · tp ${mkt.plan.tp}` : ""}
+                            {mkt.plan.rr ? ` · rr ${mkt.plan.rr}` : ""}
                           </span>
                         </div>
-                      )}
-                      {mkt.htf_bias && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">htf bias</span>
-                          <span className="pr-num">{mkt.htf_bias}</span>
-                        </div>
-                      )}
-                      {mkt.sweep && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">sweep</span>
-                          <span className="pr-num">{mkt.sweep}</span>
-                        </div>
-                      )}
-                      {mkt.order_block && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">order block</span>
-                          <span className="pr-num">{mkt.order_block}</span>
-                        </div>
-                      )}
-                      {mkt.session && (
-                        <div className="pr-kv">
-                          <span className="pr-lab">session</span>
-                          <span className="pr-num">
-                            {mkt.session.open ? "open" : "closed"} · {mkt.session.ist}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                  {mkt.plan && (
-                    <div className="pr-card" style={{ padding: "9px 10px" }}>
-                      <div className="pr-kv">
-                        <span className="pr-lab">plan · {mkt.plan.side}</span>
-                        <span className="pr-num">
-                          {mkt.plan.entry ? `in ${mkt.plan.entry}` : ""}
-                          {mkt.plan.sl ? ` · sl ${mkt.plan.sl}` : ""}
-                          {mkt.plan.tp ? ` · tp ${mkt.plan.tp}` : ""}
-                          {mkt.plan.rr ? ` · rr ${mkt.plan.rr}` : ""}
-                        </span>
+                        {mkt.plan.text && (
+                          <p className="pr-pane-note" style={{ marginTop: 6 }}>
+                            {mkt.plan.text}
+                          </p>
+                        )}
                       </div>
-                      {mkt.plan.text && (
-                        <p className="pr-pane-note" style={{ marginTop: 6 }}>
-                          {mkt.plan.text}
-                        </p>
-                      )}
+                    )}
+                  </>
+                )}
+                {feed
+                  .filter((e): e is Extract<Feed, { kind: "alert" }> => e.kind === "alert")
+                  .slice(-4)
+                  .reverse()
+                  .map((e) => (
+                    <div key={e.id} className="pr-card pr-alert">
+                      <div className="pr-alert-head">
+                        <span className="pr-alert-sym">⚑ {e.symbol}</span>
+                        <span className="pr-alert-at">{e.at}</span>
+                      </div>
+                      <div className="pr-alert-text">{e.text}</div>
                     </div>
-                  )}
-                </>
-              )}
-              {feed
-                .filter((e): e is Extract<Feed, { kind: "alert" }> => e.kind === "alert")
-                .slice(-4)
-                .reverse()
-                .map((e) => (
-                  <div key={e.id} className="pr-card pr-alert">
-                    <div className="pr-alert-head">
-                      <span className="pr-alert-sym">⚑ {e.symbol}</span>
-                      <span className="pr-alert-at">{e.at}</span>
-                    </div>
-                    <div className="pr-alert-text">{e.text}</div>
-                  </div>
-                ))}
-            </div>
-          )}
+                  ))}
+              </div>
+            )}
           </div>
         </aside>
       </div>

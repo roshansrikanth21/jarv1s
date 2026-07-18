@@ -1,0 +1,10 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "include": ["*.py"],
+  "exclude": ["**/node_modules", "**/venv", "**/.venv", "**/__pycache__"],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "none",
+  "reportMissingModuleSource": "none",
+  "extraPaths": ["."]
+}

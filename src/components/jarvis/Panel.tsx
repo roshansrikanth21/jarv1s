@@ -11,7 +11,15 @@ interface PanelProps {
   right?: ReactNode;
 }
 
-export function Panel({ title, status, children, className = "", dense = false, active = false, right }: PanelProps) {
+export function Panel({
+  title,
+  status,
+  children,
+  className = "",
+  dense = false,
+  active = false,
+  right,
+}: PanelProps) {
   return (
     <motion.div
       className={`j-panel scanlines ${active ? "active" : ""} ${className}`}

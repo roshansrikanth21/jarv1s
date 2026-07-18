@@ -7,7 +7,7 @@
 // not on every hot-reload during development.
 import { useEffect, useRef, useState } from "react";
 
-const SRC = "./intro.mp4";                 // drop the rendered clip at public/intro.mp4
+const SRC = "./intro.mp4"; // drop the rendered clip at public/intro.mp4
 const SEEN_KEY = "jarvis_intro_seen";
 
 export function BootIntro({ onDone }: { onDone: () => void }) {
@@ -19,7 +19,11 @@ export function BootIntro({ onDone }: { onDone: () => void }) {
     if (doneRef.current) return;
     doneRef.current = true;
     setFading(true);
-    try { sessionStorage.setItem(SEEN_KEY, "1"); } catch { /* ignore */ }
+    try {
+      sessionStorage.setItem(SEEN_KEY, "1");
+    } catch {
+      /* ignore */
+    }
     // let the fade play before unmounting
     setTimeout(onDone, 650);
   };
@@ -27,13 +31,25 @@ export function BootIntro({ onDone }: { onDone: () => void }) {
   useEffect(() => {
     const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
     let seen = false;
-    try { seen = sessionStorage.getItem(SEEN_KEY) === "1"; } catch { /* ignore */ }
-    if (reduce || seen) { onDone(); return; }
+    try {
+      seen = sessionStorage.getItem(SEEN_KEY) === "1";
+    } catch {
+      /* ignore */
+    }
+    if (reduce || seen) {
+      onDone();
+      return;
+    }
 
     const v = videoRef.current;
-    if (!v) { onDone(); return; }
+    if (!v) {
+      onDone();
+      return;
+    }
     // If the asset can't start playing within a beat, don't hold the app hostage.
-    const guard = setTimeout(() => { if (v.readyState < 2) finish(); }, 1600);
+    const guard = setTimeout(() => {
+      if (v.readyState < 2) finish();
+    }, 1600);
     v.play?.().catch(() => finish());
     return () => clearTimeout(guard);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -42,9 +58,15 @@ export function BootIntro({ onDone }: { onDone: () => void }) {
   return (
     <div
       style={{
-        position: "fixed", inset: 0, zIndex: 100000, background: "#0a0705",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        opacity: fading ? 0 : 1, transition: "opacity 0.6s ease",
+        position: "fixed",
+        inset: 0,
+        zIndex: 100000,
+        background: "#0a0705",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        opacity: fading ? 0 : 1,
+        transition: "opacity 0.6s ease",
         pointerEvents: fading ? "none" : "auto",
       }}
     >
@@ -62,11 +84,19 @@ export function BootIntro({ onDone }: { onDone: () => void }) {
         onClick={finish}
         className="no-drag"
         style={{
-          position: "absolute", bottom: 26, right: 28,
-          background: "rgba(10,7,5,0.6)", border: "1px solid oklch(0.68 0.22 38 / 0.5)",
-          color: "oklch(0.68 0.22 38)", borderRadius: 999, padding: "6px 16px",
-          fontFamily: "JetBrains Mono, ui-monospace, monospace", fontSize: 11,
-          letterSpacing: "0.18em", textTransform: "uppercase", cursor: "pointer",
+          position: "absolute",
+          bottom: 26,
+          right: 28,
+          background: "rgba(10,7,5,0.6)",
+          border: "1px solid oklch(0.68 0.22 38 / 0.5)",
+          color: "oklch(0.68 0.22 38)",
+          borderRadius: 999,
+          padding: "6px 16px",
+          fontFamily: "JetBrains Mono, ui-monospace, monospace",
+          fontSize: 11,
+          letterSpacing: "0.18em",
+          textTransform: "uppercase",
+          cursor: "pointer",
           backdropFilter: "blur(6px)",
         }}
       >

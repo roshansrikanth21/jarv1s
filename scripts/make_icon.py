@@ -84,7 +84,11 @@ def draw_mark(size: int) -> Image.Image:
     accent = [(stem_l, top_y), (stem_l + cut, top_y), (stem_l, top_y + cut)]
     d.polygon(accent, fill=ACCENT)
 
-    return img.resize((size, size), Image.LANCZOS)
+    try:
+        _lanczos = Image.Resampling.LANCZOS
+    except AttributeError:
+        _lanczos = Image.LANCZOS  # type: ignore[attr-defined]
+    return img.resize((size, size), _lanczos)
 
 
 def main():

@@ -47,10 +47,20 @@ export function WindowControls({
         <button type="button" className="pr-iconbtn" title="Minimize" onClick={minimize}>
           <Minus size={13} />
         </button>
-        <button type="button" className="pr-iconbtn" title={maximized ? "Restore" : "Maximize"} onClick={toggleMax}>
+        <button
+          type="button"
+          className="pr-iconbtn"
+          title={maximized ? "Restore" : "Maximize"}
+          onClick={toggleMax}
+        >
           {maximized ? <Minimize2 size={11} /> : <Square size={11} />}
         </button>
-        <button type="button" className="pr-iconbtn pr-iconbtn--close" title="Close" onClick={close}>
+        <button
+          type="button"
+          className="pr-iconbtn pr-iconbtn--close"
+          title="Close"
+          onClick={close}
+        >
           <X size={13} />
         </button>
       </div>
@@ -64,7 +74,12 @@ export function WindowControls({
       <button type="button" className="winctl-btn" title="Minimize" onClick={minimize}>
         <Minus size={12} />
       </button>
-      <button type="button" className="winctl-btn" title={maximized ? "Restore" : "Maximize"} onClick={toggleMax}>
+      <button
+        type="button"
+        className="winctl-btn"
+        title={maximized ? "Restore" : "Maximize"}
+        onClick={toggleMax}
+      >
         {maximized ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
       </button>
       <button type="button" className="winctl-btn winctl-btn--close" title="Close" onClick={close}>

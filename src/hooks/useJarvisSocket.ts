@@ -8,7 +8,12 @@ import { notifyNative } from "@/lib/utils";
 
 export type Role = "user" | "agent" | "system";
 export type Line = { id: string; role: Role; text: string };
-export type Mood = { enabled?: boolean; emotion?: string; colour?: string; intensity?: number } | null;
+export type Mood = {
+  enabled?: boolean;
+  emotion?: string;
+  colour?: string;
+  intensity?: number;
+} | null;
 
 const uid = () => Math.random().toString(36).slice(2);
 
@@ -17,9 +22,9 @@ export type JarvisSocket = {
   listening: boolean;
   speaking: boolean;
   lines: Line[];
-  stream: string;      // in-progress streamed assistant text (before the final line)
+  stream: string; // in-progress streamed assistant text (before the final line)
   mood: Mood;
-  level: number;       // mic input level (0..32767) during listening
+  level: number; // mic input level (0..32767) during listening
   /** True only once a disconnect has lasted past a short grace period — lets
    *  the UI show a calm "waking up" state instead of flashing an error on
    *  every brief, self-healing blip. Never mention backend/WebSocket/retry. */
@@ -37,19 +42,19 @@ export type JarvisSocket = {
 export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   const [connected, setConnected] = useState(false);
   const [listening, setListening] = useState(false);
-  const [speaking, setSpeaking]   = useState(false);
-  const [lines, setLines]         = useState<Line[]>([{ id: uid(), role: "system", text: greeting }]);
-  const [stream, setStream]       = useState("");
-  const [mood, setMood]           = useState<Mood>(null);
-  const [level, setLevel]         = useState(0);
+  const [speaking, setSpeaking] = useState(false);
+  const [lines, setLines] = useState<Line[]>([{ id: uid(), role: "system", text: greeting }]);
+  const [stream, setStream] = useState("");
+  const [mood, setMood] = useState<Mood>(null);
+  const [level, setLevel] = useState(0);
   const [showReconnectHint, setShowReconnectHint] = useState(false);
   const reconnectHintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const wsRef    = useRef<WebSocket | null>(null);
+  const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const addRef   = useRef<(r: Role, t: string) => void>(null!);
-  const connRef  = useRef<() => void>(null!);
-  const tapsRef  = useRef<Set<(msg: Record<string, unknown>) => void>>(new Set());
+  const addRef = useRef<(r: Role, t: string) => void>(null!);
+  const connRef = useRef<() => void>(null!);
+  const tapsRef = useRef<Set<(msg: Record<string, unknown>) => void>>(new Set());
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const manualCloseRef = useRef(false);
@@ -91,13 +96,18 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
 
   const add = useCallback((role: Role, text: string) => {
     if (!text.trim()) return;
-    setLines(p => [...p.slice(-120), { id: uid(), role, text }]);
+    setLines((p) => [...p.slice(-120), { id: uid(), role, text }]);
   }, []);
   addRef.current = add;
 
   const playTts = useCallback((b64: string) => {
-    if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
-    const blob = new Blob([Uint8Array.from(atob(b64), c => c.charCodeAt(0))], { type: "audio/mpeg" });
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+    const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], {
+      type: "audio/mpeg",
+    });
     const url = URL.createObjectURL(blob);
     const a = new Audio(url);
     audioRef.current = a;
@@ -108,7 +118,8 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
       audioRef.current = null;
       wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
     };
-    a.onended = end; a.onerror = end;
+    a.onended = end;
+    a.onerror = end;
     a.play()
       .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
       .catch(() => {
@@ -121,11 +132,27 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   }, []);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
-    if (wsRef.current?.readyState === WebSocket.CONNECTING) return;
+    const cur = wsRef.current;
+    if (cur && (cur.readyState === WebSocket.OPEN || cur.readyState === WebSocket.CONNECTING))
+      return;
+    // Tear down any half-dead socket so its late onclose/onmessage can't flip
+    // connected=false or duplicate TTS after a newer socket is already live.
+    if (cur) {
+      cur.onopen = null;
+      cur.onclose = null;
+      cur.onerror = null;
+      cur.onmessage = null;
+      try {
+        cur.close();
+      } catch {
+        /* stale */
+      }
+      wsRef.current = null;
+    }
     const ws = new WebSocket(wsUrl());
     wsRef.current = ws;
     ws.onopen = () => {
+      if (wsRef.current !== ws) return;
       reconnectAttemptRef.current = 0;
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
@@ -133,18 +160,26 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
       }
       setConnected(true);
       flushPendingActions();
-      fetch("/api/agent/status").then(r => r.json()).then(d => { if (d?.emotion) setMood(d.emotion); }).catch(() => {});
+      fetch("/api/agent/status")
+        .then((r) => r.json())
+        .then((d) => {
+          if (d?.emotion) setMood(d.emotion);
+        })
+        .catch(() => {});
     };
     ws.onclose = (ev) => {
+      if (wsRef.current !== ws) return;
       setConnected(false);
       setListening(false);
       setSpeaking(false);
       if (!manualCloseRef.current && ev.code !== 1000) scheduleReconnect("onclose");
     };
     ws.onerror = () => {
+      if (wsRef.current !== ws) return;
       scheduleReconnect("onerror");
     };
     ws.onmessage = (ev) => {
+      if (wsRef.current !== ws) return;
       try {
         const d = JSON.parse(ev.data);
         const txt: string = d.text ?? d.message ?? "";
@@ -156,25 +191,38 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         }
         if (d.type === "emotion" && d.emotion) setMood(d.emotion);
         if (d.type === "transcription" || d.type === "transcript") addRef.current("user", txt);
-        if (d.type === "llm_chunk" && d.text) setStream(p => p + (d.text as string));
-        if (d.type === "llm_reset") setStream("");   // model dumped a tool-call as text; discard it
-        if (d.type === "llm_response" || d.type === "response") { setStream(""); addRef.current("agent", txt); }
+        if (d.type === "llm_chunk" && d.text) setStream((p) => p + (d.text as string));
+        if (d.type === "llm_reset") setStream(""); // model dumped a tool-call as text; discard it
+        if (d.type === "llm_response" || d.type === "response") {
+          setStream("");
+          addRef.current("agent", txt);
+        }
         if (d.type === "tts_audio" && d.data) playTts(d.data as string);
         if ((d.type === "system" || d.type === "tts_error") && txt.trim()) {
           addRef.current("system", txt);
         }
         if (d.type === "tts_stop") {
-          if (audioRef.current) { audioRef.current.pause(); audioRef.current = null; }
+          if (audioRef.current) {
+            audioRef.current.pause();
+            audioRef.current = null;
+          }
           setSpeaking(false);
           setStream("");
           wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
         }
         if (d.type === "open_trading") {
-          window.electronAPI?.openTrading?.()
-            .then((r: { ok?: boolean; error?: string } | undefined) => {
-              if (r && r.ok === false && r.error) addRef.current("system", r.error);
-            })
-            .catch(() => addRef.current("system", "Could not open the trading terminal."));
+          if (!window.electronAPI?.openTrading) {
+            addRef.current("system", "Trading terminal needs the desktop app.");
+          } else {
+            window.electronAPI
+              .openTrading()
+              .then((r: { ok?: boolean; error?: string } | undefined) => {
+                if (r && r.ok === false && r.error) addRef.current("system", r.error);
+                else if (r && r.ok === false)
+                  addRef.current("system", "Trading terminal failed to open.");
+              })
+              .catch(() => addRef.current("system", "Could not open the trading terminal."));
+          }
         }
         // Authoritative mic state from the backend — the single source of truth. Fixes the
         // ALWAYS_LISTEN desync (UI showing "tap to speak" while the mic was already hot) and
@@ -182,8 +230,16 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         if (d.type === "mic") setListening(Boolean(d.listening));
         if (d.type === "audio_level") setLevel(Number(d.level) || 0);
         if (d.type === "system_alert" && txt.trim()) notifyNative("JARVIS", txt);
-        tapsRef.current.forEach(fn => { try { fn(d); } catch { /* tap error is not ours */ } });
-      } catch { /* ignore malformed packet */ }
+        tapsRef.current.forEach((fn) => {
+          try {
+            fn(d);
+          } catch {
+            /* tap error is not ours */
+          }
+        });
+      } catch {
+        /* ignore malformed packet */
+      }
     };
   }, [playTts, scheduleReconnect, flushPendingActions]);
   connRef.current = connect;
@@ -209,32 +265,44 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   useEffect(() => {
     if (connected) {
       setShowReconnectHint(false);
-      if (reconnectHintTimerRef.current) { clearTimeout(reconnectHintTimerRef.current); reconnectHintTimerRef.current = null; }
+      if (reconnectHintTimerRef.current) {
+        clearTimeout(reconnectHintTimerRef.current);
+        reconnectHintTimerRef.current = null;
+      }
       return;
     }
     reconnectHintTimerRef.current = setTimeout(() => setShowReconnectHint(true), 2500);
     return () => {
-      if (reconnectHintTimerRef.current) { clearTimeout(reconnectHintTimerRef.current); reconnectHintTimerRef.current = null; }
+      if (reconnectHintTimerRef.current) {
+        clearTimeout(reconnectHintTimerRef.current);
+        reconnectHintTimerRef.current = null;
+      }
     };
   }, [connected]);
 
-  const send = useCallback((text: string) => {
-    const t = text.trim();
-    if (!t) return;
-    add("user", t);
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ action: "command", text: t }));
-      return;
-    }
-    if (pendingCommandsRef.current.length < 8) {
-      pendingCommandsRef.current.push(t);
-    }
-    add("system", "Got it — one moment, then I'll reply.");
-    connRef.current();
-  }, [add]);
+  const send = useCallback(
+    (text: string) => {
+      const t = text.trim();
+      if (!t) return;
+      add("user", t);
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ action: "command", text: t }));
+        return;
+      }
+      if (pendingCommandsRef.current.length < 8) {
+        pendingCommandsRef.current.push(t);
+      }
+      add("system", "Got it — one moment, then I'll reply.");
+      connRef.current();
+    },
+    [add],
+  );
 
   const toggleMic = useCallback(() => {
-    if (!connected) { connRef.current(); return; }
+    if (!connected) {
+      connRef.current();
+      return;
+    }
     // While JARVIS is speaking, tapping the mic/orb means "stop talking," not
     // "start listening over you" (which would just feed the echo guard) — this
     // surfaces the backend's dedicated interrupt action without new UI.
@@ -260,8 +328,24 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
 
   const subscribe = useCallback((handler: (msg: Record<string, unknown>) => void) => {
     tapsRef.current.add(handler);
-    return () => { tapsRef.current.delete(handler); };
+    return () => {
+      tapsRef.current.delete(handler);
+    };
   }, []);
 
-  return { connected, listening, speaking, lines, stream, mood, level, showReconnectHint, send, toggleMic, addLine: add, sendAction, subscribe };
+  return {
+    connected,
+    listening,
+    speaking,
+    lines,
+    stream,
+    mood,
+    level,
+    showReconnectHint,
+    send,
+    toggleMic,
+    addLine: add,
+    sendAction,
+    subscribe,
+  };
 }

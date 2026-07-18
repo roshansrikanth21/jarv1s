@@ -20,10 +20,12 @@ import sys
 import time
 from pathlib import Path
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(_reconfigure):
+    try:
+        _reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
@@ -45,11 +47,15 @@ def section(name: str) -> None:
 
 
 # ── Mock harness ────────────────────────────────────────────────────────────────
-def make_brain(script_by_agent: dict[str, list[dict]], call_log: list = None):
+def make_brain(
+    script_by_agent: dict[str, list[dict]],
+    call_log: list | None = None,
+):
     """Returns an async brain_call that replays scripted replies per user prompt.
     Each entry in the per-agent list is a reply {"content": ..., "tool_calls": [...]}.
     """
-    call_log = call_log if call_log is not None else []
+    if call_log is None:
+        call_log = []
 
     async def brain(messages, tools, max_tokens):
         # Identify which agent this call is for by the user prompt in the first turn.
@@ -68,7 +74,10 @@ def make_brain(script_by_agent: dict[str, list[dict]], call_log: list = None):
     return brain, call_log
 
 
-def make_execute_tool(responses: dict = None, sleep_by_name: dict = None):
+def make_execute_tool(
+    responses: dict | None = None,
+    sleep_by_name: dict | None = None,
+):
     responses = responses or {}
     sleep_by_name = sleep_by_name or {}
 
@@ -105,8 +114,11 @@ def run() -> int:
        "spawn_agents" not in names)
 
     section("spec validation")
+    async def _noop_brain(*_args):
+        return {"content": "", "tool_calls": []}
+
     async def _val(specs):
-        return await subagents.run_all(specs, [], lambda *_: None, lambda *_: None)
+        return await subagents.run_all(specs, [], _noop_brain, lambda *_: "")
 
     r = asyncio.run(_val([]))
     ok("empty list returns __error__", r.get("__error__", "").startswith("spawn_agents"))

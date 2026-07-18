@@ -58,7 +58,10 @@ def run() -> int:
                          confidence=0.9, source_episode_id=eid)
     ok("add_fact returns id", bool(fid))
     got = store.get_fact(fid)
-    ok("get_fact roundtrip", got and got["text"] == "User prefers dark mode.")
+    ok(
+        "get_fact roundtrip",
+        isinstance(got, dict) and got.get("text") == "User prefers dark mode.",
+    )
 
     # Dedup on exact-text within namespace bumps confidence, doesn't insert twice.
     fid2 = store.add_fact("User prefers dark mode.", category="preference",
@@ -90,8 +93,14 @@ def run() -> int:
     # reinforce_facts must bump access_count and set last_access.
     store.reinforce_facts([fid])
     row = store.get_fact(fid)
-    ok("reinforce_facts bumps access_count", row["access_count"] >= 1)
-    ok("reinforce_facts stamps last_access", bool(row["last_access"]))
+    ok(
+        "reinforce_facts bumps access_count",
+        isinstance(row, dict) and int(row.get("access_count") or 0) >= 1,
+    )
+    ok(
+        "reinforce_facts stamps last_access",
+        isinstance(row, dict) and bool(row.get("last_access")),
+    )
 
     section("cortex.embeddings — locked backend + deterministic WordHash")
     embeddings.reset_for_tests()

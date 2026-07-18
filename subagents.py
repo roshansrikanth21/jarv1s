@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
 log = logging.getLogger("jarvis.subagents")
 
@@ -45,7 +45,6 @@ READ_ONLY_TOOL_NAMES = frozenset({
     "recall_memory",
     "get_system_info",
     "get_weather",
-    "get_current_time",
     "analyze_image",
     "capture_screen",
     "watch_video",
@@ -185,11 +184,12 @@ async def run_all(
         failure  → {"__error__": "...why..."}
     Callers should check for '__error__' first."""
     valid, err = _validate_specs(specs)
-    if err:
-        return {"__error__": err}
+    if err or valid is None:
+        return {"__error__": err or "spawn_agents: invalid agent specs."}
+    specs_ok: list[dict] = valid
     tools = filter_tools(all_tools)
     tasks = [asyncio.create_task(_run_one(s, tools, brain_call, execute_tool))
-             for s in valid]
+             for s in specs_ok]
     try:
         pairs = await asyncio.wait_for(
             asyncio.gather(*tasks, return_exceptions=True), wall_clock_sec)
@@ -199,7 +199,7 @@ async def run_all(
                 t.cancel()
         # Collect any that finished before the timeout so nothing is silently lost.
         partial: dict[str, str] = {}
-        for t, s in zip(tasks, valid):
+        for t, s in zip(tasks, specs_ok):
             if t.done() and not t.cancelled():
                 try:
                     n, r = t.result()
@@ -210,12 +210,12 @@ async def run_all(
                 partial[s["name"]] = f"(cancelled: hit {wall_clock_sec}s wall-clock)"
         return partial
     results: dict[str, str] = {}
-    for item, s in zip(pairs, valid):
-        if isinstance(item, Exception):
+    for item, s in zip(pairs, specs_ok):
+        if isinstance(item, BaseException):
             results[s["name"]] = f"(sub-agent {s['name']!r} error: {item})"
-        else:
-            n, r = item
-            results[n] = r
+            continue
+        name, text = cast(tuple[str, str], item)
+        results[name] = text
     return results
 
 

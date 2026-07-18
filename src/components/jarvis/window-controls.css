@@ -21,7 +21,9 @@
   color: color-mix(in srgb, var(--winctl-accent, #888) 55%, #666);
   border-radius: 4px;
   cursor: pointer;
-  transition: color 150ms, background 150ms;
+  transition:
+    color 150ms,
+    background 150ms;
 }
 
 .winctl-btn:hover {

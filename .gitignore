@@ -43,7 +43,12 @@ out/
 
 # Local tool output/scratch
 graphify-out/
-scratch_nib2_*.png
+scratch_*.png
+scratch_*.log
+debug-*.log
+
+# Local editor / agent settings (machine-specific)
+.claude/settings.local.json
 
 # Authorized-target allowlist for the pentest tool (engagement-sensitive)
 memory/jarvis_scope.json

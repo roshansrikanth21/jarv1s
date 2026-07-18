@@ -14,11 +14,12 @@ import os
 import sys
 from pathlib import Path
 
-# Force UTF-8 on stdout so unicode arrows in labels don't crash on the Windows console.
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")   # py3.7+
-except Exception:
-    pass
+_reconfigure = getattr(sys.stdout, "reconfigure", None)
+if callable(_reconfigure):
+    try:
+        _reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
@@ -43,6 +44,7 @@ def section(name: str) -> None:
 _spawn_calls: list[list[str]] = []
 _run_calls: list[list[str]] = []
 _run_responses: dict[str, tuple[int, str, str]] = {}
+_startfile_calls: list[str] = []
 
 
 def _install_stubs() -> None:
@@ -58,16 +60,21 @@ def _install_stubs() -> None:
             key = f"winget:{argv[1]}"
         return _run_responses.get(key, (0, "", ""))
 
+    def fake_startfile(path, *args, **kwargs):
+        _startfile_calls.append(str(path))
+
     desktop._spawn = fake_spawn
     desktop._run = fake_run
     # Force IS_WINDOWS true so we exercise the real branches even if running on non-Windows.
     desktop.IS_WINDOWS = True
+    os.startfile = fake_startfile  # type: ignore[attr-defined]
 
 
 def _reset() -> None:
     _spawn_calls.clear()
     _run_calls.clear()
     _run_responses.clear()
+    _startfile_calls.clear()
 
 
 def _last_spawn() -> list[str]:
@@ -83,14 +90,17 @@ def run() -> int:
     ok("unknown action returns clear error", "unknown action" in out and "Available" in out, out)
     ok("unknown action never spawned anything", not _spawn_calls and not _run_calls)
 
-    section("open_path — Explorer")
+    section("open_path — startfile / Explorer")
     _reset()
     # A path that definitely exists on any Windows host (or wherever this runs).
     real = str(Path(_REPO).resolve())
     out = desktop.run("open_path", {"path": real})
-    ok("open_path spawns explorer.exe with the resolved path",
-       _last_spawn()[:1] == ["explorer.exe"] and _last_spawn()[-1] == real, str(_last_spawn()))
-    ok("open_path reports what it opened", "Opened Explorer at:" in out)
+    ok(
+        "open_path uses os.startfile with the resolved path",
+        _startfile_calls[:1] == [real] and not _spawn_calls,
+        str(_startfile_calls),
+    )
+    ok("open_path reports what it opened", out.startswith("Opened:"), out)
 
     _reset()
     out = desktop.run("open_path", {"path": ""})

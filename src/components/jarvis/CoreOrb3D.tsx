@@ -59,10 +59,7 @@ function eyeRing(radiusX: number, radiusY: number) {
 }
 
 function slashLine() {
-  const pts = [
-    new THREE.Vector3(-1.15, 0.95, 0.15),
-    new THREE.Vector3(1.05, -0.85, -0.1),
-  ];
+  const pts = [new THREE.Vector3(-1.15, 0.95, 0.15), new THREE.Vector3(1.05, -0.85, -0.1)];
   const geo = new THREE.BufferGeometry().setFromPoints(pts);
   const mat = new THREE.LineBasicMaterial({
     color: CORE,
@@ -120,7 +117,11 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
     const camera = new THREE.PerspectiveCamera(42, w / h, 0.1, 100);
     camera.position.z = 3.35;
 
-    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      powerPreference: "high-performance",
+    });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(w, h);
     renderer.setClearColor(0x000000, 0);
@@ -187,7 +188,15 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
       const st = stateRef.current;
       const lvl = levelRef.current;
       const baseSpeed =
-        st === "thinking" ? 1.35 : st === "speaking" ? 0.95 : st === "listening" ? 0.65 : st === "low" ? 0.25 : 0.42;
+        st === "thinking"
+          ? 1.35
+          : st === "speaking"
+            ? 0.95
+            : st === "listening"
+              ? 0.65
+              : st === "low"
+                ? 0.25
+                : 0.42;
       rpm = baseSpeed * 12;
 
       root.rotation.y += dt * baseSpeed;
@@ -208,7 +217,14 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
       const scale = pulse * listen;
       root.scale.setScalar(scale);
 
-      const glow = st === "speaking" ? 0.95 : st === "listening" ? 0.75 + lvl * 0.25 : st === "thinking" ? 0.82 : 0.55;
+      const glow =
+        st === "speaking"
+          ? 0.95
+          : st === "listening"
+            ? 0.75 + lvl * 0.25
+            : st === "thinking"
+              ? 0.82
+              : 0.55;
       shells.forEach((s) => {
         const m = s.material as THREE.LineBasicMaterial;
         m.opacity = glow * (0.5 + Math.sin(now * 0.003 + s.id) * 0.08);

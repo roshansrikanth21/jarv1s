@@ -19,7 +19,18 @@ def today_key() -> str:
 def greeting_text(user_name: str, memories: list[dict]) -> str:
     """Phase 1 — speak immediately, no network."""
     nm = user_name.strip() or "sir"
+    # Prefer ambient/user timezone when known; fall back to system clock.
     hour = datetime.now().hour
+    now_local = datetime.now()
+    try:
+        snap = ambient.snapshot()
+        tz_name = (snap.get("location") or {}).get("timezone") or (snap.get("timezone") or "")
+        if tz_name:
+            from zoneinfo import ZoneInfo
+            now_local = datetime.now(ZoneInfo(str(tz_name)))
+            hour = now_local.hour
+    except Exception:
+        pass
     if hour < 12:
         salute = "Good morning"
     elif hour < 17:
@@ -27,10 +38,10 @@ def greeting_text(user_name: str, memories: list[dict]) -> str:
     else:
         salute = "Good evening"
 
-    time_str = datetime.now().strftime("%I:%M %p").lstrip("0")
+    time_str = now_local.strftime("%I:%M %p").lstrip("0")
     parts = [f"{salute}, {nm}. It's {time_str}."]
 
-    lang = _memory_value(memories, "language")
+    _ = _memory_value(memories, "language")  # reserved for localized greeting later
 
     try:
         snap = ambient.snapshot()

@@ -81,14 +81,15 @@ TRADING_ROOT = Path(os.environ.get("C0MR4DES_DIR", str(BASE_DIR.parent / "c0mr4d
 # Load .env from repo root if present
 _env_file = BASE_DIR / ".env"
 if _env_file.exists():
-    for _line in _env_file.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig strips a Windows/PowerShell BOM so "GROQ_API_KEY" isn't read as "\ufeffGROQ_API_KEY".
+    for _line in _env_file.read_text(encoding="utf-8-sig").splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
             _v = _v.strip()
             if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
                 _v = _v[1:-1]
-            os.environ.setdefault(_k.strip(), _v)
+            os.environ.setdefault(_k.strip().lstrip("\ufeff"), _v)
 
 # ── Brain config ────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -99,6 +100,7 @@ OLLAMA_RELEASE_RAM_PCT = int(os.environ.get("JARVIS_OLLAMA_RELEASE_RAM", "82")) 
 VISION_MODEL      = "llava:latest"
 USE_CLAUDE        = bool(ANTHROPIC_API_KEY)
 
+_AnthropicClient: Any = None
 try:
     from anthropic import AsyncAnthropic as _AnthropicClient
     _HAS_ANTHROPIC = True
@@ -213,6 +215,7 @@ WATCH_TF = os.environ.get("JARVIS_WATCH_TF", "15m")
 WATCH_SPEAK = os.environ.get("JARVIS_WATCH_SPEAK", "1") != "0"
 USE_GROQ        = bool(GROQ_API_KEY)
 
+_openai_mod: Any = None
 try:
     import openai as _openai_mod
     _HAS_GROQ = True
@@ -333,7 +336,7 @@ _tts_ended_at = 0.0           # when playback last ended — mic stays muted a b
 _tts_gen = 0                  # bumped per TTS clip; lets a stale mute-failsafe know it's superseded
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
-_speak_task   = None          # in-flight _speak task (for barge-in cancel)
+_speak_task: asyncio.Task[None] | None = None  # in-flight _speak task (for barge-in cancel)
 _turn_generation = 0          # bumped on every new dispatch; lets a barged-in tool
                                # thread (which asyncio.to_thread cannot forcibly stop)
                                # notice it's stale and quiet down instead of surfacing
@@ -600,7 +603,13 @@ async def _run_startup_briefing(*, force: bool = False) -> None:
     _briefing_running = True
     try:
         await broadcast({"type": "briefing", "phase": "start"})
-        greet = briefing.greeting_text(_user_name(), memories)
+        # Briefing reads cortex facts (authoritative), not the legacy JSON mirror.
+        try:
+            _brief_mems = [{"category": f.get("category", ""), "content": f.get("content", "")}
+                           for f in cortex.store.all_facts(include_private=True)]
+        except Exception:
+            _brief_mems = list(memories)
+        greet = briefing.greeting_text(_user_name(), _brief_mems)
         await _emit_content_panel(
             "BRIEFING — status",
             f"{greet}\n\nFetching headlines…",
@@ -850,10 +859,16 @@ TOOLS: list[dict] = [
                             "type": "object",
                             "properties": {
                                 "op": {"type": "string",
-                                       "enum": ["navigate", "read", "read_all", "click", "type", "screenshot", "page_info"]},
-                                "url": {"type": "string", "description": "For navigate: the http(s) URL."},
+                                       "enum": ["navigate", "read", "read_all", "click", "type", "screenshot",
+                                                "page_info", "open_app", "find_text", "wait_for_text", "wait_ms"]},
+                                "url": {"type": "string", "description": "For navigate / open_app: http(s) URL or known app URL."},
                                 "selector": {"type": "string", "description": "CSS selector for read/read_all/click/type."},
-                                "text": {"type": "string", "description": "For type: the text to enter."},
+                                "text": {"type": "string", "description": "For type: text to enter. For find_text/wait_for_text: visible label."},
+                                "text2": {"type": "string", "description": "For find_text action=type: the value to type into the matched field."},
+                                "action": {"type": "string", "description": "For find_text: click | type | read."},
+                                "app": {"type": "string", "description": "For open_app: known app name (whatsapp, gmail, …)."},
+                                "ms": {"type": "integer", "description": "For wait_ms: milliseconds to wait."},
+                                "timeout_ms": {"type": "integer", "description": "For wait_for_text: max wait in ms."},
                             },
                             "required": ["op"],
                         },
@@ -1817,8 +1832,8 @@ def _browse(actions) -> str:
     if isinstance(actions, dict):
         actions = [actions]
     script, err = _bh_build_script(actions if isinstance(actions, list) else [])
-    if err:
-        return err
+    if err or not script:
+        return err or "Failed to build browse script."
     return _browser_run(script)
 
 
@@ -2168,7 +2183,11 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
                 monitor = sct.monitors[1]
                 raw = sct.grab(monitor)
                 img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                img.thumbnail((1280, 720), Image.LANCZOS)
+                try:
+                    _lanczos = Image.Resampling.LANCZOS
+                except AttributeError:
+                    _lanczos = Image.LANCZOS  # type: ignore[attr-defined]
+                img.thumbnail((1280, 720), _lanczos)
                 buf = io.BytesIO()
                 img.save(buf, format="JPEG", quality=70)
                 img_bytes = buf.getvalue()
@@ -2196,7 +2215,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
                     ]}],
                     max_tokens=500,
                 )
-                return resp.choices[0].message.content
+                return resp.choices[0].message.content or ""
             except Exception as exc:
                 return f"Vision read failed: {exc}"
 
@@ -2208,7 +2227,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
                 messages=[{"role": "user", "content": prompt, "images": [img_bytes]}],
                 options={"keep_alive": 0},
             )
-            return resp.message.content
+            return resp.message.content or ""
         except Exception as exc:
             return f"Screen capture failed (no Groq key and Ollama unavailable): {exc}"
 
@@ -2299,7 +2318,7 @@ def _groq_vision(b64_images: list, prompt: str, max_tokens: int = 600) -> str:
     if not (USE_GROQ and _HAS_GROQ):
         return "Vision needs a Groq API key."
     client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
-    content = [{"type": "text", "text": prompt}]
+    content: list[Any] = [{"type": "text", "text": prompt}]
     for b in b64_images:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}})
     resp = client.chat.completions.create(
@@ -2318,7 +2337,11 @@ def _analyze_image(path: str, question: str = "") -> str:
     try:
         from PIL import Image
         img = Image.open(path).convert("RGB")
-        img.thumbnail((1280, 1280), Image.LANCZOS)
+        try:
+            _lanczos = Image.Resampling.LANCZOS
+        except AttributeError:
+            _lanczos = Image.LANCZOS  # type: ignore[attr-defined]
+        img.thumbnail((1280, 1280), _lanczos)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=80)
         b64 = base64.b64encode(buf.getvalue()).decode()
@@ -2369,7 +2392,7 @@ def _watch_video(source: str, question: str = "", gen: int | None = None) -> str
         out_tmpl = os.path.join(workdir, "vid.%(ext)s")
         _progress("Downloading video...")
         try:
-            opts = {"outtmpl": out_tmpl, "quiet": True, "noplaylist": True,
+            opts: Any = {"outtmpl": out_tmpl, "quiet": True, "noplaylist": True,
                     "format": "mp4[height<=480]/best[height<=480]/best", "max_filesize": 80 * 1024 * 1024}
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([source])
@@ -3229,7 +3252,9 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    obs = await _run_tool(block.name, block.input)
+                    raw_in = block.input
+                    tool_args = dict(raw_in) if isinstance(raw_in, dict) else {}
+                    obs = await _run_tool(block.name, tool_args)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -3295,7 +3320,14 @@ async def _brain_ollama(
 
         for tc in msg.tool_calls:
             _raw_args = tc.function.arguments or {}
-            obs = await _run_tool(tc.function.name, _raw_args)
+            tool_args: dict = dict(_raw_args) if isinstance(_raw_args, dict) else {}
+            if isinstance(_raw_args, str):
+                try:
+                    parsed = json.loads(_raw_args)
+                    tool_args = parsed if isinstance(parsed, dict) else {}
+                except Exception:
+                    tool_args = {}
+            obs = await _run_tool(tc.function.name, tool_args)
             messages.append({"role": "tool", "content": obs})
 
     return final_answer
@@ -3566,8 +3598,12 @@ async def _run_sleep_cycle() -> None:
     await broadcast({"type": "sleep", "state": "start", "text": "Consolidating memory…"})
     try:
         result = await cortex.dreaming.run_once()
-        _last_consolidated_turn = _turn_seq
-        text = ("nothing new to learn" if result.get("status") != "ok"
+        # Only advance the gate on a real success — skipped/empty/failed cycles must
+        # remain eligible so the next idle window can retry (not wait another 6 turns).
+        status = result.get("status")
+        if status == "ok":
+            _last_consolidated_turn = _turn_seq
+        text = ("nothing new to learn" if status != "ok"
                 else f"consolidated · +{result.get('facts_added', 0)} facts · "
                      f"+{result.get('prospective_added', 0)} pending items")
         st = cortex.stats()
@@ -3831,8 +3867,10 @@ async def _prewarm_wake_acks() -> None:
         try:
             audio = b""
             async for chunk in edge_tts.Communicate(phrase, _tts_voice, rate=rate, pitch=pitch).stream():
-                if chunk["type"] == "audio":
-                    audio += chunk["data"]
+                if chunk.get("type") == "audio":
+                    data = chunk.get("data")
+                    if isinstance(data, (bytes, bytearray)):
+                        audio += bytes(data)
             if audio:
                 _wake_ack_cache[key] = base64.b64encode(audio).decode()
         except Exception:
@@ -3944,7 +3982,7 @@ async def _deliberate(question: str) -> None:
         )
         if "gpt-oss" in MOA_AGGREGATOR:
             agg_kwargs["reasoning_effort"] = "medium"
-        agg = await client.chat.completions.create(**agg_kwargs)
+        agg = await client.chat.completions.create(**agg_kwargs)  # type: ignore[arg-type]
         verdict = (agg.choices[0].message.content or "").strip()
     except Exception as exc:
         verdict = f"The panel couldn't reach a verdict: {exc}"
@@ -4109,8 +4147,10 @@ async def _speak(text: str) -> None:
         rate, pitch = _voice_params(base_rate)
         communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
         async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                audio_bytes += chunk["data"]
+            if chunk.get("type") == "audio":
+                data = chunk.get("data")
+                if isinstance(data, (bytes, bytearray)):
+                    audio_bytes += bytes(data)
         if not audio_bytes:
             await broadcast({"type": "tts_error",
                              "text": "Speech failed — Edge TTS returned no audio. Check internet."})
@@ -4449,13 +4489,14 @@ def _voice_worker() -> None:
     # machines (Intel Smart Sound arrays) with a -9999 host error. RATE is whatever that
     # device accepts (16 kHz if possible, else its native rate; Groq Whisper resamples).
     input_device, RATE, CHANS = _pick_input_device(sd)
-    if input_device is None:
+    if input_device is None or RATE is None or CHANS is None:
         broadcast_from_thread({"type": "system", "text":
             "No usable microphone. Check Windows mic access (Settings → Privacy & security → "
             "Microphone → let desktop apps use the mic), that a mic is enabled, and that no "
             "other app is holding it exclusively."})
         _voice_stopped()
         return
+    sample_rate = int(RATE)
     audio_q: Q.Queue = Q.Queue()
 
     def _cb(indata, frames, time_info, status):
@@ -4601,9 +4642,9 @@ def _voice_worker() -> None:
     MAX_UTTER_FRAMES = int(14000 / 30)   # ~14 s hard cap
 
     def _resample16(mono_f32):
-        if RATE == 16000 or len(mono_f32) < 2:
+        if sample_rate == 16000 or len(mono_f32) < 2:
             return mono_f32
-        n = max(1, int(round(len(mono_f32) * 16000 / RATE)))
+        n = max(1, int(round(len(mono_f32) * 16000 / sample_rate)))
         return np.interp(np.linspace(0.0, 1.0, n, endpoint=False),
                          np.linspace(0.0, 1.0, len(mono_f32), endpoint=False), mono_f32)
 
@@ -4612,7 +4653,7 @@ def _voice_worker() -> None:
 
     try:
         from collections import deque
-        with sd.InputStream(device=input_device, samplerate=RATE, channels=CHANS, dtype="int16",
+        with sd.InputStream(device=input_device, samplerate=sample_rate, channels=CHANS, dtype="int16",
                             blocksize=CHUNK, callback=_cb):
             broadcast_from_thread({"type": "system", "text": "Mic online. Listening..."})
 
@@ -4770,7 +4811,8 @@ async def agent_status() -> dict:
 async def command_endpoint(body: dict) -> dict:
     text = (body.get("command") or "").strip()
     if not text:
-        return JSONResponse({"error": "empty command"}, status_code=400)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="empty command")
     asyncio.create_task(handle_command(text))
     return {"status": "processing"}
 

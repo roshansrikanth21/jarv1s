@@ -21,7 +21,12 @@ export function ContentPanel({ data, onDismiss }: Props) {
           <span className="pr-lab">results</span>
           <h2 className="pr-content-title">{data.title}</h2>
         </div>
-        <button type="button" className="pr-content-close" onClick={onDismiss} title="Dismiss panel">
+        <button
+          type="button"
+          className="pr-content-close"
+          onClick={onDismiss}
+          title="Dismiss panel"
+        >
           <X size={14} />
         </button>
       </header>

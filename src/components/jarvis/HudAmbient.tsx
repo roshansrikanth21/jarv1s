@@ -45,14 +45,16 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     // backdrop whose own content-box collapses to 0 (all its children are absolutely
     // positioned), so measuring against it yields nothing. innerWidth/innerHeight is
     // both correct here and immune to that layout quirk.
-    let w = 0, h = 0, dpr = Math.min(window.devicePixelRatio || 1, 2);
+    let w = 0,
+      h = 0,
+      dpr = Math.min(window.devicePixelRatio || 1, 2);
     let motes: Mote[] = [];
     const streaks: Streak[] = [];
 
     const seed = () => {
       const count = Math.round(Math.min(110, Math.max(46, (w * h) / 22000)));
       motes = Array.from({ length: count }, () => {
-        const z = Math.random();                     // depth 0 (far) .. 1 (near)
+        const z = Math.random(); // depth 0 (far) .. 1 (near)
         return {
           x: Math.random() * w,
           y: Math.random() * h,
@@ -60,13 +62,14 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
           vx: (Math.random() - 0.5) * (0.06 + z * 0.16),
           vy: (Math.random() - 0.5) * (0.06 + z * 0.16) - 0.03, // faint upward bias
           r: 0.4 + z * 1.7,
-          tw: Math.random() * Math.PI * 2,           // twinkle phase
+          tw: Math.random() * Math.PI * 2, // twinkle phase
         };
       });
     };
 
     const resize = () => {
-      w = window.innerWidth; h = window.innerHeight;
+      w = window.innerWidth;
+      h = window.innerHeight;
       dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.max(1, Math.floor(w * dpr));
       canvas.height = Math.max(1, Math.floor(h * dpr));
@@ -93,9 +96,13 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
       // Self-heal: if the viewport wasn't measurable at mount (0×0) or has since
       // changed, re-measure. Guarantees the field fills the window once it exists,
       // without depending on a resize event ever firing.
-      const vw = window.innerWidth, vh = window.innerHeight;
+      const vw = window.innerWidth,
+        vh = window.innerHeight;
       if (vw > 0 && vh > 0 && (vw !== w || vh !== h)) resize();
-      if (w === 0 || h === 0) { raf = requestAnimationFrame(frame); return; }
+      if (w === 0 || h === 0) {
+        raf = requestAnimationFrame(frame);
+        return;
+      }
 
       const s = stateRef.current;
       const moodBoost = 0.75 + 0.5 * Math.max(0, Math.min(1, intensityRef.current));
@@ -107,10 +114,11 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
       ctx.clearRect(0, 0, w, h);
 
       // Central volumetric bloom — the "core is powered" glow.
-      const cx = w / 2, cy = h * 0.46;
+      const cx = w / 2,
+        cy = h * 0.46;
       const rad = Math.max(w, h) * (0.28 + 0.06 * energy);
       const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, rad);
-      grad.addColorStop(0, rgba(0.05 + 0.10 * bloom));
+      grad.addColorStop(0, rgba(0.05 + 0.1 * bloom));
       grad.addColorStop(0.5, rgba(0.02 + 0.04 * bloom));
       grad.addColorStop(1, rgba(0));
       ctx.fillStyle = grad;
@@ -124,8 +132,10 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
           m.x += m.vx * spd * dt;
           m.y += m.vy * spd * dt;
           m.tw += 0.02 * dt;
-          if (m.x < -4) m.x = w + 4; else if (m.x > w + 4) m.x = -4;
-          if (m.y < -4) m.y = h + 4; else if (m.y > h + 4) m.y = -4;
+          if (m.x < -4) m.x = w + 4;
+          else if (m.x > w + 4) m.x = -4;
+          if (m.y < -4) m.y = h + 4;
+          else if (m.y > h + 4) m.y = -4;
         }
         const twinkle = 0.6 + 0.4 * Math.sin(m.tw);
         const a = (0.05 + m.z * 0.32) * twinkle * (0.5 + 0.9 * energy);
@@ -140,11 +150,20 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
       if (!reduced && streakTimer <= 0 && streaks.length < 3) {
         streakTimer = 180 + Math.random() * 260 - energy * 120;
         const edge = Math.random() * h;
-        streaks.push({ x: -20, y: edge, vx: 6 + Math.random() * 6, vy: (Math.random() - 0.5) * 1.2, life: 0, max: 60 });
+        streaks.push({
+          x: -20,
+          y: edge,
+          vx: 6 + Math.random() * 6,
+          vy: (Math.random() - 0.5) * 1.2,
+          life: 0,
+          max: 60,
+        });
       }
       for (let i = streaks.length - 1; i >= 0; i--) {
         const st = streaks[i];
-        st.x += st.vx * dt; st.y += st.vy * dt; st.life += dt;
+        st.x += st.vx * dt;
+        st.y += st.vy * dt;
+        st.life += dt;
         const p = st.life / st.max;
         const a = Math.sin(p * Math.PI) * 0.5 * (0.5 + energy);
         ctx.beginPath();
@@ -171,7 +190,13 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     <canvas
       ref={canvasRef}
       aria-hidden
-      style={{ position: "fixed", inset: 0, width: "100vw", height: "100vh", pointerEvents: "none" }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        width: "100vw",
+        height: "100vh",
+        pointerEvents: "none",
+      }}
     />
   );
 }
