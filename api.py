@@ -1673,6 +1673,10 @@ _WEB_APPS: dict[str, str] = {
     "amazon":    "https://www.amazon.com",
     "twitch":    "https://www.twitch.tv",
     "maps":      "https://www.google.com/maps",
+    "google":    "https://www.google.com",
+    "bing":      "https://www.bing.com",
+    "duckduckgo": "https://duckduckgo.com",
+    "google maps": "https://www.google.com/maps",
 }
 
 
@@ -1822,14 +1826,23 @@ def _bh_build_script(actions: list[dict]) -> tuple[str | None, str | None]:
             lines.append(f'print("[page_info #{i}]")')
             lines.append("print(page_info())")
         elif op == "open_app":
-            # Smart-open a known web app by name. Falls back to `navigate` semantics if
-            # the model already supplied a full URL.
-            app = str(step.get("app", "")).strip().lower()
-            url = _WEB_APPS.get(app) or (str(step.get("url", "")).strip() or "")
+            # Open a web app OR any site. Priority: an explicit url, then a known-app
+            # shortcut, then treat the given name as a site to visit — a full URL is used
+            # as-is, a domain becomes https://<domain>, and anything else becomes a web
+            # search. So "open amrita.com", "open youtube", and "open cat videos" all work
+            # instead of erroring on an unknown app name.
+            app = str(step.get("app", "")).strip()
+            raw_url = str(step.get("url", "")).strip()
+            url = raw_url or _WEB_APPS.get(app.lower())
+            if not url and app:
+                if re.match(r"^https?://", app, re.I):
+                    url = app
+                elif re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", app):        # looks like a domain
+                    url = "https://" + app
+                else:                                                    # a bare term → search it
+                    url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(app)
             if not url:
-                supported = ", ".join(sorted(_WEB_APPS))
-                return None, (f"action {i} (open_app): unknown app {app!r}. "
-                              f"Supply {{app: <one of {supported}>}} or a full url.")
+                return None, f"action {i} (open_app): give an 'app', a domain, or a full 'url'."
             err = _browse_allowed(url)
             if err:
                 return None, err
@@ -1911,6 +1924,8 @@ def _ensure_debug_chrome() -> str | None:
             f"--user-data-dir={BH_PROFILE}", "--no-first-run", "--no-default-browser-check"]
     if BH_HEADLESS:
         args += ["--headless=new", "--disable-gpu"]
+    else:
+        args += ["--start-maximized"]          # visible + full-size so the user can watch it work
     try:
         _bh_chrome_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception as exc:
@@ -1942,6 +1957,43 @@ def _shutdown_browser() -> None:
 atexit.register(_shutdown_browser)
 
 
+def _foreground_chrome() -> None:
+    """Best-effort: raise our debug Chrome to the foreground (Windows) so the user actually
+    sees it act, instead of it working behind the JARVIS window. Matches any window owned by
+    Chrome's process tree (the visible window often belongs to a child process). Silent no-op
+    on failure, when headless, or off-Windows."""
+    if BH_HEADLESS or os.name != "nt" or _bh_chrome_proc is None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        pids = {_bh_chrome_proc.pid}
+        try:
+            pids |= {c.pid for c in psutil.Process(_bh_chrome_proc.pid).children(recursive=True)}
+        except Exception:
+            pass
+
+        user32 = ctypes.windll.user32
+        targets: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                wpid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+                if wpid.value in pids:
+                    targets.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        for hwnd in targets:
+            user32.ShowWindow(hwnd, 9)         # SW_RESTORE
+            user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+
+
 def _browser_run(script: str) -> str:
     """Run a JARVIS-generated browser-harness snippet against the debug Chrome and return its
     output. browser-harness lives in its own venv (isolated deps); we shell out to its CLI.
@@ -1954,6 +2006,7 @@ def _browser_run(script: str) -> str:
     err = _ensure_debug_chrome()
     if err:
         return f"Browser unavailable — {err}"
+    _foreground_chrome()          # bring the window to the front so the user sees it act
     # Minimal env: only what the harness needs. NOT **os.environ — that would hand the
     # decrypted GROQ/ANTHROPIC keys to the subprocess. Force UTF-8 so unicode pages survive.
     # The home/appdata vars are REQUIRED on Windows: browser-harness resolves Path.home() at
@@ -3045,7 +3098,7 @@ You are in a live spoken conversation — your replies are read aloud and you re
 
 You have tools — memory, web search, browser (`browse`), security recon (`recon`, passive), active pentest (`pentest`, scope-gated), scope management (`scope`), system info, app launch, Windows desktop control (`desktop`), parallel sub-agents (`spawn_agents`), tasks, screen capture, shell, market scans, and the trading terminal. Use a tool ONLY when the request genuinely needs real data, an action, or your saved memory. For greetings or small talk, just reply directly — never call a tool for "hi". For anything security-related — recon, scanning, pentesting a site — you call `recon`/`pentest` and report ONLY what they return; you never describe scans you didn't run.
 
-Driving web apps with `browse`: for anything like "open WhatsApp and message Roshan", "play X on Spotify", "post in #general on Slack" — use `browse` with an `open_app` action first, then `find_text` to click/type by visible label (search box → contact/track/channel → send). Prefer `find_text` over `click`/`type` with CSS selectors — visible-text matching survives redesigns. Use `wait_for_text` after navigation because these apps load asynchronously.
+Driving web apps with `browse`: to just OPEN a specific site (e.g. "open amrita.com", "go to nytimes.com"), use a single `open_app` action with that site as the `app` (a domain like "amrita.com") or a full `url` — do NOT open Google and search for it unless the user explicitly asked you to search. For app tasks like "open WhatsApp and message Roshan", "play X on Spotify", "post in #general on Slack" — `open_app` the app first, then `find_text` to click/type by visible label (search box → contact/track/channel → send). Prefer `find_text` over `click`/`type` with CSS selectors — visible-text matching survives redesigns. Use `wait_for_text` after navigation because these apps load asynchronously.
 
 Windows desktop control (`desktop`): for anything system-shaped — "open my downloads folder", "open display settings", "open task manager", "uninstall Zoom" — use `desktop`, not `launch_app` or `run_command`. Actions: `open_path` (files/folders), `open_settings` (apps/display/network/…), `open_control_panel` (programs/network/sound/…), `open_registry` (regedit, optional key), `open_component` (task_manager/device_manager/services/event_viewer/…), `list_apps` + `uninstall_app` (winget). Uninstall pattern: call `uninstall_app` with the name first (dry-run, confirm defaults to false) → the tool returns the exact match with version → repeat back to the user and get their yes → call again with `confirm: true`. If the dry-run says 2+ packages matched, ask the user which one before proceeding. `list_apps` is safe to call whenever.
 
