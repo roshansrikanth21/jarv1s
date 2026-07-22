@@ -4210,28 +4210,56 @@ def _forget_memory(mid) -> None:
 
 
 # ── Wake word + barge-in ─────────────────────────────────────────────────────────
+_WAKE_FILLERS = ("hey there ", "hey ", "hello ", "hi ", "hiya ", "ok ", "okay ", "yo ",
+                 "um ", "uh ", "so ", "well ", "a ", "and ", "hmm ", "hm ", "yeah ", "hey, ")
+
+
+def _wake_fuzzy(token: str) -> bool:
+    """True if `token` is a close mis-hearing of the wake word. Tiny Whisper routinely swaps or
+    drops a letter in 'jarvis' (jervis, jarvus, jarvix, jaravis…). The 0.72 ratio is tuned to
+    accept those while rejecting real words that merely rhyme — 'travis' (~0.67) and 'service'
+    (~0.62) do NOT trigger. Universal: it's phonetic-ish string distance, not per-mic tuning."""
+    from difflib import SequenceMatcher
+    tok = (token or "").strip(" ,.!?:;-'\"").lower()
+    if len(tok) < 3:
+        return False
+    for w in WAKE_WORDS:
+        if tok.startswith(w):
+            return True
+    return SequenceMatcher(None, tok, "jarvis").ratio() >= 0.72
+
+
 def _match_wake_word(text: str):
-    """Return the command after the wake word, '' if only the wake word was said, or None if
-    the utterance doesn't START with a wake word. Prefix-anchored (after optional leading
-    fillers like 'hey'/'ok') and boundary-checked, so ordinary speech that merely CONTAINS a
-    wake-ish word ('we saw Travis yesterday') no longer fires a spurious command."""
+    """Return the command after the wake word, '' if only the wake word was said, or None if the
+    utterance isn't addressed to Jarvis. Tolerant by design so a real 'hey Jarvis' lands reliably:
+    strips leading fillers, then looks for the wake word (exact, prefix, or a fuzzy mis-hear) in
+    the FIRST TWO tokens — so a garbled leading word or a Whisper mis-spelling still fires — while
+    still ignoring ordinary speech that merely mentions a similar word later on."""
     t = text.lower().strip().lstrip("\"'.,!?;:- ")
-    # Strip any leading fillers before the wake word — "hey/hello/hi/yo jarvis", "ok jarvis",
-    # even "hey there jarvis". Loops so multiple stack.
-    _fillers = ("hey there ", "hey ", "hello ", "hi ", "ok ", "okay ", "yo ", "um ", "uh ")
     changed = True
     while changed:
         changed = False
-        for filler in _fillers:
+        for filler in _WAKE_FILLERS:
             if t.startswith(filler):
                 t = t[len(filler):].lstrip()
                 changed = True
                 break
-    for w in WAKE_WORDS:
-        if t.startswith(w):
-            nxt = t[len(w):len(w) + 1]
-            if nxt == "" or not nxt.isalnum():   # word boundary — not "jarvis" inside a longer word
-                return t[len(w):].lstrip(" ,.!?:;-'\"")
+    if not t:
+        return None
+    tokens = t.split()
+    for idx in range(min(2, len(tokens))):          # wake word in the first one or two tokens
+        tok = tokens[idx]
+        hit = False
+        for w in WAKE_WORDS:
+            if tok.startswith(w):
+                nxt = tok[len(w):len(w) + 1]
+                if nxt == "" or not nxt.isalnum():   # word boundary
+                    hit = True
+                    break
+        if not hit and _wake_fuzzy(tok):
+            hit = True
+        if hit:
+            return " ".join(tokens[idx + 1:]).strip(" ,.!?:;-'\"")
     return None
 
 
@@ -4953,9 +4981,13 @@ def _voice_worker() -> None:
         if _main_loop and not _main_loop.is_closed():
             asyncio.run_coroutine_threadsafe(coro, _main_loop)
 
-    MIN_UTTER_SAMPLES = int(float(os.environ.get("JARVIS_MIN_UTTER_SEC", "0.55")) * 16000)
-    # Reject low-energy "speech" (fan hiss / keyboard) before Whisper — biggest idle-CPU saver.
-    MIN_UTTER_ENERGY = int(os.environ.get("JARVIS_MIN_UTTER_ENERGY", "480"))
+    # Short enough to catch a quick one-word "Jarvis" (~0.4 s) without dropping it.
+    MIN_UTTER_SAMPLES = int(float(os.environ.get("JARVIS_MIN_UTTER_SEC", "0.40")) * 16000)
+    # A LOW absolute floor, just above digital silence — only there to skip dead-air segments.
+    # WebRTC VAD (spectral, gain-independent) is the real speech gate, so this must stay low or a
+    # quiet / low-gain mic on another machine would drop soft "hey Jarvis" before Whisper (and
+    # before the peak-normalize below could rescue it). Universal across mics — not gain-tuned.
+    MIN_UTTER_ENERGY = int(os.environ.get("JARVIS_MIN_UTTER_ENERGY", "150"))
 
     def _flush(pcm16) -> None:
         """Transcribe one utterance. `pcm16` is a 1-D int16 numpy array, 16 kHz mono."""
@@ -5077,13 +5109,18 @@ def _voice_worker() -> None:
     # package is missing (it's in requirements). Aggressiveness 0..3 via JARVIS_VAD_AGGR.
     try:
         import webrtcvad
-        _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "3")))))
+        # Aggressiveness 2 (not 3): 3 is the most aggressive filter and rejects a lot of REAL
+        # speech — soft, quick, or low-gain "hey Jarvis" — which was the main reason wake words
+        # only landed ~2/10. 2 catches far more genuine speech; the wake-word text gate below
+        # still rejects anything that isn't actually addressed to Jarvis, so the cost of the
+        # occasional noise segment is just one cheap discarded transcription.
+        _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "2")))))
     except Exception:
         _vad = None
 
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
-    START_PAD, START_VOICED = 6, 4       # need ~4/6 voiced frames (~120–180 ms) before opening
-    #                                      so a quick "Jarvis" is caught on the first try
+    START_PAD, START_VOICED = 6, 3       # ~3/6 voiced frames (~90–180 ms) opens the segment —
+    #                                      sensitive enough to catch a quick/soft "Jarvis"
     END_PAD, END_UNVOICED = 12, 10       # end only on a clean ~360 ms pause (won't cut a sentence)
     RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
     MAX_UTTER_FRAMES = int(14000 / 30)   # ~14 s hard cap
