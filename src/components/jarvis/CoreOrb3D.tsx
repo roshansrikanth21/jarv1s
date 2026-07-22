@@ -160,6 +160,7 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
     let rpm = 0;
     let raf = 0;
     let t0 = performance.now();
+    const _dirVec = new THREE.Vector3();   // reused across frames — no per-frame allocation
 
     const animate = (now: number) => {
       // Don't schedule the next frame while hidden — keeps GPU/CPU idle in background tabs.
@@ -218,15 +219,19 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
 
       renderer.render(scene, camera);
 
-      const dir = new THREE.Vector3(0, 0, 1).applyQuaternion(root.quaternion);
-      onCoordinates?.({
-        x: dir.x,
-        y: dir.y,
-        z: dir.z,
-        theta: THREE.MathUtils.radToDeg(root.rotation.y),
-        phi: THREE.MathUtils.radToDeg(root.rotation.x),
-        rpm,
-      });
+      // Only compute + allocate when someone actually consumes the coordinates. Prime passes
+      // no onCoordinates, so this used to churn ~60 throwaway Vector3s/sec for nothing.
+      if (onCoordinates) {
+        _dirVec.set(0, 0, 1).applyQuaternion(root.quaternion);
+        onCoordinates({
+          x: _dirVec.x,
+          y: _dirVec.y,
+          z: _dirVec.z,
+          theta: THREE.MathUtils.radToDeg(root.rotation.y),
+          phi: THREE.MathUtils.radToDeg(root.rotation.x),
+          rpm,
+        });
+      }
     };
 
     const onVis = () => {
@@ -266,6 +271,11 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
       document.removeEventListener("visibilitychange", onVis);
       mount.removeEventListener("pointermove", onMove);
       ro.disconnect();
+      // forceContextLoss() actually releases the underlying WebGL context; dispose() alone only
+      // frees JS-side objects and leaves the GL context lingering until GC. Because decks remount
+      // on every preset switch, without this each switch into/out of Prime leaked a context —
+      // eventually hitting the browser's ~16-context ceiling → "context lost" / black orb.
+      renderer.forceContextLoss();
       renderer.dispose();
       shells.forEach((s) => {
         s.geometry.dispose();

@@ -1,4 +1,4 @@
-import { motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 
 interface Props {
   active?: boolean;
@@ -25,6 +25,7 @@ const A = {
 export function ArcReactor({ active = false, speaking = false, size = "md", energy = 1 }: Props) {
   const px = size === "sm" ? 128 : 192;
   const core = size === "sm" ? 56 : 80;
+  const reduce = useReducedMotion();   // honour the OS "reduce motion" accessibility setting
 
   return (
     <div
@@ -40,17 +41,26 @@ export function ArcReactor({ active = false, speaking = false, size = "md", ener
         transition: "opacity 1.2s ease",
       }}
     >
-      {/* Ambient glow */}
+      {/* Ambient glow — a STATIC box-shadow whose OPACITY pulses. Animating opacity is a cheap
+          compositor op; animating box-shadow itself (the old approach) forced a full repaint every
+          frame, permanently, even when idle/backgrounded. Frozen under reduced-motion. */}
       <motion.div
-        style={{ position: "absolute", inset: 0, borderRadius: "50%" }}
-        animate={{
+        style={{
+          position: "absolute",
+          inset: 0,
+          borderRadius: "50%",
           boxShadow: active
             ? speaking
-              ? [`0 0 30px ${A.a80}`, `0 0 60px ${A.aCC}`, `0 0 30px ${A.a80}`]
-              : [`0 0 18px ${A.a40}`, `0 0 32px ${A.a65}`, `0 0 18px ${A.a40}`]
+              ? `0 0 60px ${A.aCC}`
+              : `0 0 32px ${A.a65}`
             : `0 0 0px ${A.a00}`,
         }}
-        transition={{ duration: speaking ? 0.9 : 2.5, repeat: Infinity, ease: "easeInOut" }}
+        animate={active && !reduce ? { opacity: [0.5, 1, 0.5] } : { opacity: active ? 0.85 : 0 }}
+        transition={
+          active && !reduce
+            ? { duration: speaking ? 0.9 : 2.5, repeat: Infinity, ease: "easeInOut" }
+            : { duration: 0.3 }
+        }
       />
 
       {/* Outer slow-spin ring */}

@@ -24,11 +24,23 @@ import re
 import time
 from typing import Any
 
-try:
-    import numpy as np
-    _HAS_NP = True
-except Exception:  # numpy is a hard dep in practice, but degrade rather than crash
-    _HAS_NP = False
+import importlib.util as _ilu
+
+# numpy is a hard dep in practice, but eager-importing it here cost ~0.8s at boot (governor is
+# imported eagerly by api.py). find_spec confirms availability without importing; the real import
+# is deferred to _np() on the first Governor decision that actually needs the bandit math.
+_HAS_NP = _ilu.find_spec("numpy") is not None
+np = None
+
+
+def _np():
+    """Lazy handle to numpy. Called only inside the LinUCB paths, which are already guarded
+    by _HAS_NP, so this never runs when numpy is absent."""
+    global np
+    if np is None:
+        import numpy as _mod
+        np = _mod
+    return np
 
 
 # ── The escalation lattice ───────────────────────────────────────────────────────
@@ -198,8 +210,8 @@ class GovernorState:
             for r in RUNGS:
                 a = saved.get(r["id"], {}).get("A")
                 b = saved.get(r["id"], {}).get("b")
-                self._A[r["id"]] = np.array(a) if a else np.identity(_CTX_DIM) * _LAMBDA_REG
-                self._b[r["id"]] = np.array(b) if b else np.zeros(_CTX_DIM)
+                self._A[r["id"]] = _np().array(a) if a else _np().identity(_CTX_DIM) * _LAMBDA_REG
+                self._b[r["id"]] = _np().array(b) if b else _np().zeros(_CTX_DIM)
 
     def to_dict(self) -> dict:
         bandit = {}
@@ -216,8 +228,8 @@ class GovernorState:
             return 0.0
         try:
             A, b = self._A[rung_id], self._b[rung_id]
-            xv = np.array(x)
-            A_inv = np.linalg.inv(A)
+            xv = _np().array(x)
+            A_inv = _np().linalg.inv(A)
             theta = A_inv @ b
             ucb = float(theta @ xv) + _ALPHA * math.sqrt(max(0.0, float(xv @ A_inv @ xv)))
             return max(-0.25, min(0.25, ucb))     # clamp: a gentle nudge, not a takeover
@@ -244,8 +256,8 @@ class GovernorState:
                   - _MU * lat_norm - (0.3 if escalated else 0.0))
         if _HAS_NP and "x" in decision:
             try:
-                xv = np.array(decision["x"])
-                self._A[rid] = self._A[rid] + np.outer(xv, xv)
+                xv = _np().array(decision["x"])
+                self._A[rid] = self._A[rid] + _np().outer(xv, xv)
                 self._b[rid] = self._b[rid] + reward * xv
             except Exception:
                 pass

@@ -40,12 +40,28 @@ export function LiveOps() {
     let ws: WebSocket | null = null;
     let stop = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
+    let attempt = 0;
 
     const wsUrl = () =>
       `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
 
+    // Capped exponential backoff + jitter, and NEVER reconnect while the window is hidden.
+    // The old flat 1500ms retry (no backoff, no visibility guard) hammered the backend forever
+    // when it was down — even in the background — which was a real CPU/console-spam offender.
+    const scheduleRetry = () => {
+      if (stop || retry) return;
+      if (document.hidden) return; // resumed by the visibilitychange handler below
+      const base = Math.min(1000 * 2 ** Math.min(attempt, 5), 30000);
+      const delay = Math.floor(base * (0.5 + Math.random() * 0.5));
+      retry = setTimeout(() => {
+        retry = null;
+        attempt += 1;
+        connect();
+      }, delay);
+    };
+
     const connect = () => {
-      if (stop) return;
+      if (stop || document.hidden) return;
       // Drop any prior socket so reconnect can't stack duplicate handlers.
       if (ws) {
         try {
@@ -60,6 +76,9 @@ export function LiveOps() {
       }
       const sock = new WebSocket(wsUrl());
       ws = sock;
+      sock.onopen = () => {
+        if (ws === sock) attempt = 0; // reset backoff on a successful connect
+      };
       sock.onmessage = (ev) => {
         if (ws !== sock) return;
         let d: Record<string, unknown>;
@@ -121,7 +140,7 @@ export function LiveOps() {
         }
       };
       sock.onclose = () => {
-        if (!stop && ws === sock) retry = setTimeout(connect, 1500);
+        if (!stop && ws === sock) scheduleRetry();
       };
       sock.onerror = () => {
         try {
@@ -131,9 +150,24 @@ export function LiveOps() {
         }
       };
     };
+
+    // When the window becomes visible again, reconnect immediately (reset backoff) if needed.
+    const onVisible = () => {
+      if (stop || document.hidden) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      if (retry) {
+        clearTimeout(retry);
+        retry = null;
+      }
+      attempt = 0;
+      connect();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
     connect();
     return () => {
       stop = true;
+      document.removeEventListener("visibilitychange", onVisible);
       if (retry) clearTimeout(retry);
       try {
         ws?.close();

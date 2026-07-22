@@ -69,6 +69,35 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const manualCloseRef = useRef(false);
+  // rAF-coalesce the two highest-frequency updates (streamed tokens + mic level). Without this,
+  // each WS message fires its own React render, so the whole (2,000+ line) deck tree re-renders
+  // dozens of times a second during a reply / while the mic is hot — the main cause of jank.
+  // Buffer here and flush at most once per animation frame; while the window is hidden, rAF
+  // doesn't fire, so this also stops all re-rendering in the background.
+  const streamBufRef = useRef("");
+  const levelRef = useRef(0);
+  const levelDirtyRef = useRef(false);
+  const rafRef = useRef<number | null>(null);
+  const flushCoalesced = useCallback(() => {
+    rafRef.current = null;
+    if (streamBufRef.current) {
+      const chunk = streamBufRef.current;
+      streamBufRef.current = "";
+      setStream((p) => p + chunk);
+    }
+    if (levelDirtyRef.current) {
+      levelDirtyRef.current = false;
+      setLevel(levelRef.current);
+    }
+  }, []);
+  const scheduleFlush = useCallback(() => {
+    if (rafRef.current != null) return;
+    rafRef.current = requestAnimationFrame(flushCoalesced);
+  }, [flushCoalesced]);
+  const resetStream = useCallback(() => {
+    streamBufRef.current = "";
+    setStream("");
+  }, []);
   const pendingActionsRef = useRef<{ action: string; payload?: Record<string, unknown> }[]>([]);
   const pendingCommandsRef = useRef<string[]>([]);
 
@@ -207,10 +236,13 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         }
         if (d.type === "emotion" && d.emotion) setMood(d.emotion);
         if (d.type === "transcription" || d.type === "transcript") addRef.current("user", txt);
-        if (d.type === "llm_chunk" && d.text) setStream((p) => p + (d.text as string));
-        if (d.type === "llm_reset") setStream(""); // model dumped a tool-call as text; discard it
+        if (d.type === "llm_chunk" && d.text) {
+          streamBufRef.current += d.text as string;
+          scheduleFlush();
+        }
+        if (d.type === "llm_reset") resetStream(); // model dumped a tool-call as text; discard it
         if (d.type === "llm_response" || d.type === "response") {
-          setStream("");
+          resetStream();
           addRef.current("agent", txt);
         }
         if (d.type === "tts_audio" && d.data) playTts(d.data as string);
@@ -223,7 +255,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
             audioRef.current = null;
           }
           setSpeaking(false);
-          setStream("");
+          resetStream();
           wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
         }
         if (d.type === "open_trading") {
@@ -244,7 +276,11 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         // ALWAYS_LISTEN desync (UI showing "tap to speak" while the mic was already hot) and
         // reconciles the optimistic toggle below if it ever guessed wrong.
         if (d.type === "mic") setListening(Boolean(d.listening));
-        if (d.type === "audio_level") setLevel(Number(d.level) || 0);
+        if (d.type === "audio_level") {
+          levelRef.current = Number(d.level) || 0;
+          levelDirtyRef.current = true;
+          scheduleFlush();
+        }
         if (d.type === "system_alert" && txt.trim()) notifyNative("JARVIS", txt);
         if (d.type === "tool_approval" && d.id) {
           setPendingApproval({
@@ -282,6 +318,10 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         reconnectTimerRef.current = null;
       }
       if (audioRef.current) audioRef.current.pause();
+      if (rafRef.current != null) {
+        cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
       wsRef.current?.close(1000);
     };
   }, [connect]);

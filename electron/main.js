@@ -30,7 +30,10 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const uiRoot = path.resolve(__dirname, "..");
 const appRoot = uiRoot; // api.py lives in the repo root
-const backendUrl = process.env.JARVIS_BACKEND_URL ?? "http://127.0.0.1:8000";
+// Mutable: the backend auto-selects a free port if its default (8000) is busy (e.g. Docker
+// Desktop squats on 8000) and prints "[[JARVIS_PORT]] <n>" on stdout, which we parse below
+// to point every fetch / window-load / readiness-check at the real port.
+let backendUrl = process.env.JARVIS_BACKEND_URL ?? "http://127.0.0.1:8000";
 const devUiUrl = process.env.JARVIS_DEV_UI_URL ?? "http://127.0.0.1:8080";
 
 // c0mr4des trading terminal — a separate app JARVIS launches in its own window.
@@ -193,15 +196,21 @@ function resolvePythonPath() {
 }
 
 async function isBackendReady() {
+  // Timeout the probe: if a dead process (or Docker) squats the port and accepts TCP but never
+  // responds, a bare fetch would hang forever and stall startup. 2s is plenty for a loopback probe.
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 2000);
   try {
-    const response = await fetch(`${backendUrl}/api/agent/status`);
+    const response = await fetch(`${backendUrl}/api/agent/status`, { signal: ctrl.signal });
     return response.ok;
   } catch {
     return false;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
-async function waitForBackend(timeoutMs = 90000) {
+async function waitForBackend(timeoutMs = 150000) {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     if (await isBackendReady()) return true;
@@ -245,7 +254,15 @@ async function startPythonBackend() {
   pythonProcess.stdout.on("data", (data) => {
     const lines = data.toString().split("\n");
     lines.forEach((line) => {
-      if (line.trim()) console.log(`[Python] ${line.trim()}`);
+      const t = line.trim();
+      if (!t) return;
+      // The backend announces its actual port (it may differ from 8000 if that was busy).
+      const m = t.match(/^\[\[JARVIS_PORT\]\]\s+(\d+)/);
+      if (m) {
+        backendUrl = `http://127.0.0.1:${m[1]}`;
+        console.log(`[Electron] Backend on port ${m[1]}`);
+      }
+      console.log(`[Python] ${t}`);
     });
   });
 

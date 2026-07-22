@@ -15,11 +15,22 @@ import shutil
 import time
 from pathlib import Path
 
-try:
-    import ollama as _ollama
-    _HAS_OLLAMA = True
-except Exception:
-    _HAS_OLLAMA = False
+import importlib.util as _ilu
+
+# Availability without importing — the real `ollama` import (~1.5s) is deferred to _ollama_mod()
+# on first use. models_advisor is imported eagerly by api.py, so eager-importing ollama here was
+# ~1.5s of pure boot cost for a client nothing needs synchronously at startup.
+_HAS_OLLAMA = _ilu.find_spec("ollama") is not None
+_ollama = None
+
+
+def _ollama_mod():
+    """Lazy handle to the ollama client module."""
+    global _ollama
+    if _ollama is None:
+        import ollama as _mod
+        _ollama = _mod
+    return _ollama
 
 
 def _ollama_base() -> str:
@@ -651,7 +662,7 @@ def _name(m) -> str:
 
 def _supports_tools(name: str) -> bool:
     try:
-        info = _ollama.show(name)
+        info = _ollama_mod().show(name)
         caps = getattr(info, "capabilities", None) or (info.get("capabilities") if isinstance(info, dict) else []) or []
         return "tools" in caps
     except Exception:
@@ -691,7 +702,7 @@ def installed(with_caps: bool = True, *, use_cache: bool = True) -> list[dict]:
     if use_cache and with_caps and _inst_cache["data"] and (now - _inst_cache["at"]) < _INST_CACHE_TTL:
         return [dict(m) for m in _inst_cache["data"]]
     try:
-        resp = _ollama.list()
+        resp = _ollama_mod().list()
         models = getattr(resp, "models", None) or resp.get("models", [])
     except Exception:
         return []
@@ -720,7 +731,7 @@ def running() -> list[dict]:
     if not _HAS_OLLAMA:
         return []
     try:
-        resp = _ollama.ps()
+        resp = _ollama_mod().ps()
         models = getattr(resp, "models", None) or resp.get("models", [])
     except Exception:
         return []
@@ -745,7 +756,7 @@ def ollama_up() -> tuple[bool, str | None]:
         return (r.status_code == 200), r.json().get("version")
     except Exception:
         try:
-            _ollama.list()
+            _ollama_mod().list()
             return True, None
         except Exception:
             return False, None
@@ -770,7 +781,7 @@ def remove(model: str) -> dict:
     if not _HAS_OLLAMA:
         return {"ok": False, "error": "Ollama not available."}
     try:
-        _ollama.delete(model)
+        _ollama_mod().delete(model)
         invalidate_install_cache()
         return {"ok": True, "model": model}
     except Exception as exc:
@@ -786,7 +797,7 @@ def benchmark(model: str) -> dict:
     if not _HAS_OLLAMA:
         return {"ok": False, "error": "Ollama not available."}
     try:
-        r = _ollama.generate(model=model, prompt="In one sentence, what is a fair value gap?",
+        r = _ollama_mod().generate(model=model, prompt="In one sentence, what is a fair value gap?",
                              stream=False, options={"num_predict": 64, "keep_alive": 0})
         ec = getattr(r, "eval_count", None) or (r.get("eval_count") if isinstance(r, dict) else None)
         ed = getattr(r, "eval_duration", None) or (r.get("eval_duration") if isinstance(r, dict) else None)
@@ -810,7 +821,7 @@ def pull(model: str, on_progress) -> dict:
         return {"ok": False, "error": "Ollama not available."}
     try:
         last = 0.0
-        for ev in _ollama.pull(model, stream=True):
+        for ev in _ollama_mod().pull(model, stream=True):
             status = ev.get("status", "") if isinstance(ev, dict) else getattr(ev, "status", "")
             total = ev.get("total") if isinstance(ev, dict) else getattr(ev, "total", None)
             done = ev.get("completed") if isinstance(ev, dict) else getattr(ev, "completed", None)

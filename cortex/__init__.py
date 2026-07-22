@@ -43,6 +43,14 @@ def init() -> dict:
     return s
 
 
+def warm() -> None:
+    """Reconcile the vector index from SQLite (fills in anything not already indexed).
+    Runs AFTER init(), meant to be scheduled on a background thread so boot isn't blocked
+    by re-embedding. No-op cost on a warm Chroma restart (vectors are persisted)."""
+    init()
+    vectors.warm()
+
+
 def record_turn(user_text: str, assistant_text: str, *,
                 source: str = "chat", namespace: str = "personal",
                 schedule_extraction: bool = True) -> str:
@@ -111,7 +119,7 @@ def stats() -> dict:
 
 __all__ = [
     "PromptHooks", "build_system_prompt",
-    "init", "record_turn", "recall", "remember", "forget", "stats",
+    "init", "warm", "record_turn", "recall", "remember", "forget", "stats",
     "dreaming", "embeddings", "emotion", "extract", "migrate", "paths",
     "router", "store", "sync_mem0", "vectors",
 ]

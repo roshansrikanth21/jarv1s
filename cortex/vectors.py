@@ -68,26 +68,48 @@ def _try_chroma():
 
 
 def init() -> None:
-    """Bring the index up + rebuild from SQLite if empty or stale."""
+    """Bring the index up. FAST — sets up the client and stamps the embedding dim, but does
+    NOT re-embed the store here (that's warm(), run in the background after the server is
+    serving). Chroma is persistent, so a warm boot needs zero re-embedding."""
     global _client, _facts_col, _episodes_col, _impl, _dim
     if _impl != "none":
         return
     store.init()
     _client, _facts_col, _episodes_col = _try_chroma()
     _impl = "chroma" if _client else "memory"
-    # Force a first embed so we can stamp the dim.
+    # Force a first embed so we can stamp the dim (one embed, not O(facts)).
     embeddings.embed("hello")
     _dim = embeddings.dim() or 0
-    _bootstrap_from_store()
 
 
-def _bootstrap_from_store() -> None:
-    """Re-index whatever's already in SQLite. Idempotent — upserts are safe."""
-    facts = store.all_facts(include_private=True)
-    for f in facts:
-        _upsert(FACTS_COLLECTION, f["id"], f["text"], _fact_meta(f))
+def _existing_ids(col) -> set:
+    """Ids already present in a Chroma collection (persisted across restarts)."""
+    if col is None:
+        return set()
+    try:
+        return set(col.get(include=[]).get("ids") or [])
+    except Exception:
+        return set()
+
+
+def warm() -> None:
+    """Rebuild/reconcile the index from SQLite. Meant to run in a BACKGROUND thread after the
+    server is already serving, so boot isn't blocked by O(facts) embed calls.
+
+    - Chroma backend (persistent): vectors survive restarts, so we only embed ids that AREN'T
+      already indexed — a warm restart does zero re-embedding. SQLite stays authoritative.
+    - In-RAM fallback: the index is empty every boot, so this rebuilds it fully.
+    Idempotent and safe to call more than once."""
+    if _impl == "none":
+        init()
+    facts_have = _existing_ids(_facts_col) if _impl == "chroma" else set()
+    eps_have = _existing_ids(_episodes_col) if _impl == "chroma" else set()
+    for f in store.all_facts(include_private=True):
+        if f["id"] not in facts_have:
+            _upsert(FACTS_COLLECTION, f["id"], f["text"], _fact_meta(f))
     for ep in store.recent_episodes(limit=200):
-        _upsert(EPISODES_COLLECTION, ep["id"], ep["raw_text"], _ep_meta(ep))
+        if ep["id"] not in eps_have:
+            _upsert(EPISODES_COLLECTION, ep["id"], ep["raw_text"], _ep_meta(ep))
 
 
 def _fact_meta(f: dict) -> dict:

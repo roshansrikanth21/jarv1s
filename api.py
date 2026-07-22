@@ -10,6 +10,7 @@ Run: python api.py
 import asyncio
 import atexit
 import base64
+import importlib.util
 import io
 import ipaddress
 import json
@@ -30,7 +31,6 @@ from pathlib import Path
 from typing import Any
 
 import psutil
-import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -46,6 +46,15 @@ _oh = (os.environ.get("OLLAMA_HOST") or "").strip()
 if _oh.startswith("0.0.0.0"):
     _port = _oh.split(":", 1)[1] if ":" in _oh else "11434"
     os.environ["OLLAMA_HOST"] = f"http://127.0.0.1:{_port}"
+
+# Cap BLAS/OpenMP thread pools BEFORE numpy/ChromaDB/CTranslate2 load. Left unset, each of
+# these libraries spawns one worker thread PER CPU CORE — on a modern many-core laptop that's
+# dozens of idle threads and their stacks resident for our tiny matrices (LinUCB is 10-dim,
+# embeddings are small-batch), pure RSS waste. Cap at 4 (plenty for our workloads); setdefault
+# so a power user can still override. This is the global thread bound the perf commit missed.
+_tcap = str(max(1, min(4, (os.cpu_count() or 4))))
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+    os.environ.setdefault(_var, _tcap)
 
 import desktop
 import device
@@ -115,12 +124,19 @@ VISION_MODEL      = "llava:latest"
 USE_CLAUDE        = bool(ANTHROPIC_API_KEY)
 
 _AnthropicClient: Any = None
-try:
-    from anthropic import AsyncAnthropic as _AnthropicClient
-    _HAS_ANTHROPIC = True
-except ImportError:
-    _HAS_ANTHROPIC = False
-    USE_CLAUDE = False
+# Deferred: find_spec (~ms) tells us Claude is available; the real ~1.7s `anthropic` import
+# only happens in _anthropic() when a Claude call is actually made — off the boot path.
+_HAS_ANTHROPIC = importlib.util.find_spec("anthropic") is not None
+
+
+def _anthropic():
+    """Lazy handle to the anthropic AsyncAnthropic client class."""
+    global _AnthropicClient
+    if _AnthropicClient is None:
+        from anthropic import AsyncAnthropic
+        _AnthropicClient = AsyncAnthropic
+    return _AnthropicClient
+
 
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
 # Default: gpt-oss-120b — true reasoning model. Keeps chain-of-thought on a hidden
@@ -239,12 +255,21 @@ WATCH_SPEAK = os.environ.get("JARVIS_WATCH_SPEAK", "1") != "0"
 USE_GROQ        = bool(GROQ_API_KEY)
 
 _openai_mod: Any = None
-try:
-    import openai as _openai_mod
-    _HAS_GROQ = True
-except ImportError:
-    _HAS_GROQ = False
-    USE_GROQ  = False
+# Availability is checked WITHOUT importing (find_spec is ~ms); the real ~1.2s import is
+# deferred to _openai() on first cloud call, keeping it off the boot path.
+_HAS_GROQ = importlib.util.find_spec("openai") is not None
+if not _HAS_GROQ:
+    USE_GROQ = False
+
+
+def _openai():
+    """Lazy handle to the openai SDK (used for Groq's OpenAI-compatible API). Populates the
+    module global on first use so existing `except _openai_mod.X` clauses keep working."""
+    global _openai_mod
+    if _openai_mod is None:
+        import openai as _mod
+        _openai_mod = _mod
+    return _openai_mod
 
 
 def _active_model() -> str:
@@ -302,9 +327,12 @@ async def _lifespan(app: FastAPI):
     # Cortex: SQLite (WAL) + Chroma-or-RAM vector index. First boot migrates any
     # legacy jarvis_memory.json / jarvis_history.json into the new store.
     try:
-        _cortex_stats = await asyncio.to_thread(cortex.init)
+        _cortex_stats = await asyncio.to_thread(cortex.init)   # fast: schema + client + dim only
         print(f"[JARVIS] Cortex: {_cortex_stats}")
         cortex.emotion.sync_from_persona(_persona)
+        # Re-index/reconcile OFF the boot path — a warm Chroma restart re-embeds nothing, and
+        # the in-RAM fallback rebuilds without blocking the server from serving.
+        asyncio.create_task(asyncio.to_thread(cortex.warm))
     except Exception as _exc:
         log.warning("cortex init failed: %s", _exc)
     # Background tasks (don't block serving): hardware probe, sleep cycle, ambient,
@@ -590,7 +618,8 @@ async def _monitor_loop() -> None:
     """Background hardware watchdog — speaks + UI alert when thresholds breach."""
     while True:
         try:
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
+            _maybe_unload_whisper()          # reclaim STT RAM when idle (esp. while disconnected)
             if not active_connections:
                 continue
             alert = await asyncio.to_thread(_sys_monitor.check)
@@ -2309,7 +2338,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         if USE_GROQ and _HAS_GROQ:
             try:
                 b64 = base64.b64encode(img_bytes).decode()
-                client = _openai_mod.OpenAI(
+                client = _openai().OpenAI(
                     api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
                 )
                 resp = client.chat.completions.create(
@@ -2423,7 +2452,7 @@ def _groq_vision(b64_images: list, prompt: str, max_tokens: int = 600) -> str:
     """Send one or more base64 JPEGs + a prompt to Groq's multimodal model."""
     if not (USE_GROQ and _HAS_GROQ):
         return "Vision needs a Groq API key."
-    client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
+    client = _openai().OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
     content: list[Any] = [{"type": "text", "text": prompt}]
     for b in b64_images:
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b}"}})
@@ -2547,7 +2576,7 @@ def _watch_video(source: str, question: str = "", gen: int | None = None) -> str
     try:
         if USE_GROQ and _HAS_GROQ and os.path.getsize(video_path) <= 24 * 1024 * 1024:
             _progress("Transcribing audio...")
-            client = _openai_mod.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
+            client = _openai().OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
             with open(video_path, "rb") as f:
                 r = client.audio.transcriptions.create(model=STT_MODEL, file=f, response_format="text")
             transcript = (r or "").strip()
@@ -3052,7 +3081,7 @@ async def _subagent_brain(messages: list[dict], tools: list[dict], max_tokens: i
 
     Returns {"content": str, "tool_calls": [{"id", "name", "arguments"}]}."""
     if USE_GROQ and _HAS_GROQ:
-        client = _openai_mod.AsyncOpenAI(
+        client = _openai().AsyncOpenAI(
             api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
         # Deliberately SUBAGENT_MODEL (small/fast), not GROQ_MODEL — see comment where it's
         # defined. Prevents a spawn_agents call from burning through the parent's quota.
@@ -3323,7 +3352,7 @@ def _remember_overheard(text: str) -> None:
 async def _brain_groq(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
     """Primary brain — streams text, runs tools, returns the final answer. The
     shared wrapper (_run_agent) handles emit, fillers, history, and recording."""
-    client = _openai_mod.AsyncOpenAI(
+    client = _openai().AsyncOpenAI(
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
         timeout=GROQ_TIMEOUT,
@@ -3426,7 +3455,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
 
 # ── Claude agent loop ───────────────────────────────────────────────────────────
 async def _brain_claude(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
-    client   = _AnthropicClient(api_key=ANTHROPIC_API_KEY)
+    client   = _anthropic()(api_key=ANTHROPIC_API_KEY)
     messages: list[dict] = list(history) + [{"role": "user", "content": text}]
 
     # Force tools whenever the request clearly wants an action/live data — otherwise the
@@ -4146,7 +4175,7 @@ async def _deliberate(question: str) -> None:
         await _emit_final("Multi-agent deliberation needs the Groq backend.")
         return
 
-    client = _openai_mod.AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
+    client = _openai().AsyncOpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT)
     await broadcast({"type": "council_start", "question": question,
                      "panel": [_short_model(m) for m in MOA_PROPOSERS]})
     await broadcast({"type": "state", "status": "thinking", "text": "Convening the panel..."})
@@ -4444,6 +4473,27 @@ def _is_stt_noise(text: str) -> bool:
 _whisper_model = None
 _whisper_lock = threading.Lock()
 _whisper_load_failed = False   # sticky — don't retry a 1-3s failed load on every utterance
+_whisper_last_used = 0.0       # monotonic-ish wall time of the last transcription
+# Free the resident model after this many idle seconds to reclaim ~150-300MB RSS. It reloads
+# lazily (~1-3s) on the next utterance. 0 disables. Tunable via JARVIS_STT_IDLE_UNLOAD_SEC.
+_WHISPER_IDLE_UNLOAD = int(os.environ.get("JARVIS_STT_IDLE_UNLOAD_SEC", "300"))
+
+
+def _maybe_unload_whisper() -> None:
+    """Drop the resident Whisper model if it's been idle a while (called from _monitor_loop).
+    Mirrors the Ollama RAM-release policy — voice is bursty, so holding ~200MB of CTranslate2
+    weights resident between conversations is pure waste."""
+    global _whisper_model
+    if _whisper_model is None or _WHISPER_IDLE_UNLOAD <= 0:
+        return
+    if _listening:                       # never unload mid-session; the mic is hot
+        return
+    if (time.time() - _whisper_last_used) < _WHISPER_IDLE_UNLOAD:
+        return
+    with _whisper_lock:
+        if _whisper_model is not None and not _listening:
+            _whisper_model = None         # GC frees the CTranslate2 weights; reloads on next use
+            log.info("whisper: unloaded idle STT model to reclaim RAM")
 
 
 def _import_faster_whisper():
@@ -4466,12 +4516,16 @@ def _import_faster_whisper():
 
 
 def _stt_available() -> bool:
-    """True if voice input can transcribe at all — local faster-whisper or Groq cloud."""
-    try:
-        _import_faster_whisper()
+    """True if voice input can transcribe at all — local faster-whisper or Groq cloud.
+
+    Uses find_spec (~ms, no import) rather than actually importing faster_whisper: this is
+    called from GET /api/agent/status, which the desktop shell polls during boot. Importing
+    faster_whisper here (heavy CTranslate2 DLLs) would block the event loop on the first
+    status request and could stall the shell's readiness probe — and it defeats the whole
+    point of loading the model lazily."""
+    if importlib.util.find_spec("faster_whisper") is not None:
         return True
-    except ImportError:
-        return bool(USE_GROQ and _HAS_GROQ)
+    return bool(USE_GROQ and _HAS_GROQ)
 
 
 def _get_local_whisper():
@@ -4513,9 +4567,11 @@ def _transcribe_local(pcm16, sample_rate: int):
     """Transcribe raw int16 mono PCM via the local faster-whisper singleton — no WAV/file
     round-trip, no PyAV. Returns text, or None if the local model isn't available (caller
     should fall back to Groq)."""
+    global _whisper_last_used
     model = _get_local_whisper()
     if model is None:
         return None
+    _whisper_last_used = time.time()      # keep the idle-unload timer fresh while in use
     try:
         import numpy as np
         audio_f32 = (pcm16.astype(np.float32) / 32768.0)
@@ -4549,7 +4605,7 @@ def _transcribe(pcm16, sample_rate: int = 16000) -> str:
             wf.setsampwidth(2)
             wf.setframerate(sample_rate)
             wf.writeframes(pcm16.tobytes())
-        client = _openai_mod.OpenAI(
+        client = _openai().OpenAI(
             api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
         )
         result = client.audio.transcriptions.create(
@@ -4969,8 +5025,35 @@ from routers.rest import register as _register_rest  # noqa: E402
 _register_rest(app)
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
+def _bind_port(host: str, preferred: int) -> socket.socket:
+    """Return a LISTENING socket on the preferred port, or on an OS-assigned free port
+    if the preferred one is taken (e.g. Docker Desktop squats on 8000). Handing the
+    already-bound socket to uvicorn avoids a bind race, and makes the app portable to any
+    machine where the default port happens to be busy. The chosen port is printed for the
+    Electron shell to parse (see electron/main.js)."""
+    for candidate in (preferred, 0):        # try the preferred port, then any free one
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # NOTE: no SO_REUSEADDR — on Windows it would let us co-bind a port another process
+        # already holds, defeating the whole point. We WANT bind() to fail so we fall back.
+        try:
+            sock.bind((host, candidate))
+            sock.listen()
+            return sock
+        except OSError:
+            sock.close()
+    raise SystemExit(f"[JARVIS] Could not bind {host}:{preferred} or any free port.")
+
+
 if __name__ == "__main__":
-    port = int(os.getenv("JARVIS_PORT", 8000))
+    import uvicorn   # imported here (not at module top) so `import api` doesn't pay the uvicorn+watchfiles cost
     host = os.getenv("JARVIS_HOST", "127.0.0.1")
-    print(f"[JARVIS] Starting on http://{host}:{port}")
-    uvicorn.run(app, host=host, port=port, log_level="warning")
+    preferred = int(os.getenv("JARVIS_PORT", "8000"))
+    _sock = _bind_port(host, preferred)
+    _port = _sock.getsockname()[1]
+    # Machine-parseable first so the desktop shell learns the real port even when it differs
+    # from the default; flush so Electron sees it immediately (PYTHONUNBUFFERED is also set).
+    print(f"[[JARVIS_PORT]] {_port}", flush=True)
+    if _port != preferred:
+        print(f"[JARVIS] Port {preferred} was busy — using free port {_port} instead.", flush=True)
+    print(f"[JARVIS] Starting on http://{host}:{_port}", flush=True)
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=[_sock])
