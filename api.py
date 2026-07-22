@@ -140,15 +140,18 @@ def _anthropic():
 
 
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-# Default: gpt-oss-120b — true reasoning model. Keeps chain-of-thought on a hidden
-# channel and returns clean, concise answers (ideal for TTS). 8k TPM is fine for
-# personal use; rate limits degrade gracefully. For max throughput / no throttling
-# set GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct (30k TPM, but verbose).
-GROQ_MODEL      = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-# Sub-agents default to the smaller/faster model so a spawn_agents call (up to 5 × 6 = 30
-# API hits) doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL to
-# put them on the big model, or set both to the same to disable the split.
-SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "openai/gpt-oss-20b")
+# Cloud model tiers (Groq). Everyday chat must NOT default to a 120B *reasoning* model:
+# reasoning emits a large hidden token stream that (a) overruns max_tokens (the "max
+# completion tokens reached" JSON failures) and (b) exhausts the free tier in a handful of
+# messages. So we tier by task difficulty (see _groq_model_for) and keep the heavy reasoning
+# model for the explicit council only.
+#   fast : greetings / trivial chat  — cheap, high rate limits
+#   main : normal + tool-calling work — strong, non-reasoning, no hidden-token blowup
+GROQ_FAST_MODEL = os.environ.get("JARVIS_GROQ_FAST_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# Sub-agents on the cheap fast model so a spawn_agents fan-out (up to 5 × 6 = 30 API hits)
+# doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL.
+SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "llama-3.1-8b-instant")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
 GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard cap so a slow/hung API never stalls the agent
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
@@ -3281,18 +3284,60 @@ async def _emit_final(text: str) -> None:
 
 
 # ── Groq agent loop (primary — gpt-oss-120b reasoning model, streaming) ────────
-async def _groq_round(client, messages: list[dict], allow_tools: bool):
+# ── Per-request tool subsetting ──────────────────────────────────────────────────
+# Sending all ~25 tool schemas (~5.7k tokens) on every action request overruns Groq's
+# free-tier per-request token budget (observed persistent HTTP 413s). So we always offer a
+# small everyday CORE set and add a heavy group only when the request's intent matches it —
+# this keeps a typical tool call around ~1.5k tool-tokens instead of ~5.7k.
+_CORE_TOOLS = {
+    "remember", "recall_memory", "search_web", "calculate", "get_weather",
+    "get_system_info", "add_task", "complete_task", "run_command", "launch_app",
+    "capture_screen", "use_skill", "create_skill",
+}
+_TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
+    (re.compile(r"\b(desktop|click|type this|keyboard|mouse|window|gui|automate|drag|scroll)\b", re.I),
+     {"desktop"}),
+    (re.compile(r"\b(browse|website|web ?page|url|https?://|navigate|scrape|crawl|open the site)\b", re.I),
+     {"browse"}),
+    (re.compile(r"\b(recon|pentest|pen[- ]?test|bug ?bounty|vuln\w*|exploit|cve|nmap|nikto|sqlmap|"
+                r"gobuster|ffuf|nuclei|osint|subdomain|payload|scope|target)\b", re.I),
+     {"recon", "pentest", "bugbounty", "report", "scope"}),
+    (re.compile(r"\b(market|nifty|sensex|banknifty|stock|price|trading|\bict\b|chart)\b", re.I),
+     {"ict_scan", "open_trading"}),
+    (re.compile(r"\b(image|photo|picture|screenshot|video|watch this|analyze the (image|photo|video))\b", re.I),
+     {"analyze_image", "watch_video"}),
+    (re.compile(r"\b(deliberate|council|panel|debate|multiple agents|sub-?agents|spawn)\b", re.I),
+     {"spawn_agents"}),
+]
+
+
+def _relevant_tools(text: str) -> list[dict]:
+    """The subset of TOOLS worth sending for this request: everyday core + any heavy group
+    the text clearly needs. Falls back to the full set if nothing resolves (never empty)."""
+    keep = set(_CORE_TOOLS)
+    for rx, names in _TOOL_GROUPS:
+        if rx.search(text or ""):
+            keep |= names
+    subset = [t for t in TOOLS if t["function"]["name"] in keep]
+    return subset or TOOLS
+
+
+async def _groq_round(client, messages: list[dict], allow_tools: bool,
+                      model: str | None = None, tools: list[dict] | None = None):
     """One streaming round. Returns (full_text, tool_calls_raw dict)."""
+    model = model or GROQ_MODEL
     kwargs: dict = {
-        "model": GROQ_MODEL,
+        "model": model,
         "messages": messages,
-        "max_tokens": 2048,   # room for hidden reasoning + a concise answer, still under TPM
+        # Reserved output counts against Groq's per-request/TPM budget. 1536 is plenty for a
+        # concise, spoken answer (and code snippets) while leaving headroom on the free tier.
+        "max_tokens": 1536,
         "stream": True,
     }
-    if "gpt-oss" in GROQ_MODEL:
+    if "gpt-oss" in model:
         kwargs["reasoning_effort"] = GROQ_REASONING
     if allow_tools:
-        kwargs["tools"] = TOOLS
+        kwargs["tools"] = tools if tools is not None else TOOLS
         kwargs["tool_choice"] = "auto"
 
     stream = await client.chat.completions.create(**kwargs)
@@ -3404,6 +3449,18 @@ def _remember_overheard(text: str) -> None:
         _save_json(OVERHEARD_FILE, _overheard)
 
 
+def _groq_model_for(decision: dict, use_tools: bool) -> str:
+    """Pick the Groq model by task complexity — this is the core of 'scale the model to
+    the task'. Tool-calling and non-trivial asks get the strong 70B model; greetings and
+    trivial chat get the cheap fast model. Neither is a reasoning model, so there's no
+    hidden-token blowup and the effective free-tier limits are far higher."""
+    if use_tools:
+        return GROQ_MODEL                       # tool-calling wants the stronger model
+    if float(decision.get("difficulty") or 0.0) < 0.20:
+        return GROQ_FAST_MODEL                   # "hi", "thanks", "what time is it" -> cheap
+    return GROQ_MODEL
+
+
 async def _brain_groq(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
     """Primary brain — streams text, runs tools, returns the final answer. The
     shared wrapper (_run_agent) handles emit, fillers, history, and recording."""
@@ -3422,10 +3479,13 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     # Force tools whenever the request clearly wants an action/live data — otherwise the
     # model can't act and (rightly forbidden from fabricating) returns nothing.
     use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
+    model = _groq_model_for(decision, use_tools)
+    tool_subset = _relevant_tools(text) if use_tools else None
     final_answer = ""
     for _ in range(8):
         try:
-            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools)
+            full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools,
+                                                          model=model, tools=tool_subset)
         except _openai_mod.AuthenticationError:
             return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
                     "in Settings (Electron) or `.env`, then restart the backend.")
@@ -3444,7 +3504,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
             # Malformed tool call rejected mid-stream — retry forcing a text answer;
             # prior tool results stay in context.
             try:
-                full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False)
+                full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=False, model=model)
             except _openai_mod.AuthenticationError:
                 return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
                         "and restart the backend.")
@@ -3479,7 +3539,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
             else:
                 # Empty answer, no tools — retry once without tools.
                 try:
-                    retry_text, _ = await _groq_round(client, messages, allow_tools=False)
+                    retry_text, _ = await _groq_round(client, messages, allow_tools=False, model=model)
                 except _openai_mod.APIError:
                     retry_text = ""
                 final_answer = retry_text.strip()
@@ -3719,8 +3779,10 @@ async def _run_rung(rung: str, text: str, dev: dict, decision: dict) -> str:
 
 def _fallback_rung(failed: str, avail: set[str]) -> str | None:
     """The next rung to try when `failed` produced nothing: the best available alternative.
-    Never auto-escalates into council (heavy + self-emitting) — that stays an explicit choice."""
-    for r in ("cloud_deep", "cloud_fast", "local_deep", "local_fast"):
+    Prefer another cloud rung, then the LIGHT local model before the heavy one — a cloud
+    rate-limit shouldn't cascade into loading the largest Ollama model (a RAM spike) when the
+    small local model can answer. Never auto-escalates into council (heavy + self-emitting)."""
+    for r in ("cloud_deep", "cloud_fast", "local_fast", "local_deep"):
         if r != failed and r in avail:
             return r
     return None

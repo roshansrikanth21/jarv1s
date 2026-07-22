@@ -21,10 +21,13 @@ from typing import Optional
 
 log = logging.getLogger("jarvis.cortex")
 
+# Non-reasoning models here on purpose: extraction/consolidation emit strict JSON, and a
+# reasoning model spends its token budget on hidden chain-of-thought and then trips
+# "max completion tokens reached before generating a valid document" (observed on gpt-oss-20b).
 GROQ_MODEL_EXTRACT = os.environ.get("JARVIS_ROUTER_EXTRACT",
-                                    os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b"))
+                                    os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"))
 GROQ_MODEL_CONSOL = os.environ.get("JARVIS_ROUTER_CONSOL",
-                                   os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"))
+                                   os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 LOCAL_FAST = os.environ.get("JARVIS_LOCAL_FAST", "qwen2.5:7b")
 LOCAL_DEEP = os.environ.get("JARVIS_LOCAL_DEEP", "")
