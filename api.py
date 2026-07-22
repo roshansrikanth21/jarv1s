@@ -60,6 +60,7 @@ import desktop
 import device
 import governor
 import models_advisor
+import skills
 
 import ambient
 import briefing
@@ -1438,6 +1439,36 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "use_skill",
+            "description": "Load the full step-by-step instructions for one of your named skills (see the [SKILLS] list in your context). Call this FIRST whenever a request matches a skill, then follow the returned instructions. Don't guess a skill's steps.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "The skill name/slug from the [SKILLS] list (e.g. 'market-brief')."},
+                },
+                "required": ["skill"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "Save a reusable procedure as a new skill (procedural memory) so it can be loaded later with use_skill. Use this after you work out a repeatable, non-trivial way to do something the user is likely to want again.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short human name, e.g. 'Weekly Portfolio Review'."},
+                    "description": {"type": "string", "description": "One line: when to use this skill."},
+                    "instructions": {"type": "string", "description": "The full step-by-step procedure, in markdown."},
+                },
+                "required": ["name", "description", "instructions"],
+            },
+        },
+    },
 ]
 
 # Name → schema lookup for the executor
@@ -2120,6 +2151,20 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
     err = _validate_tool_args(name, args)
     if err:
         return err
+
+    if name == "use_skill":
+        body = skills.load(str(args.get("skill", "")))
+        if body is None:
+            avail = ", ".join(s.slug for s in skills.all_skills()) or "none"
+            return f"No skill named '{args.get('skill', '')}'. Available skills: {avail}."
+        return body
+
+    if name == "create_skill":
+        try:
+            s = skills.create(args["name"], args.get("description", ""), args["instructions"])
+        except Exception as exc:
+            return f"Could not create skill: {exc}"
+        return f"Saved skill '{s.slug}'. Load it later with use_skill(skill='{s.slug}')."
 
     if name == "remember":
         # Persist via cortex (SQLite + vector index). Legacy `memories` mirror is kept
@@ -3059,7 +3104,7 @@ def _build_system_prompt(query: str = "") -> str:
         include_private=True,   # in-process JARVIS sees private facts; the HTTP hub does not
     )
     try:
-        return cortex.build_system_prompt(query, hooks)
+        prompt = cortex.build_system_prompt(query, hooks)
     except Exception as exc:
         # Never let the memory layer fail a reply — degrade to persona + ambient only.
         log.warning("cortex.build_system_prompt failed: %s", exc)
@@ -3070,7 +3115,17 @@ def _build_system_prompt(query: str = "") -> str:
             parts.append("\n" + persona_block)
         if homeo_line:
             parts.append("\n" + homeo_line)
-        return "\n".join(parts)
+        prompt = "\n".join(parts)
+
+    # Advertise available skills (names + descriptions only). The full instructions
+    # for a skill are pulled on demand via the use_skill tool — progressive disclosure.
+    try:
+        skill_cat = skills.catalog()
+        if skill_cat:
+            prompt = f"{prompt}\n\n{skill_cat}"
+    except Exception as exc:
+        log.warning("skills.catalog failed: %s", exc)
+    return prompt
 
 
 # ── Shared tool runner ──────────────────────────────────────────────────────────

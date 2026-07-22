@@ -261,6 +261,24 @@ def register(app: FastAPI) -> None:
                 "recent": core._gov.log[-12:], "homeostasis": _homeostasis(dev)}
 
 
+    @app.get("/api/skills")
+    async def skills_list() -> dict:
+        """Hermes-style skills catalog — names + descriptions (procedural memory)."""
+        return {
+            "skills": [
+                {"slug": s.slug, "name": s.name, "description": s.description}
+                for s in core.skills.all_skills()
+            ]
+        }
+
+    @app.get("/api/skills/{slug}")
+    async def skills_get(slug: str):
+        """Full instruction body for one skill."""
+        s = core.skills.get(slug)
+        if s is None:
+            return JSONResponse({"error": f"No skill '{slug}'."}, status_code=404)
+        return {"slug": s.slug, "name": s.name, "description": s.description, "body": s.body}
+
     @app.get("/api/memory")
     async def memory_endpoint(limit: int = 60) -> dict:
         """The inspectable self-model — durable core.memories, newest first. Reads core.cortex (the real
