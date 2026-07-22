@@ -5,7 +5,7 @@
 // Design doctrine (distilled from the five-angle research pass):
 //   presence is one honest mark · glow is an event · decisions are visible ·
 //   every gauge reads a real number · serif voice for JARVIS, mono for machines.
-import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense, memo } from "react";
 import { Mic, MicOff, Send, X, Moon, Trash2, Volume2 } from "lucide-react";
 import { ContentPanel, type ContentPanelData } from "@/components/jarvis/ContentPanel";
 import { WindowControls } from "@/components/jarvis/WindowControls";
@@ -1644,7 +1644,11 @@ export default function PrimeDeck() {
 }
 
 /* ── feed row ────────────────────────────────────────────── */
-function FeedRow({ e }: { e: Feed }) {
+// Memoized: the feed is the biggest subtree in the deck, and it's independent of the
+// 5-60s status/models/market polls. Without memo, every poll's setState re-rendered the
+// whole conversation. Feed items are append-only (stable identity), so memo correctly
+// re-renders only rows whose `e` actually changed.
+const FeedRow = memo(function FeedRow({ e }: { e: Feed }) {
   if (e.kind === "user" || e.kind === "agent" || e.kind === "system") {
     return (
       <div className={`pr-entry pr-entry--${e.kind}`}>
@@ -1712,7 +1716,7 @@ function FeedRow({ e }: { e: Feed }) {
     );
   }
   return null;
-}
+});
 
 function SettingsModal({
   name,

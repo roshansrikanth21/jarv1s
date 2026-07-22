@@ -33,7 +33,7 @@ import {
   GitBranch,
   Boxes,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, memo } from "react";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { HudAmbient } from "@/components/jarvis/HudAmbient";
 import { ShaderBackdrop } from "@/components/jarvis/ShaderBackdrop";
@@ -315,6 +315,28 @@ function BootScreen() {
     </div>
   );
 }
+
+// Memoized transcript row. visibleLines is a useMemo keyed on [lines, lineCut], so its
+// element refs are stable across the 8-60s status/model/market polls — memo means those
+// polls no longer re-render the whole conversation, only genuinely-changed rows. The
+// motion.div stays inside so AnimatePresence (keyed on <HudMsg>) still animates enter/exit.
+const HudMsg = memo(function HudMsg({ line }: { line: Line }) {
+  return (
+    <motion.div
+      className={`hud-msg hud-msg--${line.role}`}
+      initial={{ opacity: 0, y: 6 }}
+      animate={{ opacity: 1, y: 0 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.2, ease: "easeOut" }}
+    >
+      <span className="hud-msg-time">{line.at}</span>
+      <span className={`hud-msg-role hud-msg-role--${ROLE_META[line.role].color}`}>
+        {ROLE_META[line.role].label}
+      </span>
+      <span className="hud-msg-text">{line.text}</span>
+    </motion.div>
+  );
+});
 
 // ── Main ──────────────────────────────────────────────────
 function CommandDeck() {
@@ -1021,20 +1043,7 @@ function CommandDeck() {
           >
             <AnimatePresence initial={false}>
               {visibleLines.map((line) => (
-                <motion.div
-                  key={line.id}
-                  className={`hud-msg hud-msg--${line.role}`}
-                  initial={{ opacity: 0, y: 6 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0 }}
-                  transition={{ duration: 0.2, ease: "easeOut" }}
-                >
-                  <span className="hud-msg-time">{line.at}</span>
-                  <span className={`hud-msg-role hud-msg-role--${ROLE_META[line.role].color}`}>
-                    {ROLE_META[line.role].label}
-                  </span>
-                  <span className="hud-msg-text">{line.text}</span>
-                </motion.div>
+                <HudMsg key={line.id} line={line} />
               ))}
             </AnimatePresence>
 
