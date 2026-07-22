@@ -25,7 +25,7 @@ const A = {
 export function ArcReactor({ active = false, speaking = false, size = "md", energy = 1 }: Props) {
   const px = size === "sm" ? 128 : 192;
   const core = size === "sm" ? 56 : 80;
-  const reduce = useReducedMotion();   // honour the OS "reduce motion" accessibility setting
+  const reduce = useReducedMotion(); // honour the OS "reduce motion" accessibility setting
 
   return (
     <div

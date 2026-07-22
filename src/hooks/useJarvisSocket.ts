@@ -305,7 +305,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         /* ignore malformed packet */
       }
     };
-  }, [playTts, scheduleReconnect, flushPendingActions]);
+  }, [playTts, scheduleReconnect, flushPendingActions, resetStream, scheduleFlush]);
   connRef.current = connect;
 
   useEffect(() => {

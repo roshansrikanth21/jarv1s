@@ -160,7 +160,7 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
     let rpm = 0;
     let raf = 0;
     let t0 = performance.now();
-    const _dirVec = new THREE.Vector3();   // reused across frames — no per-frame allocation
+    const _dirVec = new THREE.Vector3(); // reused across frames — no per-frame allocation
 
     const animate = (now: number) => {
       // Don't schedule the next frame while hidden — keeps GPU/CPU idle in background tabs.

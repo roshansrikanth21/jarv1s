@@ -154,7 +154,8 @@ export function LiveOps() {
     // When the window becomes visible again, reconnect immediately (reset backoff) if needed.
     const onVisible = () => {
       if (stop || document.hidden) return;
-      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))
+        return;
       if (retry) {
         clearTimeout(retry);
         retry = null;
