@@ -2209,11 +2209,12 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return err
 
     if name == "use_skill":
-        body = skills.load(str(args.get("skill", "")))
-        if body is None:
+        slug_in = str(args.get("skill", ""))
+        skill = skills.get(slug_in)
+        if skill is None:
             avail = ", ".join(s.slug for s in skills.all_skills()) or "none"
-            return f"No skill named '{args.get('skill', '')}'. Available skills: {avail}."
-        return body
+            return f"No skill named '{slug_in}'. Available skills: {avail}."
+        return skills.format_for_tool(skill.body, skill.slug)
 
     if name == "create_skill":
         try:
@@ -3350,17 +3351,21 @@ _CORE_TOOLS = {
 _TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
     (re.compile(r"\b(desktop|click|type this|keyboard|mouse|window|gui|automate|drag|scroll)\b", re.I),
      {"desktop"}),
-    (re.compile(r"\b(browse|website|web ?page|url|https?://|navigate|scrape|crawl|open the site)\b", re.I),
+    (re.compile(r"\b(browse|website|web ?page|url|https?://|navigate|scrape|crawl|open the site|"
+                r"deep[- ]?web|research|look up|investigate)\b", re.I),
      {"browse"}),
     (re.compile(r"\b(recon|pentest|pen[- ]?test|bug ?bounty|vuln\w*|exploit|cve|nmap|nikto|sqlmap|"
                 r"gobuster|ffuf|nuclei|osint|subdomain|payload|scope|target)\b", re.I),
      {"recon", "pentest", "bugbounty", "report", "scope"}),
-    (re.compile(r"\b(market|nifty|sensex|banknifty|stock|price|trading|\bict\b|chart)\b", re.I),
+    (re.compile(r"\b(market|nifty|sensex|banknifty|stock|price|trading|\bict\b|chart|"
+                r"market[- ]?brief)\b", re.I),
      {"ict_scan", "open_trading"}),
     (re.compile(r"\b(image|photo|picture|screenshot|video|watch this|analyze the (image|photo|video))\b", re.I),
      {"analyze_image", "watch_video"}),
     (re.compile(r"\b(deliberate|council|panel|debate|multiple agents|sub-?agents|spawn)\b", re.I),
      {"spawn_agents"}),
+    (re.compile(r"\b(triage|diagnose|system (health|status|check)|why (is|am).*(slow|hot|loud))\b", re.I),
+     {"get_system_info", "run_command"}),
 ]
 
 
@@ -5255,7 +5260,28 @@ if __name__ == "__main__":
     import uvicorn   # imported here (not at module top) so `import api` doesn't pay the uvicorn+watchfiles cost
     host = os.getenv("JARVIS_HOST", "127.0.0.1")
     preferred = int(os.getenv("JARVIS_PORT", "8000"))
-    _sock = _bind_port(host, preferred)
+    # Vite's proxy is fixed at process start to JARVIS_PORT (default 8000). Silent remapping
+    # to a free port broke desktop:dev for anyone whose 8000 was taken (Docker Desktop) —
+    # Electron learned the new port, Vite kept proxying to 8000 → dead UI. So in desktop/Vite
+    # mode we refuse to remap unless JARVIS_ALLOW_PORT_FALLBACK=1 is set explicitly.
+    _desktopish = os.getenv("JARVIS_DESKTOP") == "1" or os.getenv("JARVIS_USE_VITE") == "1"
+    _fb = os.getenv("JARVIS_ALLOW_PORT_FALLBACK")
+    allow_fallback = (_fb == "1") if _fb is not None else (not _desktopish)
+    if allow_fallback:
+        _sock = _bind_port(host, preferred)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind((host, preferred))
+            sock.listen()
+            _sock = sock
+        except OSError:
+            sock.close()
+            raise SystemExit(
+                f"[JARVIS] Port {preferred} is busy (often Docker Desktop). "
+                f"Free it, or set JARVIS_PORT to a free port and restart BOTH the backend and "
+                f"Vite with the same JARVIS_PORT so /api and /ws still proxy correctly."
+            )
     _port = _sock.getsockname()[1]
     # Machine-parseable first so the desktop shell learns the real port even when it differs
     # from the default; flush so Electron sees it immediately (PYTHONUNBUFFERED is also set).

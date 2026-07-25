@@ -23,5 +23,8 @@ export default defineConfig({
     url: "http://127.0.0.1:8080",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
+    // Vite proxies /api+/ws using JARVIS_PORT. A leftover JARVIS_PORT from a manual
+    // backend test would point the e2e UI at a dead port — pin 8000 for smoke tests.
+    env: { ...process.env, JARVIS_PORT: "8000" },
   },
 });

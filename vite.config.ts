@@ -18,13 +18,16 @@ export default defineConfig({
   vite: {
     base: "./",
     server: {
+      // Must match the backend bind port. Electron sets JARVIS_PORT when spawning;
+      // if the backend silently remapped off 8000 while Vite stayed on 8000, friends
+      // with Docker (or anything on 8000) got a dead UI. Keep these in lockstep.
       proxy: {
         "/api": {
-          target: "http://127.0.0.1:8000",
+          target: `http://127.0.0.1:${process.env.JARVIS_PORT || "8000"}`,
           changeOrigin: true,
         },
         "/ws": {
-          target: "http://127.0.0.1:8000",
+          target: `http://127.0.0.1:${process.env.JARVIS_PORT || "8000"}`,
           ws: true,
         },
       },

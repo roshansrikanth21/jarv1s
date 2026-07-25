@@ -9,10 +9,10 @@ decay bookkeeping, category normalisation, and the private-memory filter live in
 place. If the backend is down, tools return "JARVIS is offline" rather than reading
 stale data.
 
-Config (Claude Desktop example, claude_desktop_config.json):
+Config (Claude Desktop example, claude_desktop_config.json) — use YOUR paths:
     "jarvis-memory": {
-      "command": "C:\\Users\\rosha\\venv\\Scripts\\python.exe",
-      "args": ["C:\\Users\\rosha\\jarvis\\memory_mcp.py"],
+      "command": "C:\\path\\to\\jarv1s\\venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\jarv1s\\memory_mcp.py"],
       "env": { "JARVIS_MEMORY_SOURCE": "claude" }
     }
 Gemini CLI (~/.gemini/settings.json) uses the same command/args shape with

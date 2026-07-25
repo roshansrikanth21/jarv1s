@@ -142,6 +142,8 @@ Runtime data (`memory/`, `.env`, overheard logs) is **not** committed.
 
 ## Setup
 
+**Friends / fresh clone — do all of these before `desktop:dev` or the app will look “broken”:**
+
 ```bash
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
@@ -151,8 +153,15 @@ npm install
 # optional: ollama pull nomic-embed-text
 ```
 
+Then `npm run desktop:dev`. Electron **requires** `./venv` (or `JARVIS_PYTHON`). It will not silently use a bare global `python` that is missing FastAPI.
+
+**Port rule:** backend and Vite must share `JARVIS_PORT` (default `8000`). If Docker (or anything) holds 8000, free it or set the same `JARVIS_PORT` for both processes. Desktop mode refuses silent port remapping — that used to leave a live Electron shell with a dead API.
+
 Keys can also be stored encrypted via **Settings** in the Electron app.
 
+### Hermes skills
+
+Procedural playbooks live under `skills/*/SKILL.md` (agentskills.io-style). The model sees names + descriptions in the system prompt and loads full steps via `use_skill`. Override root with absolute `JARVIS_SKILLS_DIR`.
 ---
 
 ## Run

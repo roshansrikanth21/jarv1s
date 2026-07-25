@@ -52,6 +52,7 @@ def register(app: FastAPI) -> None:
         except Exception:
             _rss_mb = None
         return {
+            "app": "jarvis",
             "brain": {
                 "primary_llm":          _routing_label(),
                 "configured_default":   _active_model(),

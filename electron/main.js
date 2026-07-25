@@ -170,7 +170,7 @@ function resolvePythonPath() {
     : path.join(process.resourcesPath, "jarvis_backend", "jarvis_backend");
 
   if (!isDev && fs.existsSync(packagedBackend)) {
-    return { path: packagedBackend, isPackaged: true };
+    return { path: packagedBackend, isPackaged: true, hint: null };
   }
 
   const venvPy = (root) =>
@@ -178,21 +178,40 @@ function resolvePythonPath() {
       ? path.join(root, "venv", "Scripts", "python.exe")
       : path.join(root, "venv", "bin", "python");
 
-  const candidates = [
-    process.env.JARVIS_PYTHON, // explicit override
-    venvPy(appRoot), // venv inside the repo (portable)
-    venvPy(path.resolve(appRoot, "..")), // venv one level up (e.g. C:\Users\rosha\venv)
-    isWindows ? "py" : "python3",
-    "python",
-  ].filter(Boolean);
-  const found = candidates.find(
-    (candidate) =>
-      candidate === "py" ||
-      candidate === "python3" ||
-      candidate === "python" ||
-      fs.existsSync(candidate),
-  );
-  return { path: found, isPackaged: false };
+  // Prefer an explicit override, then the in-repo venv. Do NOT fall through to bare
+  // `py`/`python` — friends' global Python lacks FastAPI and the backend "boots" into a
+  // crash loop that looks like a mysterious Electron failure.
+  const override = process.env.JARVIS_PYTHON;
+  if (override) {
+    if (
+      fs.existsSync(override) ||
+      override === "py" ||
+      override === "python" ||
+      override === "python3"
+    ) {
+      return { path: override, isPackaged: false, hint: null };
+    }
+    return {
+      path: null,
+      isPackaged: false,
+      hint: `JARVIS_PYTHON=${override} does not exist.`,
+    };
+  }
+
+  const repoVenv = venvPy(appRoot);
+  if (fs.existsSync(repoVenv)) {
+    return { path: repoVenv, isPackaged: false, hint: null };
+  }
+
+  return {
+    path: null,
+    isPackaged: false,
+    hint:
+      "No ./venv found. From the repo root run:\n" +
+      "  python -m venv venv\n" +
+      "  venv\\Scripts\\pip install -r requirements.txt\n" +
+      "Or set JARVIS_PYTHON to a Python that already has those deps.",
+  };
 }
 
 async function isBackendReady() {
@@ -202,7 +221,11 @@ async function isBackendReady() {
   const timer = setTimeout(() => ctrl.abort(), 2000);
   try {
     const response = await fetch(`${backendUrl}/api/agent/status`, { signal: ctrl.signal });
-    return response.ok;
+    if (!response.ok) return false;
+    // Require a JARVIS marker so we don't "reuse" some other service that happens to
+    // answer 200 on /api/agent/status (or a squatting HTTP server on 8000).
+    const body = await response.json().catch(() => null);
+    return Boolean(body && body.app === "jarvis");
   } catch {
     return false;
   } finally {
@@ -221,12 +244,16 @@ async function waitForBackend(timeoutMs = 150000) {
 
 async function startPythonBackend() {
   if (await isBackendReady()) {
-    console.log("[Electron] Reusing existing backend.");
+    console.log("[Electron] Reusing existing JARVIS backend.");
     return true;
   }
 
   const pythonInfo = resolvePythonPath();
   const pythonPath = pythonInfo.path;
+  if (!pythonPath) {
+    console.error(`[Electron] ${pythonInfo.hint || "No Python backend interpreter found."}`);
+    return false;
+  }
 
   let pythonArgs;
   if (pythonInfo.isPackaged) {
@@ -245,6 +272,8 @@ async function startPythonBackend() {
       ...apiKeys,
       PYTHONUNBUFFERED: "1",
       JARVIS_DESKTOP: "1",
+      // Keep Vite proxy and backend on the same port (see vite.config.ts).
+      JARVIS_PORT: process.env.JARVIS_PORT || "8000",
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -403,12 +432,14 @@ async function loadApp() {
   const targetUrl = isDev && process.env.JARVIS_USE_VITE === "1" ? devUiUrl : backendUrl;
 
   if (!backendReady) {
+    const pyHint = resolvePythonPath().hint;
     await mainWindow.loadURL(
       `data:text/html;charset=utf-8,${encodeURIComponent(`
         <body style="margin:0;background:#090403;color:#f4d28b;font:14px monospace;display:grid;place-items:center;height:100vh">
-          <div style="border:1px solid rgba(220,38,38,.45);padding:24px;max-width:620px">
+          <div style="border:1px solid rgba(220,38,38,.45);padding:24px;max-width:640px;white-space:pre-wrap">
             <div style="color:#ef4444;letter-spacing:.25em;text-transform:uppercase;margin-bottom:12px">JARVIS backend failed to boot</div>
-            <div>Start api.py manually once to inspect the Python error, then relaunch the desktop app.</div>
+            <div>${pyHint ? pyHint.replace(/</g, "&lt;") : "Start api.py manually once to inspect the Python error, then relaunch the desktop app."}</div>
+            <div style="margin-top:12px;opacity:.75">Also check: port 8000 free (or set JARVIS_PORT), .env / Settings API keys, and Docker not squatting the port.</div>
           </div>
         </body>
       `)}`,
