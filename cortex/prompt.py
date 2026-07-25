@@ -19,15 +19,27 @@ from typing import Callable, Optional
 from . import emotion as emo_mod
 from . import store, vectors
 
+try:
+    from jarvis.cognition.tokens import estimate_tokens as _estimate_tokens
+except Exception:  # kernel optional during isolated cortex tests
+    _estimate_tokens = None  # type: ignore
+
 DEFAULT_TOKEN_CAP = 2000
-CHARS_PER_TOKEN = 4  # heuristic — good enough for budget-and-trim
+CHARS_PER_TOKEN = 4  # fallback only if jarvis.cognition.tokens is unavailable
 
 FACT_K = 8
 EPISODE_K = 3
 
 
 def _tok(text: str) -> int:
-    return max(1, len(text or "") // CHARS_PER_TOKEN)
+    if not text:
+        return 0
+    if _estimate_tokens is not None:
+        try:
+            return int(_estimate_tokens(text))
+        except Exception:
+            pass
+    return max(1, len(text) // CHARS_PER_TOKEN)
 
 
 @dataclass

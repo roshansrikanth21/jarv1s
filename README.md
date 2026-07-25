@@ -1,30 +1,95 @@
 # JARVIS
 
-**Personal voice-first desktop agent — compute-elastic, embodied, still in beta.**
+**Personal voice-first desktop agent** — local by default, cloud when it helps, still in **beta**.
 
-[![Status](https://img.shields.io/badge/status-beta-amber)](#status)
-[![Platform](https://img.shields.io/badge/platform-Windows-blue)](#requirements)
-[![Stack](https://img.shields.io/badge/backend-FastAPI-009688)](#architecture)
-
-JARVIS treats the machine it runs on as its *body*: it senses battery, thermal load, and free RAM, then routes each request to the **minimum** cognition that clears a quality bar within the current energy/latency budget.
-
-This repository is a **working beta**. Expect rough edges, Windows-first tooling, and APIs that may change.
+[![status](https://img.shields.io/badge/status-beta-yellow)](#project-status)
+[![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](#requirements)
+[![backend](https://img.shields.io/badge/backend-FastAPI-009688)](#architecture)
+[![ui](https://img.shields.io/badge/UI-React%20%2B%20Electron-61dafb)](#user-interfaces)
 
 ---
 
-## Status
+## What this project is
 
-| Area | Maturity | Notes |
+JARVIS is a **desktop companion agent** that runs on your machine: you speak or type, it thinks with a local or cloud model, can use tools (files, browser, shell, memory), and talks back. It is closer to an always-available operator for *your* PC than to a website chatbot.
+
+The design bet is **embodiment**. The process reads host signals (battery, load, free RAM) and a **governor** chooses the cheapest cognition that still clears a quality bar — local fast models when the machine is strained, stronger cloud models when the task needs them, and an optional multi-model “council” for hard questions. Memory is persistent on disk (Cortex): facts, recent episodes, and future reminders feed the next turn. Mood and tone shift with context (affect layer), and optional **skills** are on-disk playbooks the agent can load when a task matches.
+
+You interact through an Electron app with several UI “decks” (Prime, Command Deck, Focus, Terminal, Chat). Under the hood a Python FastAPI backend owns WebSocket chat, tools, voice, and memory; the React UI is a client.
+
+**Beta means:** documented capabilities exist in this repository and are usable, but APIs, UX, and packaging can change. The stack is **Windows-first** for desktop and browser automation. It is not production-hardened, not multi-user, and not claimed to offer equal desktop control on macOS/Linux.
+
+---
+
+## Table of contents
+
+- [JARVIS](#jarvis)
+  - [What this project is](#what-this-project-is)
+  - [Table of contents](#table-of-contents)
+  - [Project status](#project-status)
+  - [Features](#features)
+  - [Architecture](#architecture)
+    - [How a session feels](#how-a-session-feels)
+  - [Requirements](#requirements)
+  - [Fresh install (exact steps)](#fresh-install-exact-steps)
+    - [1. Clone](#1-clone)
+    - [2. Python virtualenv (required by Electron)](#2-python-virtualenv-required-by-electron)
+    - [3. Environment file](#3-environment-file)
+    - [4. Node dependencies](#4-node-dependencies)
+    - [5. Free the backend port (or set one)](#5-free-the-backend-port-or-set-one)
+    - [6. Start the desktop app (preferred)](#6-start-the-desktop-app-preferred)
+    - [7. First-run in the UI](#7-first-run-in-the-ui)
+    - [Optional after first boot](#optional-after-first-boot)
+  - [Running](#running)
+  - [Troubleshooting](#troubleshooting)
+  - [Configuration](#configuration)
+  - [User interfaces](#user-interfaces)
+  - [Tools](#tools)
+  - [Skills](#skills)
+  - [Optional: Docker pentest image](#optional-docker-pentest-image)
+  - [Repository layout](#repository-layout)
+  - [Development checks](#development-checks)
+  - [Security notes](#security-notes)
+  - [License](#license)
+
+---
+
+## Project status
+
+| Area | Maturity | What’s in the tree |
 | --- | --- | --- |
-| Voice (VAD → STT → wake → TTS) | Beta | Local `faster-whisper`; Groq Whisper fallback |
-| Governor routing | Beta | LinUCB + lattice; Ollama and/or cloud keys for full path |
-| Cortex memory | Beta | SQLite + optional Chroma; WordHash when embeddings unavailable |
-| Desktop / OS control | Beta | Windows-oriented |
-| Markets / ICT | Beta | Analysis only — not trade execution |
-| Pentest / research tools | Experimental | Scope-gated; needs Docker + `jarvis-recon` image |
-| Electron packaging | Beta | Dev path primary; packaged builds need a Python sidecar |
+| Voice (VAD → STT → wake → TTS) | **Beta** | `webrtcvad-wheels` / energy gate; local `faster-whisper`; Groq Whisper fallback; Edge TTS |
+| Governor routing | **Beta** | Lattice + LinUCB (`governor.py`); modes auto / eco / local / cloud |
+| Cortex memory | **Beta** | SQLite WAL + optional Chroma; WordHash embeddings if Ollama embed model missing |
+| Desktop / OS control | **Beta** | Windows-oriented (`desktop.py`) |
+| Browser automation | **Beta** | Structured `browse` tool; needs Chrome (+ optional browser-harness paths) |
+| Markets / ICT | **Beta** | Analysis via `ict_scan` — **not** trade execution |
+| Skills | **Beta** | `skills.py` + `skills/*/SKILL.md`; `use_skill` / `create_skill` |
+| Pentest / research | **Experimental** | Scope-gated active tools; Docker + `jarvis-recon:latest` |
+| Electron shell | **Beta** | Dev path (`npm run desktop:dev`) is primary; packaged sidecar is separate |
 
-**Not claimed:** production hardening, multi-user auth, non-Windows desktop parity.
+**Out of scope for this beta:** production SLAs, multi-user auth, and full desktop parity on non-Windows hosts.
+
+---
+
+## Features
+
+What you can actually do with the code in this tree:
+
+- **Talk or type** — wake-word gated listening (default includes `jarvis`), always-listen option, Edge TTS replies with barge-in mute
+- **Stay on-machine when possible** — governor routes across local/cloud rungs and optional Mixture-of-Agents council
+- **Remember** — Cortex stores episodes, durable facts, and prospective items; every reply path builds a system prompt from that store
+- **Act on the PC** — desktop actions, allowlisted app launch, approval-gated shell (`run_command`)
+- **Browse and research** — structured browser tool, web search, optional skill playbooks for repeatable procedures
+- **Specialize** — `spawn_agents` runs capped parallel read-only specialists; markets tools do ICT-style analysis only
+- **Security research (experimental)** — passive `recon` anywhere; active scans only for targets in the local scope allowlist
+
+Subsystem map (same capabilities, named by module):
+
+- **Governor** — rung selection from difficulty + device energy (`governor.py`, `device.py`)
+- **Cortex** — prompt build, async extraction, optional `python -m cortex.dreaming`
+- **Affect** — PAD mood (`persona.py`), transcript cues (`perception.py`), ambient time/place/weather (`ambient.py`)
+- **Skills** — on-disk playbooks; catalog in the system prompt; full body via `use_skill`
 
 ---
 
@@ -32,182 +97,389 @@ This repository is a **working beta**. Expect rough edges, Windows-first tooling
 
 ```mermaid
 flowchart LR
-  subgraph Desktop["Electron"]
-    UI["React decks"]
-    Keys["OS safeStorage"]
+  subgraph Shell["Electron shell"]
+    UI["React decks<br/>Vite :8080 in desktop:dev"]
+    Keys["OS safeStorage<br/>GROQ / ANTHROPIC / MEM0"]
   end
-  subgraph Backend["api.py"]
-    WS["FastAPI + WS"]
+
+  subgraph Backend["Python · api.py"]
+    WS["FastAPI + WebSocket"]
     Gov["Governor"]
     Cortex["Cortex"]
-    Tools["Tools"]
-    Voice["STT / TTS"]
+    Skills["skills.py"]
+    Tools["Tool runtime"]
+    Voice["STT / TTS / VAD"]
   end
-  UI <--> WS
+
+  subgraph External["External (optional)"]
+    Groq["Groq"]
+    Claude["Anthropic"]
+    Ollama["Ollama"]
+    Edge["Edge TTS"]
+    Docker["Docker · jarvis-recon"]
+  end
+
+  UI <-->|"/api · /ws<br/>(same JARVIS_PORT)"| WS
   Keys -->|env at spawn| Backend
   WS --> Gov --> Tools
   WS --> Cortex
+  WS --> Skills
   WS --> Voice
+  Gov --> Groq
+  Gov --> Claude
+  Gov --> Ollama
+  Voice --> Edge
+  Voice --> Groq
+  Tools --> Docker
 ```
 
-**Per turn:** utterance → WebSocket → cortex prompt build → governor picks rung (`local·fast` → `cloud·fast` / `local·deep` → `cloud·deep` → council) → brain + tools → reply + TTS → async memory extract.
+```mermaid
+sequenceDiagram
+  participant U as User
+  participant FE as React deck
+  participant API as api.py
+  participant C as Cortex / skills
+  participant G as Governor
+  participant B as Brain
+  participant T as Tools
 
----
-
-## What it does
-
-- **Governor** — resource-aware routing over local/cloud rungs + optional Mixture-of-Agents council
-- **Cortex** — past/present/future memory (episodes, facts, prospective) with semantic recall
-- **Affect** — PAD mood (`persona.py`) + transcript perception + ambient time/place/weather
-- **Voice** — WebRTC VAD, faster-whisper / Groq STT, Edge TTS, wake word
-- **Desktop** — Explorer, winget, volume, windows, notifications, structured browser harness
-- **Sub-agents** — up to 5 parallel read-only specialists
-- **Markets** — ICT-style reads for Indian markets (analysis only)
-- **Pentest** — passive `recon` anywhere; active scans only for scoped targets
-
-### Cortex (memory)
-
-SQLite at `memory/cortex.sqlite` (WAL). Optional Chroma index. Every brain call flows through `cortex.build_system_prompt`. After each turn, extraction writes facts / prospective / emotion nudges (fail-soft). Nightly consolidation: `python -m cortex.dreaming`.
-
-Optional Mem0 cloud mirror when `MEM0_API_KEY` is set (`python -m cortex.sync_mem0`). Private facts never leave the machine.
-
-### Affect
-
-- `persona.py` — Pleasure–Arousal–Dominance mood with decay; `JARVIS_SARCASM=playful|sharp|savage`
-- `perception.py` — frustration / gratitude / banter cues; distress suppresses sarcasm
-- `ambient.py` — local time, IP geo (or `JARVIS_HOME_CITY`), Open-Meteo weather  
-  Kill switch: `JARVIS_EMOTION=0`
-
-### Memory hub
-
-`memory_mcp.py` exposes cortex over MCP so other clients can share the same store. Cortex stays authoritative — MCP is an adapter, not a second brain.
-
-### Pentest (experimental)
-
-| Rule | Behaviour |
-| --- | --- |
-| Recon | Passive only — any target |
-| Attack | Refused unless target is in `memory/jarvis_scope.json` |
-
-Requires **Docker Desktop running** and image `jarvis-recon:latest`:
-
-```bash
-docker build -t jarvis-recon:latest -f docker/jarvis-recon/Dockerfile docker/jarvis-recon
+  U->>FE: text / mic
+  FE->>API: WebSocket action:command
+  API->>C: build_system_prompt (+ skills catalog)
+  API->>G: choose rung
+  G->>B: chat (+ tool schemas)
+  B->>T: tool calls
+  T-->>B: observations
+  B-->>API: answer
+  API->>FE: tokens / state / TTS
+  API->>C: record_turn (async extract)
 ```
 
-Image includes dig, curl, subfinder, httpx, nmap, ffuf, nuclei, sqlmap. Override with `JARVIS_KALI_IMAGE=...`.
+**Port contract:** in `desktop:dev`, Vite proxies `/api` and `/ws` to `http://127.0.0.1:${JARVIS_PORT||8000}`. The backend must listen on that same port. Desktop mode does **not** silently bind a different free port when the preferred port is taken — otherwise the UI and API would disagree about where the backend lives.
 
----
+### How a session feels
 
-## Decks
+1. Electron starts (or you run `api.py` alone) and the UI connects over WebSocket.
+2. You type a command or say the wake word, then speak.
+3. Cortex builds a system prompt (persona, ambient context, recalled facts/episodes, skills catalog).
+4. The governor picks a model rung; the brain may call tools (desktop, browse, memory, skills, …).
+5. The reply streams back to the deck and optionally speaks via Edge TTS; the turn is recorded for later recall.
 
-| Preset | Role |
-| --- | --- |
-| `prime` | Default Airbus-inspired HUD |
-| `overhaul` | Command Deck (amber ops) |
-| `focus` | Minimal |
-| `terminal` | Console |
-| `chat` | Conversation-first |
-
----
-
-## Layout
-
-```
-jarv1s/
-├── api.py              # FastAPI, WS, agent loops, tools, voice
-├── governor.py         # Compute-elastic routing
-├── cortex/             # Cognitive memory
-├── persona.py · perception.py · ambient.py
-├── desktop.py · pentest.py · subagents.py
-├── electron/           # Desktop shell + encrypted keys
-├── src/decks/          # React UIs
-├── docker/jarvis-recon/
-├── requirements.txt · package.json · .env.example
-└── README.md
-```
-
-Runtime data (`memory/`, `.env`, overheard logs) is **not** committed.
+That loop is the product. The install commands below only get you into it.
 
 ---
 
 ## Requirements
 
-- Windows 10/11 (desktop paths are Windows-first)
-- Python 3.10+ · Node 20+
-- At least one brain: `GROQ_API_KEY`, `ANTHROPIC_API_KEY`, or Ollama with a tool-capable model
-- Optional: Docker Desktop (pentest), Chrome (browse), Mem0
+| Need | Detail |
+| --- | --- |
+| OS | **Windows 10/11** recommended (desktop + Electron `desktop:dev` script uses `set …`) |
+| Python | **3.10+** with a project **`./venv`** |
+| Node.js | **20+** (Vite 7 / Electron in `package.json`) |
+| Brain (at least one) | `GROQ_API_KEY` and/or `ANTHROPIC_API_KEY` and/or **Ollama** with a tool-capable model |
+| Disk / RAM | Local Whisper and Chroma can use significant RAM; a machine with adequate free memory is recommended |
+
+**Optional**
+
+| Feature | Extra requirement |
+| --- | --- |
+| Richer semantic memory | Ollama + `nomic-embed-text` (else WordHash fallback) |
+| Local rungs | Ollama + a chat model (e.g. `qwen2.5:7b`) |
+| `browse` | Google Chrome; optional `JARVIS_BH_*` / `JARVIS_CHROME` |
+| Pentest tools | Docker Desktop **running** + built `jarvis-recon:latest` |
+| Mem0 mirror | `MEM0_API_KEY` + `mem0ai` (already in `requirements.txt`) |
 
 ---
 
-## Setup
+## Fresh install (exact steps)
 
-**Friends / fresh clone — do all of these before `desktop:dev` or the app will look “broken”:**
+This section is the mechanical install path. If you have not read [What this project is](#what-this-project-is), start there — JARVIS is an Electron + Python agent, not a single CLI binary.
 
-```bash
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-copy .env.example .env          # set GROQ_API_KEY=...
-npm install
-# optional: ollama pull qwen2.5:7b
-# optional: ollama pull nomic-embed-text
+Complete every step before launching. A missing `./venv` or a busy port `8000` will prevent a normal boot.
+
+### 1. Clone
+
+```bat
+git clone https://github.com/roshansrikanth21/jarv1s.git
+cd jarv1s
 ```
 
-Then `npm run desktop:dev`. Electron **requires** `./venv` (or `JARVIS_PYTHON`). It will not silently use a bare global `python` that is missing FastAPI.
+### 2. Python virtualenv (required by Electron)
 
-**Port rule:** backend and Vite must share `JARVIS_PORT` (default `8000`). If Docker (or anything) holds 8000, free it or set the same `JARVIS_PORT` for both processes. Desktop mode refuses silent port remapping — that used to leave a live Electron shell with a dead API.
+Electron will **not** fall back to a bare global `python` / `py`. It looks for `.\venv\Scripts\python.exe`, or `JARVIS_PYTHON`.
 
-Keys can also be stored encrypted via **Settings** in the Electron app.
+```bat
+python -m venv venv
+venv\Scripts\pip install --upgrade pip
+venv\Scripts\pip install -r requirements.txt
+```
 
-### Hermes skills
+### 3. Environment file
 
-Procedural playbooks live under `skills/*/SKILL.md` (agentskills.io-style). The model sees names + descriptions in the system prompt and loads full steps via `use_skill`. Override root with absolute `JARVIS_SKILLS_DIR`.
+```bat
+copy .env.example .env
+```
+
+Edit `.env` and set at least:
+
+```env
+GROQ_API_KEY=gsk_...
+```
+
+(Or use Anthropic / Ollama instead — see [Configuration](#configuration).)
+
+### 4. Node dependencies
+
+```bat
+npm install
+```
+
+### 5. Free the backend port (or set one)
+
+Default backend + Vite proxy port is **8000**.
+
+- If Docker Desktop, WSL, or another app owns 8000, either free it, **or** set the **same** value everywhere:
+
+```bat
+set JARVIS_PORT=8010
+```
+
+Then start Vite/Electron with that variable still set in the same terminal (see below).
+
+### 6. Start the desktop app (preferred)
+
+```bat
+npm run desktop:dev
+```
+
+What this does (`package.json`):
+
+1. Sets `JARVIS_USE_VITE=1`
+2. Starts Vite on `127.0.0.1:8080`
+3. Starts Electron, which spawns `venv\Scripts\python.exe api.py` with `JARVIS_DESKTOP=1` and `JARVIS_PORT` (default 8000)
+4. Loads the UI from `http://127.0.0.1:8080` (proxied `/api` + `/ws` → backend)
+
+### 7. First-run in the UI
+
+1. Open **Settings** (gear) if you prefer OS-encrypted keys instead of `.env`
+2. Confirm the status / mic indicators respond (backend returns `"app": "jarvis"` on `/api/agent/status`)
+3. Send a short text command (e.g. ask the time) before relying on voice
+
+### Optional after first boot
+
+```bat
+ollama pull qwen2.5:7b
+ollama pull nomic-embed-text
+```
+
+```bat
+docker build -t jarvis-recon:latest -f docker/jarvis-recon/Dockerfile docker/jarvis-recon
+```
+
 ---
 
-## Run
+## Running
 
-| Command | What |
+| Command | What it does |
 | --- | --- |
-| `npm run desktop:dev` | **Preferred** — Vite + Electron; backend auto-spawned |
-| `npm run desktop` | Build SPA + Electron |
-| `python api.py` | Backend only (`:8000`) |
-| `npm run dev` | Frontend only (proxies to `:8000`) |
-| `npm run typecheck` / `npm run lint` / `npm run test:e2e` | Checks |
+| `npm run desktop:dev` | **Preferred for development** — Vite `:8080` + Electron; backend auto-spawned from `./venv` |
+| `npm run electron:dev` | Alias of `desktop:dev` |
+| `npm run desktop` | `vite build` then Electron (UI served from backend when `dist` is present) |
+| `npm run desktop:fast` | Electron only (expects a backend already available / previous build) |
+| `venv\Scripts\python.exe api.py` | Backend only (default `http://127.0.0.1:8000`) |
+| `npm run dev` | Frontend only; proxies `/api` + `/ws` to `JARVIS_PORT` (default 8000) — start `api.py` yourself |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run lint` | ESLint |
+| `npm run test:e2e` | Playwright smoke (`e2e/smoke.spec.ts`) |
+| `npm run test:kernel` | Python unit tests for the `jarvis/` kernel |
+| `npm run audit:local` | Offline/runtime audit (copies harness into gitignored `.local/` first) |
+
+Without any cloud key **and** without Ollama models, the process can still boot, but chat will report what’s missing rather than invent capability.
+
+---
+
+## Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Electron shows “backend failed to boot” / no `./venv` | Fresh clone without venv | Run the [venv steps](#2-python-virtualenv-required-by-electron) |
+| UI loads but API/WS never connect | Port split (8000 busy / remapped) or wrong `JARVIS_PORT` | Free 8000, **or** set the same `JARVIS_PORT` for backend and Vite; desktop mode refuses silent remapping |
+| `/api/agent/status` is 404 on 8000 | Another process (e.g. WSL/Docker relay) owns the port | Stop that process or set `JARVIS_PORT`; Electron only reuses a backend that returns `"app": "jarvis"` |
+| Import errors / missing `yaml` | Incomplete pip install | `venv\Scripts\pip install -r requirements.txt` (`PyYAML` is listed explicitly) |
+| Voice / STT silent | No mic permission; missing `faster-whisper` and no Groq | Install requirements; set `GROQ_API_KEY` for cloud STT fallback |
+| `browse` fails | Chrome / harness path | Install Chrome; set `JARVIS_CHROME` / `JARVIS_BH_CLI` if needed (see `.env.example`) |
+| Pentest says Docker unavailable | Engine down or image missing | Start Docker Desktop; build `jarvis-recon:latest` |
+| Second Electron window does nothing | Single-instance lock | Focus the existing window |
 
 ---
 
 ## Configuration
 
+Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example`):
+
 | Variable | Role |
 | --- | --- |
-| `GROQ_MODEL` / `JARVIS_SUBAGENT_MODEL` | Primary vs sub-agent models |
-| `JARVIS_TTS_VOICE` / `JARVIS_WAKE_WORDS` | Speech / wake |
-| `JARVIS_EMOTION` / `JARVIS_SARCASM` | Affect |
+| `GROQ_API_KEY` | Primary cloud brain / Whisper / vision (OpenAI-compatible Groq API) |
+| `ANTHROPIC_API_KEY` | Optional Claude path |
+| `GROQ_MODEL` | Default model id (code default: `llama-3.3-70b-versatile` if unset) |
+| `JARVIS_SUBAGENT_MODEL` | Smaller/faster model for `spawn_agents` |
+| `JARVIS_TTS_VOICE` / voice via Settings | Edge neural voices |
+| `JARVIS_WAKE_WORDS` / `JARVIS_WAKE_REQUIRED` | Wake gate |
+| `JARVIS_ALWAYS_LISTEN` | Start mic when a client connects |
+| `JARVIS_EMOTION` / `JARVIS_SARCASM` | Affect layer (`0` disables emotion) |
 | `JARVIS_HOME_CITY` | Pin ambient location |
-| `JARVIS_SHELL_APPROVAL` | Confirm before shell tools (`1` recommended) |
-| `JARVIS_WS_PORTS` / `JARVIS_WS_ALLOW_ALL` | WS origin lockdown |
-| `JARVIS_BROWSE_ALLOWLIST` | Optional browse hosts |
-| `JARVIS_MEMORY_TOKEN` | Bearer for memory hub (blank = loopback only) |
+| `JARVIS_SHELL_APPROVAL` / `JARVIS_APPROVAL_TOOLS` | UI confirm before privileged tools (default includes `run_command`) |
+| `JARVIS_WS_PORTS` / `JARVIS_WS_ALLOW_ALL` | WebSocket Origin policy |
+| `JARVIS_BROWSE_ALLOWLIST` | Optional host allowlist for browse |
+| `JARVIS_MEMORY_TOKEN` | Bearer for memory hub HTTP; blank = loopback-oriented use |
+| `JARVIS_PYTHON` | Explicit Python for Electron if `./venv` is absent |
+| `JARVIS_PORT` | Backend bind + Vite proxy target (must match in `desktop:dev`) |
+| `JARVIS_ALLOW_PORT_FALLBACK` | Allow bind on a free port when preferred is busy (**off** for typical desktop/Vite) |
+| `JARVIS_SKILLS_DIR` | Override skills root (absolute path preferred) |
 | `JARVIS_KALI_IMAGE` | Override pentest container image |
-| `MEM0_*` | Optional cloud memory mirror |
+| `JARVIS_CHROME` / `JARVIS_BH_*` | Browser automation paths |
+| `MEM0_API_KEY` / `MEM0_USER_ID` / `JARVIS_MEM0_WRITETHROUGH` | Optional cloud memory mirror |
 
-See `.env.example` for the full list.
+In the Electron app, **Settings** can store `GROQ` / `ANTHROPIC` / `MEM0` keys via OS `safeStorage` and inject them when spawning the backend.
 
 ---
 
-## Security
+## User interfaces
 
-- Shell, desktop, and browse are privileged. WebSocket rejects non-local Origins by default.
-- Mutating HTTP requires a trusted local Origin port (`JARVIS_WS_PORTS`) or loopback.
-- Browse blocks private/loopback targets after DNS (rebinding defense).
-- Treat page text / search results as untrusted model input (prompt-injection surface still hardening).
-- API keys in `.env` or Electron `safeStorage` only — never in git.
+Five decks share one backend. The switcher persists `jarvis_ui_preset` in `localStorage` (`src/routes/index.tsx`). Legacy `classic` maps to Command Deck.
+
+| Preset id | Label | Role |
+| --- | --- | --- |
+| `prime` | Prime | Default HUD |
+| `overhaul` | Command Deck | Amber ops deck |
+| `focus` | Focus | Minimal |
+| `terminal` | Terminal | Console-oriented |
+| `chat` | Chat | Conversation-first |
+
+Shared chrome includes Settings, Live Ops, and window controls.
+
+---
+
+## Tools
+
+Registered agent tools (names as in `api.py` `TOOLS`):
+
+| Tool | Purpose |
+| --- | --- |
+| `remember` / `recall_memory` | Write / read durable knowledge |
+| `search_web` | Web search |
+| `browse` | Structured browser automation |
+| `get_system_info` | Host stats |
+| `launch_app` | App launch (allowlisted) |
+| `desktop` | OS actions |
+| `spawn_agents` | Parallel read-only specialists |
+| `add_task` / `complete_task` | Task list |
+| `capture_screen` / `analyze_image` / `watch_video` | Vision |
+| `run_command` | Privileged shell (approval-gated by default) |
+| `ict_scan` / `open_trading` | Markets / external terminal hook |
+| `calculate` / `get_weather` | Utilities |
+| `use_skill` / `create_skill` | Load / author on-disk skill playbooks |
+| `recon` / `pentest` / `bugbounty` / `report` / `scope` | Research / engagement |
+
+HTTP helpers include `/api/agent/status` (includes `"app": "jarvis"`), `/api/settings`, `/api/skills`, and memory hub routes under `/api/memory/*` (see `routers/rest.py`).
+
+---
+
+## Skills
+
+Skills are **procedural playbooks** stored on disk so the agent can reuse a known procedure instead of improvising every time. Each skill is a folder under `skills/<slug>/` containing a `SKILL.md` file: YAML frontmatter (`name`, `description`) plus a markdown body of steps. Discovery is handled by `skills.py`; the default root is `<repo>/skills`.
+
+At prompt time the model only sees a short `[SKILLS]` catalog (names + descriptions). When a task fits, it calls `use_skill` to load the full instructions. `create_skill` can write new playbooks; bundled seed slugs are protected from overwrite unless forced in code.
+
+Bundled seeds in this repository:
+
+- `deep-web-research`
+- `market-brief`
+- `system-triage`
+
+Override the skills directory with an absolute `JARVIS_SKILLS_DIR` if needed.
+
+---
+
+## Optional: Docker pentest image
+
+Active scanning tools run in throwaway containers. Build:
+
+```bat
+docker build -t jarvis-recon:latest -f docker/jarvis-recon/Dockerfile docker/jarvis-recon
+```
+
+Requires Docker Desktop **engine running** (CLI alone is not enough). Override image name with `JARVIS_KALI_IMAGE`.
+
+Scope allowlist for active attacks: `memory/jarvis_scope.json` (gitignored).
+
+> Note: `docker/jarvis-recon.Dockerfile` (alternate) expects a `kali-mcp` base image — use the `docker/jarvis-recon/Dockerfile` path above for a self-contained build.
+
+---
+
+## Repository layout
+
+```
+jarv1s/
+├── api.py                 # FastAPI app, WebSocket, agent loops, tools, voice
+├── governor.py            # Compute-elastic routing + bandit
+├── device.py              # Embodiment / energy sensing
+├── cortex/                # Cognitive memory (SQLite, vectors, dreaming, Mem0 sync)
+├── skills.py              # Skill discovery / catalog / create
+├── skills/                # Seed SKILL.md playbooks
+├── persona.py · perception.py · ambient.py
+├── subagents.py · desktop.py · pentest.py · memory_mcp.py
+├── jarvis/                # Kernel packages (memory, policy, router, events, telemetry)
+├── tests/                 # Python unit tests (`npm run test:kernel`)
+├── docs/ARCHITECTURE_V2.md
+├── routers/rest.py        # HTTP routes registered on the FastAPI app
+├── electron/main.js       # Desktop shell, venv spawn, safeStorage keys
+├── src/decks/             # prime · overhaul · focus · terminal · chat
+├── src/hooks/useJarvisSocket.ts
+├── docker/jarvis-recon/   # Recommended pentest image Dockerfile
+├── e2e/                   # Playwright smoke
+├── requirements.txt
+├── package.json
+├── .env.example
+└── README.md
+```
+
+Runtime data (not committed): `memory/`, `.env`, overheard logs, `uploads/`, `venv/`, `node_modules/`, `.local/` (machine-local audits & scratch).
+
+---
+
+## Development checks
+
+```bat
+npm run typecheck
+npm run lint
+npm run test:e2e
+npm run test:kernel
+npm run audit:local
+```
+
+Copy or keep a machine-local audit harness under `.local/` (gitignored). Unit tests under `tests/` are what CI/devs should rely on.
+CI (`.github/workflows/ci.yml`) runs typecheck, lint, and Playwright on push/PR (npm 10 + Node 22 on `windows-latest`).
+
+---
+
+## Security notes
+
+- The agent can run shell commands, drive the desktop, and browse. Treat it as **local trusted-user software**.
+- WebSocket rejects non-local Origins by default (`JARVIS_WS_ALLOW_ALL=1` disables that — unsafe).
+- Mutating HTTP requires a trusted local Origin port (`JARVIS_WS_PORTS`, default includes `8000,8080,5173,4173`) or a loopback client.
+- Browse blocks private/loopback targets after DNS (rebinding defense). Optional host allowlist: `JARVIS_BROWSE_ALLOWLIST`.
+- Page text / search results are untrusted model input (prompt-injection surface still hardening in beta).
+- API keys belong in `.env` or Electron `safeStorage` — never in git.
 - Pentest scope files and overheard transcripts stay under gitignored `memory/`.
+- Skill bodies are playbook text; treat third-party `SKILL.md` files as untrusted procedures.
 
 ---
 
 ## License
 
-Personal / research **beta**. APIs may change. Prefer issues/PRs with reproduction steps.
+Personal / research **beta**. Behaviour and APIs may change. Prefer issues/PRs with reproduction steps (OS, Node/Python versions, whether `./venv` exists, and what owns port 8000).
+
+---
 
 *JARVIS — beta. Minimum cognition. Maximum presence.*

@@ -14,6 +14,8 @@
     "format": "prettier --write .",
     "test:e2e": "playwright test",
     "test:e2e:ui": "playwright test --ui",
+    "test:kernel": "venv\\Scripts\\python.exe -m unittest discover -s tests -v",
+    "audit:local": "venv\\Scripts\\python.exe .local\\audit_runtime.py",
     "desktop": "npm run build && electron .",
     "desktop:fast": "electron .",
     "desktop:dev": "set JARVIS_USE_VITE=1&& concurrently \"npm run dev -- --host 127.0.0.1 --port 8080\" \"wait-on http://127.0.0.1:8080 && electron .\"",

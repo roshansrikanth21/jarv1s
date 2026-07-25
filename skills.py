@@ -1,8 +1,8 @@
-"""Hermes-style skills — procedural memory as on-disk skill folders.
+"""Skills — procedural memory as on-disk skill folders.
 
-Modelled on the Hermes / agentskills.io standard: a *skill* is a directory under the
-skills root holding a ``SKILL.md`` with YAML frontmatter (``name``, ``description``)
-and a markdown body of step-by-step instructions.
+A *skill* is a directory under the skills root holding a ``SKILL.md`` with YAML
+frontmatter (``name``, ``description``) and a markdown body of step-by-step
+instructions.
 
 Progressive disclosure: the system prompt carries only names + descriptions; the full
 body is pulled on demand via ``use_skill``. Skill bodies are treated as untrusted

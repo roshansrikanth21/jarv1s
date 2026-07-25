@@ -179,8 +179,8 @@ function resolvePythonPath() {
       : path.join(root, "venv", "bin", "python");
 
   // Prefer an explicit override, then the in-repo venv. Do NOT fall through to bare
-  // `py`/`python` — friends' global Python lacks FastAPI and the backend "boots" into a
-  // crash loop that looks like a mysterious Electron failure.
+  // `py`/`python` — a system interpreter often lacks FastAPI and other project deps,
+  // which surfaces as a failed backend boot in Electron.
   const override = process.env.JARVIS_PYTHON;
   if (override) {
     if (

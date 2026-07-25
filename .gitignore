@@ -10,7 +10,7 @@ release/
 uploads/
 
 # Ambient speech log — everything the mic overheard (private, never commit)
-memory/jarvis_overheard.json
+/memory/jarvis_overheard.json
 
 # Python
 __pycache__/
@@ -23,8 +23,8 @@ venv/
 # Secrets
 .env
 
-# JARVIS runtime data
-memory/
+# JARVIS runtime data (repo-root data dir only — not jarvis/memory/ package)
+/memory/
 *.log
 .jarvis_run.log
 
@@ -46,6 +46,9 @@ graphify-out/
 scratch_*.png
 scratch_*.log
 debug-*.log
+
+# Machine-local audit runs, agent scratch, import profiles (never commit)
+.local/
 
 # Local editor / agent settings (machine-specific)
 .claude/settings.local.json

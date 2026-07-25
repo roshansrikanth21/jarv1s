@@ -12,7 +12,6 @@ import atexit
 import base64
 import importlib.util
 import io
-import ipaddress
 import json
 import logging
 import os
@@ -71,6 +70,14 @@ import system_monitor
 import web_search as websearch_mod
 
 import cortex
+from jarvis.memory.dialogue import DialogueStore
+from jarvis.policy.shell import check_command as _policy_check_command
+from jarvis.policy.browse import check_url as _policy_check_browse_url
+from jarvis.policy.desktop import desktop_risk as _desktop_risk
+from jarvis.cognition.router import plan_from_governor, provider_for_rung, health as _router_health
+from jarvis.events.bus import bus as _event_bus
+from jarvis.platform import telemetry as _telemetry
+from jarvis.session.state import SessionState, WorkflowPhase
 
 logging.basicConfig(
     level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
@@ -242,6 +249,15 @@ _pending_approvals: dict[str, tuple[asyncio.Event, list]] = {}
 
 CONV_TURNS = 8   # how many past messages (user+assistant) to keep as context
 
+# Short-term dialogue window — SQLite is authoritative (one-shot import from legacy JSON).
+_dialogue = DialogueStore(
+    BASE_DIR / "memory" / "dialogue.sqlite",
+    window=CONV_TURNS,
+    legacy_json=HISTORY_FILE,
+    emit_events=False,  # api emits MemoryUpdated after cortex write
+)
+_session = SessionState(session_id="local")
+
 # Mixture-of-Agents: a panel of different models answers independently, then an
 # aggregator reconciles them into one decision. Triggered on demand (see TRIGGERS).
 MOA_PROPOSERS = [m.strip() for m in os.environ.get(
@@ -396,7 +412,8 @@ _turn_generation = 0          # bumped on every new dispatch; lets a barged-in t
                                # thread (which asyncio.to_thread cannot forcibly stop)
                                # notice it's stale and quiet down instead of surfacing
                                # results/progress for a turn that's no longer current
-_history: list[dict] = []     # rolling conversation turns for multi-turn context
+# Rolling dialogue is owned by `_dialogue` (SQLite). Prefer `_history_messages()` /
+# `_dialogue.turn_seq` — module aliases below stay for routers/legacy reads.
 _tts_voice = TTS_VOICE        # runtime-selectable voice (changed via set_voice)
 _watch_task = None            # background ICT watcher task
 _watching = False
@@ -407,8 +424,7 @@ _ICT_CACHE_MAX = 32
 _ICT_CACHE_TTL_SEC = 30
 _last_device: dict = {}       # most-recent device profile (drives homeostasis)
 _last_activity = time.time()  # for the idle "sleep" trigger
-_turn_seq = 0                   # monotonic completed exchanges (not capped like _history)
-_last_consolidated_turn = 0     # _turn_seq at last consolidation
+_last_consolidated_turn = 0     # dialogue.turn_seq at last consolidation
 _last_decision: dict | None = None   # last Governor decision (for escalation signal)
 _sleep_task = None            # background consolidation ("sleep") loop
 _sleeping = False
@@ -517,7 +533,23 @@ def _save_memory(mems: list[dict]) -> None:
 
 
 def _save_history() -> None:
-    _save_json(HISTORY_FILE, _history)
+    """No-op: dialogue window persists via DialogueStore (SQLite). Kept for call-site compat."""
+    return
+
+
+def _history_messages() -> list[dict]:
+    return _dialogue.messages()
+
+
+# Back-compat aliases — routers and older code read these; they are refreshed on mutate.
+_history: list[dict] = _dialogue.messages()
+_turn_seq: int = _dialogue.turn_seq
+
+
+def _refresh_history_aliases() -> None:
+    global _history, _turn_seq
+    _history = _dialogue.messages()
+    _turn_seq = _dialogue.turn_seq
 
 
 def _save_tasks() -> None:
@@ -545,8 +577,7 @@ def _user_name() -> str:
 memories  = _load_memory()
 task_list = _load_json(TASKS_FILE, [])
 _overheard = _load_json(OVERHEARD_FILE, [])[-OVERHEARD_MAX:]
-_history  = _load_json(HISTORY_FILE, [])[-CONV_TURNS:]
-_turn_seq = len(_history) // 2
+_refresh_history_aliases()
 _settings = _load_json(SETTINGS_FILE, {})
 _gov = governor.GovernorState(_load_json(GOVERNOR_FILE, {}))
 _persona = persona_mod.Persona.load(PERSONA_FILE)
@@ -1481,15 +1512,7 @@ _TOOL_REQUIRED: dict[str, list[str]] = {
     for t in TOOLS
 }
 
-# Shell safety: block destructive / chained commands the LLM might suggest.
-_CMD_BLOCK_RE = re.compile(
-    r"(?:^|\s)(?:rm\s+-rf|del(?:ete)?\s+|erase\s+|remove-item\b|"
-    r"format\s+|shutdown|reboot|mkfs|diskpart|"
-    r"reg\s+delete|curl\s+.+\|\s*(?:ba)?sh|(?:powershell|pwsh)\s+-(?:e|enc|encodedcommand)\b|"
-    r"invoke-expression|iex\s|wget\s+.+\|\s*sh)",
-    re.I,
-)
-_CMD_META_RE = re.compile(r"[;&|`>]|(?:\$\()")
+# Shell safety lives in jarvis.policy.shell — see _command_allowed().
 
 # Each desktop sub-action reads ONE primary arg under this name. Used to repair calls where
 # the model passed {"<sub-action>": value} instead of {"action":"<sub-action>", "<arg>":value}.
@@ -1546,16 +1569,7 @@ def _validate_tool_args(name: str, args: dict) -> str | None:
 
 
 def _command_allowed(cmd: str) -> str | None:
-    c = cmd.strip()
-    if not c:
-        return "run_command needs a non-empty command string."
-    if _CMD_BLOCK_RE.search(c):
-        return "Command blocked for safety."
-    if _CMD_META_RE.search(c):
-        return "Shell chaining and redirection are blocked — one simple command only."
-    if len(c) > 500:
-        return "Command too long (500 char max)."
-    return None
+    return _policy_check_command(cmd)
 
 # Anthropic tool format (input_schema instead of parameters)
 CLAUDE_TOOLS = [
@@ -1578,71 +1592,16 @@ def _cdp_up() -> bool:
         return False
 
 
-# The dedicated-profile Chrome WE launch (never a foreign one). Tracked so we can kill it.
-_bh_chrome_proc = None   # subprocess.Popen | None
-
-_BROWSE_BLOCK_SCHEMES = {"file", "about", "data", "javascript", "chrome", "chrome-extension",
-                         "view-source", "ftp", "blob", "ws", "wss"}
-
-
-def _ip_unsafe(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    """True for addresses that must never be reachable via browse (SSRF / metadata)."""
-    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
-        ip = ip.ipv4_mapped
-    return bool(
-        ip.is_loopback or ip.is_private or ip.is_link_local
-        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-    )
+# Browse SSRF policy lives in jarvis.policy.browse.
 
 
 def _browse_allowed(url: str) -> str | None:
-    """Gate a navigation URL: http/https only, never loopback/private/link-local hosts (SSRF
-    against the user's own machine, incl. the JARVIS backend), plus an optional host
-    allowlist. Hostnames are DNS-resolved so rebinding to 127.0.0.1/RFC1918 is blocked.
-    Returns an error string, or None if the URL is allowed."""
-    u = (url or "").strip()
-    if not u:
-        return "navigate needs a 'url'."
-    try:
-        parsed = urllib.parse.urlparse(u)
-    except Exception:
-        return f"Could not parse URL: {url!r}"
-    scheme = (parsed.scheme or "").lower()
-    if scheme in _BROWSE_BLOCK_SCHEMES:
-        return f"Blocked URL scheme '{scheme}:' for safety."
-    if scheme not in ("http", "https"):
-        return "Only http:// and https:// URLs can be browsed."
-    host = (parsed.hostname or "").lower()
-    if not host:
-        return "URL has no host."
-    if host == "localhost" or host.endswith(".localhost") or host == "localhost.localdomain":
-        return "Blocked navigation to localhost."
-    # Cloud / link-local metadata hostnames even when they somehow resolve publicly.
-    if host in {"metadata.google.internal", "metadata", "kubernetes.default",
-                "kubernetes.default.svc"}:
-        return "Blocked navigation to a metadata endpoint."
-    try:
-        ip = ipaddress.ip_address(host)
-        if _ip_unsafe(ip):
-            return "Blocked navigation to a private/loopback address."
-    except ValueError:
-        # Hostname — resolve and reject if ANY A/AAAA is private/loopback (DNS rebinding).
-        try:
-            infos = socket.getaddrinfo(host, None)
-        except socket.gaierror:
-            return f"Could not resolve '{host}' for browse safety check."
-        for info in infos:
-            addr = info[4][0]
-            try:
-                resolved = ipaddress.ip_address(addr)
-            except ValueError:
-                continue
-            if _ip_unsafe(resolved):
-                return ("Blocked navigation to a host that resolves to a "
-                        "private/loopback address.")
-    if BH_ALLOWLIST and not any(host == a or host.endswith("." + a) for a in BH_ALLOWLIST):
-        return f"'{host}' is not in the browse allowlist (JARVIS_BROWSE_ALLOWLIST)."
-    return None
+    """Gate a navigation URL via the kernel browse policy."""
+    return _policy_check_browse_url(url, allowlist=BH_ALLOWLIST)
+
+
+# The dedicated-profile Chrome WE launch (never a foreign one). Tracked so we can kill it.
+_bh_chrome_proc = None   # subprocess.Popen | None
 
 
 # Common web-app shortcuts — `{"op": "open_app", "app": "whatsapp"}` resolves to a full URL
@@ -2385,7 +2344,17 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         # (e.g. {"open_path": "C:\\…"}) instead of {"action":"open_path","path":"C:\\…"},
         # which would fail with "unknown action ''". Normalize that shape back.
         args = _normalize_desktop_args(args)
-        return desktop.run(str(args.get("action") or ""), args)
+        action = str(args.get("action") or "")
+        try:
+            _event_bus.emit(
+                "ToolCalled",
+                tool="desktop",
+                action=action,
+                risk=_desktop_risk(action),
+            )
+        except Exception:
+            pass
+        return desktop.run(action, args)
 
     if name == "add_task":
         task = {
@@ -3471,13 +3440,14 @@ def _salvage_text_toolcall(text: str):
 def _record_turn(user: str, assistant: str) -> None:
     """Keep a short rolling window of the conversation for multi-turn context, AND
     persist the exchange to cortex (episode + fire-and-forget extraction)."""
-    global _history, _turn_seq
-    _turn_seq += 1
-    _history = (_history + [
-        {"role": "user", "content": user},
-        {"role": "assistant", "content": assistant},
-    ])[-CONV_TURNS:]
-    _save_history()
+    global _last_activity
+    _dialogue.append(user, assistant)
+    _refresh_history_aliases()
+    _last_activity = time.time()
+    try:
+        _event_bus.emit("MemoryUpdated", kind="dialogue", turn_seq=_dialogue.turn_seq)
+    except Exception:
+        pass
     # Cortex write: never blocks the reply, never raises. Runs on the event loop as a
     # scheduled task so extraction can await router calls.
     try:
@@ -3826,13 +3796,14 @@ _REASK_RE = re.compile(r"\b(no,|that'?s wrong|try again|not what|rephrase|wrong 
 async def _run_rung(rung: str, text: str, dev: dict, decision: dict) -> str:
     """Run one lattice rung and return its answer. `council` is handled separately in
     _run_agent (it emits + records itself)."""
+    hist = _history_messages()
     if rung == "cloud_deep":
-        return await _brain_claude(text, list(_history), decision=decision, device=dev)
+        return await _brain_claude(text, hist, decision=decision, device=dev)
     if rung == "cloud_fast":
-        return await _brain_groq(text, list(_history), decision=decision, device=dev)
+        return await _brain_groq(text, hist, decision=decision, device=dev)
     if rung == "local_deep":
-        return await _brain_ollama(text, list(_history), LOCAL_DEEP, decision=decision, device=dev)
-    return await _brain_ollama(text, list(_history), LOCAL_FAST, decision=decision, device=dev)
+        return await _brain_ollama(text, hist, LOCAL_DEEP, decision=decision, device=dev)
+    return await _brain_ollama(text, hist, LOCAL_FAST, decision=decision, device=dev)
 
 
 def _fallback_rung(failed: str, avail: set[str]) -> str | None:
@@ -3873,13 +3844,14 @@ async def _run_agent(text: str) -> None:
     picks the cheapest brain that clears the difficulty bar within the current
     energy/latency budget, escalating only when the task is hard or the machine is
     healthy — then observes the outcome to adapt the policy to this machine."""
-    global _history, _last_device, _turn_seq, _last_consolidated_turn
+    global _last_device, _last_consolidated_turn
 
     if text.strip().lower().rstrip(".!") in RESET_PHRASES:
-        _history = []
-        _turn_seq = 0
+        _dialogue.clear()
+        _refresh_history_aliases()
         _last_consolidated_turn = 0
-        _save_history()
+        _session.reset_orchestration()
+        _session.workflow = WorkflowPhase.IDLE
         await _emit_final("Done — clean slate. What's on your mind?")
         return
 
@@ -3905,7 +3877,7 @@ async def _run_agent(text: str) -> None:
         })
 
     did = f"d{int(time.time() * 1000)}"
-    decision = governor.decide(text, list(_history), dev, avail, _gov, did)
+    decision = governor.decide(text, _history_messages(), dev, avail, _gov, did)
     if decision["rung"] not in avail:
         mode_hint = " Switch Governor mode to auto/cloud, or start Ollama for local."
         if _gov.mode == "local":
@@ -3913,33 +3885,53 @@ async def _run_agent(text: str) -> None:
         await _emit_final(f"No brain available for {_gov.mode} mode.{mode_hint}")
         return
 
-    # Tool-intent guard: an action/data request must land on a tool-capable brain. The council
-    # has no tools and local models fumble tool-calls, so routing there = guaranteed
-    # hallucination. Force such requests onto cloud tools first, else the best local rung.
-    if _needs_tools(text):
-        tool_rungs = [r for r in ("cloud_fast", "cloud_deep", "local_deep", "local_fast") if r in avail]
-        if tool_rungs and decision["rung"] not in tool_rungs:
-            decision = {**decision, "rung": tool_rungs[0],
-                        "rationale": "forced to a tool-capable brain — request needs a tool; council/other has none"}
+    tools_needed = _needs_tools(text)
+    plan = plan_from_governor(decision, avail, tools_needed=tools_needed)
+    decision = {**decision, "rung": plan.rung, "rationale": plan.rationale or decision.get("rationale")}
+    _session.workflow = WorkflowPhase.THINKING
+    _session.current_goal = (text or "")[:240] or None
+    try:
+        _event_bus.emit(
+            "TaskCreated",
+            decision_id=did,
+            rung=plan.rung,
+            provider=plan.provider,
+            tools_needed=tools_needed,
+        )
+    except Exception:
+        pass
 
     await broadcast({"type": "governor_decision",
                      "decision": _public_decision(decision),
                      "homeostasis": _homeostasis(dev), "device": _device_brief(dev)})
 
-    rung = decision["rung"]
+    rung = plan.rung
     t0 = time.time()
 
     if rung == "council":
         try:
             await _deliberate(text)                 # emits + records itself
             _observe(decision, time.time() - t0, accepted=True)
+            _router_health().mark("council", ok=True, latency_s=time.time() - t0)
+            _telemetry.record_turn(
+                decision_id=did, rung=rung, provider="council",
+                latency_s=time.time() - t0, ok=True,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await _emit_final(f"The council couldn't convene ({exc}). Try again, or switch mode in Settings.")
             _observe(decision, time.time() - t0, accepted=False)
+            _router_health().mark("council", ok=False, latency_s=time.time() - t0)
+            _telemetry.record_turn(
+                decision_id=did, rung=rung, provider="council",
+                latency_s=time.time() - t0, ok=False,
+            )
+        finally:
+            _session.workflow = WorkflowPhase.IDLE
         return
 
+    _session.workflow = WorkflowPhase.ACTING
     answer = ""
     try:
         answer = (await _run_rung(rung, text, dev, decision) or "").strip()
@@ -3949,12 +3941,10 @@ async def _run_agent(text: str) -> None:
         logging.getLogger("jarvis").warning("rung %s failed: %s: %s", rung, type(exc).__name__, exc)
         answer = ""
 
-    # Escalation-on-failure: the lattice exists so a task that stumps the cheap rung can climb
-    # it. If the chosen rung produced nothing (error or empty), try one better available rung
-    # before giving up — instead of handing the user a dead-end "that rung failed".
+    # Escalation-on-failure: prefer health-ordered fallbacks from the router plan.
     escalated = False
     if not answer:
-        fb = _fallback_rung(rung, avail)
+        fb = next((r for r in plan.fallbacks if r in avail), None) or _fallback_rung(rung, avail)
         if fb:
             escalated = True
             await broadcast({"type": "system",
@@ -3971,10 +3961,22 @@ async def _run_agent(text: str) -> None:
                 rung = fb                            # the rung that actually answered
 
     latency = time.time() - t0
+    provider = provider_for_rung(rung)
     if not answer:
         await _emit_final("I couldn't get a usable response that time — try rephrasing, "
                           "or wait a moment if the model is busy.")
         _observe(decision, latency, accepted=False, escalated=escalated)
+        _router_health().mark(provider, ok=False, latency_s=latency)
+        _telemetry.record_turn(
+            decision_id=did, rung=rung, provider=provider,
+            latency_s=latency, ok=False, escalated=escalated,
+            prompt_chars=len(text or ""),
+        )
+        try:
+            _event_bus.emit("LLMResponded", ok=False, rung=rung, provider=provider)
+        except Exception:
+            pass
+        _session.workflow = WorkflowPhase.IDLE
         return
 
     await _emit_final(answer)
@@ -3982,6 +3984,20 @@ async def _run_agent(text: str) -> None:
     # Credit the chosen rung only if IT answered; if we had to escalate, mark it escalated so
     # the bandit learns this rung was inadequate for this kind of request.
     _observe(decision, latency, accepted=not escalated, escalated=escalated)
+    _router_health().mark(provider, ok=True, latency_s=latency)
+    _telemetry.record_turn(
+        decision_id=did, rung=rung, provider=provider,
+        latency_s=latency, ok=True, escalated=escalated,
+        prompt_chars=len(text or ""), answer_chars=len(answer or ""),
+    )
+    try:
+        _event_bus.emit(
+            "LLMResponded", ok=True, rung=rung, provider=provider, latency_s=latency,
+        )
+        _event_bus.emit("TaskCompleted", decision_id=did, rung=rung)
+    except Exception:
+        pass
+    _session.workflow = WorkflowPhase.IDLE
 
     if rung in ("local_fast", "local_deep") and (dev.get("ram_percent") or 0) >= OLLAMA_RELEASE_RAM_PCT:
         used = LOCAL_DEEP if rung == "local_deep" else LOCAL_FAST

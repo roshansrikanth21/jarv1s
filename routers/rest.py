@@ -62,7 +62,8 @@ def register(app: FastAPI) -> None:
                 "max_agent_steps":      8,
             },
             "conversation": {
-                "turns": len(core._history) // 2,
+                "turns": int(getattr(core._dialogue, "turn_seq", 0) or 0),
+                "window": len(core._history_messages()) if hasattr(core, "_history_messages") else len(getattr(core, "_history", []) or []),
             },
             "council": {
                 "panel": [_short_model(m) for m in core.MOA_PROPOSERS],
@@ -493,6 +494,29 @@ def register(app: FastAPI) -> None:
             "model":    _active_model(),
             "time":     datetime.now().isoformat(),
             "memories": core.cortex.stats().get("facts", 0),
+            "kernel": {
+                "dialogue": core._dialogue.stats() if hasattr(core, "_dialogue") else {},
+                "workflow": (
+                    getattr(getattr(core, "_session", None), "workflow", None).value
+                    if getattr(getattr(core, "_session", None), "workflow", None) is not None
+                    else "idle"
+                ),
+            },
         }
+
+    @app.get("/api/metrics")
+    async def metrics() -> dict:
+        """Turn latency / provider health — local desktop only."""
+        try:
+            from jarvis.platform import telemetry
+            from jarvis.cognition.router import health as router_health
+            return {
+                "app": "jarvis",
+                "turns": telemetry.summary(),
+                "recent": telemetry.recent(20),
+                "providers": router_health().snapshot(),
+            }
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
 
 
