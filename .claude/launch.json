@@ -13,6 +13,36 @@
       "runtimeArgs": ["run", "dev", "--", "--host", "127.0.0.1", "--port", "8090"],
       "port": 8090,
       "autoPort": false
+    },
+    {
+      "name": "blog",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["C:/Users/rosha/Desktop/blog/serve.js"],
+      "port": 4321
+    },
+    {
+      "name": "pramaan-ui",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "C:/Users/rosha/jarvis/C-Shield-audit"
+      ],
+      "port": 5173,
+      "autoPort": false
+    },
+    {
+      "name": "pramaan-ui-fix",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--prefix",
+        "C:/Users/rosha/AppData/Local/Temp/claude/C--Users-rosha-jarvis/074d419b-17d4-41c7-bf9e-7fb1bfc01ef7/scratchpad/pramaan-fix"
+      ],
+      "port": 5173,
+      "autoPort": false
     }
   ]
 }
