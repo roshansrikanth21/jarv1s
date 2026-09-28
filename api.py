@@ -22,6 +22,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -116,6 +117,10 @@ _ENV_FORCE = {
     "JARVIS_WS_ALLOW_ALL",
     "JARVIS_WS_PORTS",
 }
+# Values displaced by an .env override. An override is only a *preference*: if the .env key turns
+# out to be stale/revoked, the displaced (app-injected) key is still a working fallback, so it is
+# kept in the rotation pool instead of being thrown away (see GROQ_API_KEYS below).
+_OVERRIDDEN_ENV: dict[str, str] = {}
 if _env_file.exists():
     # utf-8-sig strips a Windows/PowerShell BOM so "GROQ_API_KEY" isn't read as "\ufeffGROQ_API_KEY".
     for _line in _env_file.read_text(encoding="utf-8-sig").splitlines():
@@ -129,6 +134,9 @@ if _env_file.exists():
             if _k in _ENV_FORCE:
                 os.environ[_k] = _v          # security toggles: .env always wins
             elif _k in _ENV_OVERRIDE and _v:
+                _prior = os.environ.get(_k, "")
+                if _prior and _prior != _v:
+                    _OVERRIDDEN_ENV[_k] = _prior      # keep the displaced key as a fallback
                 os.environ[_k] = _v          # explicit .env value wins over a stale injected key
             else:
                 os.environ.setdefault(_k, _v)
@@ -161,22 +169,60 @@ def _anthropic():
 # one, JARVIS auto-rotates to the next on a rate-limit or auth failure — so when a free-tier
 # key exhausts its daily/minute quota, the next key picks up seamlessly instead of the brain
 # going dead. Add keys any time by editing .env: GROQ_API_KEY=gsk_aaa,gsk_bbb,gsk_ccc
-GROQ_API_KEYS   = [k for k in re.split(r"[,\s]+", os.environ.get("GROQ_API_KEY", "").strip()) if k]
+def _split_keys(raw: str) -> list[str]:
+    return [k for k in re.split(r"[,\s]+", (raw or "").strip()) if k]
+
+
+# Pool order: the preferred (.env / current env) key(s) first, then any key the .env override
+# displaced (the app-injected one) — de-duplicated. So a stale key in EITHER place can't leave
+# JARVIS without a brain as long as the other one works.
+GROQ_API_KEYS   = list(dict.fromkeys(
+    _split_keys(os.environ.get("GROQ_API_KEY", "")) + _split_keys(_OVERRIDDEN_ENV.get("GROQ_API_KEY", ""))))
 _groq_key_idx   = 0
 GROQ_API_KEY    = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+_groq_bad_keys: set[str] = set()      # keys Groq rejected (401/403) this session — never picked again
+_groq_key_alert: str | None = None    # shown to a UI client on connect (startup check may run pre-connect)
 
 
 def _rotate_groq_key(reason: str = "") -> bool:
-    """Advance to the next configured Groq key (wrapping). Mutates the module-global
-    GROQ_API_KEY so every subsequent client picks up the new key. Returns True if it actually
-    switched (i.e. more than one key is configured)."""
+    """Advance to the next usable Groq key (wrapping), skipping keys already known to be
+    rejected. Mutates the module-global GROQ_API_KEY so every subsequent client picks up the new
+    key. Returns True only if it actually switched to a different, not-known-bad key."""
     global _groq_key_idx, GROQ_API_KEY
-    if len(GROQ_API_KEYS) <= 1:
+    n = len(GROQ_API_KEYS)
+    if n <= 1:
         return False
-    _groq_key_idx = (_groq_key_idx + 1) % len(GROQ_API_KEYS)
-    GROQ_API_KEY = GROQ_API_KEYS[_groq_key_idx]
-    log.warning("Groq key rotated to #%d/%d (%s)", _groq_key_idx + 1, len(GROQ_API_KEYS), reason or "failover")
-    return True
+    for step in range(1, n):
+        cand = (_groq_key_idx + step) % n
+        if GROQ_API_KEYS[cand] not in _groq_bad_keys:
+            _groq_key_idx = cand
+            GROQ_API_KEY = GROQ_API_KEYS[cand]
+            log.warning("Groq key rotated to #%d/%d (%s)", cand + 1, n, reason or "failover")
+            return True
+    return False
+
+
+def _groq_key_rejected() -> bool:
+    """The current key got a 401/403: remember it as bad, then move to the next usable one.
+    Returns True if another usable key exists."""
+    _groq_bad_keys.add(GROQ_API_KEY)
+    return _rotate_groq_key("auth failure")
+
+
+def _probe_groq_key(key: str) -> str:
+    """'valid' | 'invalid' | 'unknown' via Groq's free GET /models (consumes no tokens).
+    'unknown' (offline, 429, 5xx) must never mark a key bad."""
+    req = urllib.request.Request("https://api.groq.com/openai/v1/models",
+                                 headers={"Authorization": f"Bearer {key}", "User-Agent": "jarvis/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as r:
+            return "valid" if r.status == 200 else "unknown"
+    except urllib.error.HTTPError as exc:
+        return "invalid" if exc.code in (401, 403) else "unknown"
+    except Exception:
+        return "unknown"
+
+
 # Cloud model tiers (Groq). Everyday chat must NOT default to a 120B *reasoning* model:
 # reasoning emits a large hidden token stream that (a) overruns max_tokens (the "max
 # completion tokens reached" JSON failures) and (b) exhausts the free tier in a handful of
@@ -393,6 +439,7 @@ async def _lifespan(app: FastAPI):
     # Background tasks (don't block serving): hardware probe, sleep cycle, ambient,
     # monitor, proactive silence-break.
     _boot_task = asyncio.create_task(_boot_probe())
+    asyncio.create_task(_groq_key_healthcheck())          # heal a stale key before the first turn
     _sleep_task = asyncio.create_task(_sleep_loop())
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
@@ -842,6 +889,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Tell this client the real mic state up front so its UI doesn't guess (a fresh client
     # showing "tap to speak" while the mic is already hot under ALWAYS_LISTEN was the desync).
     await websocket.send_json({"type": "mic", "listening": _listening})
+    if _groq_key_alert:
+        await websocket.send_json({"type": "system", "text": _groq_key_alert})
     _maybe_run_briefing()
     # Always-on ears: start listening the moment a client is present (no button press).
     # The wake-word gate means it still only responds when addressed as "jarvis".
@@ -3539,6 +3588,48 @@ def _groq_model_for(decision: dict, use_tools: bool) -> str:
     return GROQ_MODEL
 
 
+async def _groq_auth_dead_end() -> str:
+    """Every configured Groq key has been rejected (401/403). If a local model exists, return ""
+    so the caller's escalation falls back to it — a dead cloud key must never leave JARVIS mute
+    when Ollama is sitting right there. Otherwise tell the user exactly how to fix it."""
+    if _LOCAL_OK and (LOCAL_DEEP or LOCAL_FAST):
+        await broadcast({"type": "system", "text":
+                         "Groq rejected the API key — using the local model. "
+                         "Update the key in Settings or .env to bring cloud back."})
+        return ""
+    return ("Groq rejected the API key (401 Unauthorized) and no local model is available. "
+            "Add a valid key in Settings (or .env) and restart.")
+
+
+async def _groq_key_healthcheck() -> None:
+    """Startup, off the boot path: probe every configured Groq key (free GET /models) and switch
+    to a working one BEFORE the user's first message — so a stale key in .env or the app store is
+    healed silently instead of failing the first turn. If none work, record an alert that every
+    UI client sees on connect. Offline / rate-limited probes are 'unknown' and never mark a key bad."""
+    global _groq_key_idx, GROQ_API_KEY, _groq_key_alert
+    if not GROQ_API_KEYS:
+        return
+    statuses = await asyncio.to_thread(lambda: [_probe_groq_key(k) for k in GROQ_API_KEYS])
+    for k, st in zip(GROQ_API_KEYS, statuses):
+        if st == "invalid":
+            _groq_bad_keys.add(k)
+    if not _groq_bad_keys:
+        return
+    good = next((k for k, st in zip(GROQ_API_KEYS, statuses) if st == "valid"), None)
+    if good and GROQ_API_KEY in _groq_bad_keys:
+        _groq_key_idx, GROQ_API_KEY = GROQ_API_KEYS.index(good), good
+        log.warning("Groq: the preferred key was rejected at startup — switched to a working key.")
+        _groq_key_alert = ("A stale Groq API key was found (in .env or Settings) — JARVIS switched to "
+                           "your working one. Remove the dead key to silence this.")
+    elif good is None and all(st != "unknown" for st in statuses):
+        log.warning("Groq: every configured API key was rejected at startup.")
+        _groq_key_alert = ("Groq rejected every configured API key — the cloud brain is offline"
+                           + (" (local model will answer)." if (_LOCAL_OK and (LOCAL_DEEP or LOCAL_FAST)) else ".")
+                           + " Add a valid key in Settings or .env.")
+    if _groq_key_alert:
+        await broadcast({"type": "system", "text": _groq_key_alert})
+
+
 async def _brain_groq(text: str, history: list[dict], *, decision: dict, device: dict) -> str:
     """Primary brain — streams text, runs tools, returns the final answer. The
     shared wrapper (_run_agent) handles emit, fillers, history, and recording."""
@@ -3568,14 +3659,12 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools,
                                                           model=model, tools=tool_subset)
         except _openai_mod.AuthenticationError:
-            if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat auth failure"):
-                keys_tried += 1
+            if _groq_key_rejected():          # remembers the bad key, moves to the next usable one
                 client = _openai().AsyncOpenAI(
                     api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
                     timeout=GROQ_TIMEOUT, max_retries=0)
                 continue
-            return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
-                    "in Settings (Electron) or `.env`, then restart the backend.")
+            return await _groq_auth_dead_end()
         except _openai_mod.RateLimitError:
             # This key is throttled/exhausted — swap to the next configured key and retry the
             # round. Only after every key has been tried do we give up on Groq.
@@ -3596,14 +3685,12 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
         except _openai_mod.APIError as exc:
             status = getattr(exc, "status_code", None)
             if status in (401, 403):
-                if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat auth failure"):
-                    keys_tried += 1
+                if _groq_key_rejected():
                     client = _openai().AsyncOpenAI(
                         api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
                         timeout=GROQ_TIMEOUT, max_retries=0)
                     continue
-                return ("Groq auth failed — the API key looks invalid or revoked. "
-                        "Update GROQ_API_KEY and restart.")
+                return await _groq_auth_dead_end()
             # Groq free tier often returns 413 for TPM (tokens/min), not 429 RateLimitError.
             if status in (413, 429):
                 return ("Groq rate/token limit hit (HTTP "
