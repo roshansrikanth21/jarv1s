@@ -22,7 +22,14 @@ $ErrorActionPreference = 'Continue'
 # -- 1. paths ----------------------------------------------------------------------
 $Repo    = if ($env:NS_REPO)  { $env:NS_REPO }  else { Split-Path -Parent $PSScriptRoot }  # jarvis repo root
 $NsDir   = Join-Path $Repo 'nightshift'
-$Python  = if ($env:NS_PYTHON) { $env:NS_PYTHON } else { 'C:\Users\rosha\venv\Scripts\python.exe' }
+# Python: NS_PYTHON override, else this repo's own venv (the standard install), else a venv one
+# level up, else whatever `python` is on PATH. Never a hardcoded per-user path.
+$Python  = if ($env:NS_PYTHON) { $env:NS_PYTHON } else {
+  $cand = @((Join-Path $Repo 'venv\Scripts\python.exe'),
+            (Join-Path (Split-Path -Parent $Repo) 'venv\Scripts\python.exe')) |
+          Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($cand) { $cand } else { (Get-Command python -ErrorAction SilentlyContinue).Source }
+}
 # Find the claude CLI: NS_CLAUDE override, then PATH, then the known install locations. Task
 # Scheduler runs with a minimal PATH, so an explicit fallback is what makes this fire unattended.
 $Claude = $env:NS_CLAUDE

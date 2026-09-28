@@ -37,7 +37,8 @@ Based on Doby Lanete's "The Night Shift" blueprint, adapted for Windows + this r
 ## Requirements
 - The `claude` CLI, logged in via your **subscription** (not an API key). Auto-detected at
   `~/.local/bin/claude.exe` or npm-global; override with `NS_CLAUDE`.
-- Python at `C:\Users\rosha\venv\Scripts\python.exe` (override with `NS_PYTHON`).
+- Python: auto-detected — this repo's `venv\Scripts\python.exe`, else a `venv` one folder up, else
+  `python` on PATH (override with `NS_PYTHON`).
 - A machine that stays on (or is allowed to wake) overnight.
 
 ## ⚠️ Autonomy / permission mode — decide this before the first night

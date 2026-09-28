@@ -17,7 +17,18 @@ param([switch]$Remove)
 
 $ErrorActionPreference = 'Stop'
 $NsDir  = $PSScriptRoot
-$Python = if ($env:NS_PYTHON) { $env:NS_PYTHON } else { 'C:\Users\rosha\venv\Scripts\python.exe' }
+# Python: NS_PYTHON override, else this repo's own venv, else a venv one level up, else PATH.
+# Never a hardcoded per-user path (the scheduled task would silently fail on any other machine).
+$Repo   = Split-Path -Parent $NsDir
+$Python = if ($env:NS_PYTHON) { $env:NS_PYTHON } else {
+  $cand = @((Join-Path $Repo 'venv\Scripts\python.exe'),
+            (Join-Path (Split-Path -Parent $Repo) 'venv\Scripts\python.exe')) |
+          Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($cand) { $cand } else { (Get-Command python -ErrorAction SilentlyContinue).Source }
+}
+if (-not $Remove -and -not ($Python -and (Test-Path $Python))) {
+  throw "No Python found for the report task. Create ./venv or set NS_PYTHON to a python.exe."
+}
 $RunTask    = 'JarvisNightShift'
 $ReportTask = 'JarvisNightShiftReport'
 
