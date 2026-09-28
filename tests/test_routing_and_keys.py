@@ -172,5 +172,94 @@ class GroqKeyHealth(unittest.TestCase):
         self.assertIsNone(api._groq_key_alert)
 
 
+class _FakeSD:
+    """Scripted stand-in for `sounddevice`: each device is 'live', 'silent' (flat, but with a loud
+    pop on open — the exact trap that fooled a peak-based check), or 'error'."""
+
+    def __init__(self, devices, behavior, default):
+        import types
+        self._devices = devices
+        self.behavior = behavior
+        self.default = types.SimpleNamespace(device=(default, -1))
+        self.opened = []
+
+    def query_devices(self, idx=None):
+        return self._devices if idx is None else self._devices[idx]
+
+    def query_hostapis(self):
+        return [{"name": "MME"}, {"name": "Windows WDM-KS"}]
+
+    def sleep(self, ms):
+        pass
+
+    def InputStream(self, device, samplerate, channels, dtype, blocksize, callback):
+        import numpy as np
+        fake, kind = self, self.behavior[device]
+
+        class _Ctx:
+            def __enter__(s):
+                fake.opened.append(device)
+                if kind == "error":
+                    raise OSError("PaErrorCode -9999")
+                n = 4096
+                if kind == "live":
+                    data = (np.random.RandomState(1).randint(-40, 41, size=(n, channels))).astype("int16")
+                else:                                   # silent: flat zeros + one loud pop on open
+                    data = np.zeros((n, channels), dtype="int16")
+                    data[0, :] = 20000
+                callback(data, n, None, None)
+                return s
+
+            def __exit__(s, *a):
+                return False
+        return _Ctx()
+
+
+def _dev(name, hostapi=0, ch=1):
+    return {"name": name, "max_input_channels": ch, "default_samplerate": 16000, "hostapi": hostapi}
+
+
+class MicPicker(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import api
+        cls.pick = staticmethod(api._pick_input_device)
+
+    def test_live_default_is_used_without_probing_others(self):
+        sd = _FakeSD([_dev("Mic A"), _dev("Mic B")], {0: "live", 1: "live"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 0)
+        self.assertEqual(set(sd.opened), {0})
+
+    def test_silent_default_yields_to_a_live_device_even_with_an_open_pop(self):
+        # Windows opens a privacy-blocked/muted mic "successfully" and streams silence. The pop
+        # on open must not be mistaken for signal (peak is 20000; the stream is flat).
+        sd = _FakeSD([_dev("Mic Array"), _dev("Other Mic", 1)], {0: "silent", 1: "live"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 1)
+
+    def test_everything_silent_keeps_the_users_default(self):
+        sd = _FakeSD([_dev("Mic Array"), _dev("Other Mic", 1)], {0: "silent", 1: "silent"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 0)
+
+    def test_loopback_is_never_chosen_as_a_microphone(self):
+        # Stereo Mix carries system audio: picking it makes JARVIS hear (and trigger on) itself.
+        sd = _FakeSD([_dev("Mic Array"), _dev("Stereo Mix (Realtek)", 1)],
+                     {0: "silent", 1: "live"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 0)
+        self.assertNotIn(1, sd.opened)
+
+    def test_speaker_monitor_is_never_chosen_either(self):
+        sd = _FakeSD([_dev("Mic Array"), _dev("PC Speaker (Realtek output)", 1)],
+                     {0: "silent", 1: "live"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 0)
+
+    def test_default_that_fails_to_open_falls_back_to_a_live_mic(self):
+        sd = _FakeSD([_dev("Mic Array"), _dev("Other Mic", 1)], {0: "error", 1: "live"}, default=0)
+        self.assertEqual(self.pick(sd)[0], 1)
+
+    def test_no_working_device_returns_none(self):
+        sd = _FakeSD([_dev("Mic Array")], {0: "error"}, default=0)
+        self.assertEqual(self.pick(sd), (None, None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

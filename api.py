@@ -5116,13 +5116,16 @@ def _pick_input_device(sd):
     discovered by probing the machine's own hardware, so it works across laptops/OSes:
 
       1. FIRST honor the OS default input device (the mic the user picked in Windows/macOS/
-         Linux). On the vast majority of machines this just opens and is used — respecting the
-         user's choice, and using shared-mode audio (no exclusive lock).
-      2. Only if the default can't be opened (e.g. the Intel Smart Sound array whose MME/
-         DirectSound default fails with a -9999 host error) do we fall back to probing every
-         input device — preferring WASAPI (modern, shared) then WDM-KS, skipping loopbacks/
-         speaker-mixes, trying mono then the device's native channel count, and preferring a
-         device that delivers NON-ZERO audio (so we don't grab a silent unplugged jack).
+         Linux) — but only if it actually delivers SIGNAL. "Opens without error" is not enough:
+         Windows returns pure digital silence (not an error) when a mic is privacy-blocked,
+         muted, or routed through a dead pin, so a default that streams silence is remembered
+         but not trusted while a live device exists.
+      2. If the default can't be opened (e.g. the Intel Smart Sound array whose MME/DirectSound
+         default fails with a -9999 host error) OR it is silent, probe every input device —
+         preferring WASAPI (modern, shared) then WDM-KS, skipping loopbacks/speaker-mixes,
+         trying mono then the device's native channel count, and taking the first that delivers
+         real signal. If EVERYTHING is silent (a genuinely quiet room / no mic), the user's
+         default is kept — we never override their choice without evidence.
 
     For each device we try 16 kHz first (no resampling for Whisper) then its native rate;
     Groq Whisper resamples on its end. Returns (None, None, None) if nothing works — the
@@ -5134,20 +5137,27 @@ def _pick_input_device(sd):
     except Exception:
         return None, None, None
 
+    LIVE_LEVEL = 1   # p90 |amp| must EXCEED this. A real mic's self-noise does; a blocked/muted
+    #                  stream is flat (~0-1) even when it emits a loud pop as it opens.
+
     def probe(dev, rate, ch):
-        """Open + capture ~0.2s. Returns mean amplitude (0 = streamed silence) or None on
-        error / no buffers delivered (some phantom devices open but never fire a callback)."""
+        """Open + capture ~0.25s. Returns the 90th-percentile |amplitude| — deliberately NOT the
+        peak: a dead stream often pops loudly on open (peak in the thousands) while staying
+        flat otherwise, and a percentile ignores that transient. <= LIVE_LEVEL means streamed
+        silence. Returns None on error / no buffers (phantom devices open but never call back)."""
         acc = []
         try:
             with sd.InputStream(device=dev, samplerate=rate, channels=ch, dtype="int16",
                                 blocksize=1024, callback=lambda indata, *a: acc.append(indata.copy())):
-                sd.sleep(200)
+                sd.sleep(250)
         except Exception:
             return None
         if not acc:
             return None
         try:
-            return int(np.abs(np.concatenate(acc)).mean())
+            a = np.abs(np.concatenate(acc).astype(np.int32)).reshape(-1)
+            a = a[len(a) // 5:]                       # drop the first 20%: open-time transients
+            return int(np.percentile(a, 90)) if len(a) else 0
         except Exception:
             return 0
 
@@ -5165,13 +5175,19 @@ def _pick_input_device(sd):
         default_in = sd.default.device[0]
     except Exception:
         default_in = -1
+    silent_default = None      # (idx, rate, ch) of a default that opened but delivered silence
     if isinstance(default_in, int) and default_in >= 0:
         try:
             di = sd.query_devices(default_in)
             if int(di.get("max_input_channels", 0) or 0) >= 1:
                 for rate, ch in configs(di):
-                    if probe(default_in, rate, ch) is not None:   # streams (even if silent) → trust it
-                        return default_in, rate, ch
+                    pk = probe(default_in, rate, ch)
+                    if pk is None:
+                        continue                                  # this format didn't open; try the next
+                    if pk > LIVE_LEVEL:
+                        return default_in, rate, ch               # default works — respect the user's choice
+                    silent_default = (default_in, rate, ch)       # opened, but silent: keep as last resort
+                    break
         except Exception:
             pass
 
@@ -5189,8 +5205,13 @@ def _pick_input_device(sd):
         if i == default_in or int(d.get("max_input_channels", 0) or 0) < 1:
             continue
         low = (d.get("name") or "").lower()
-        deprio = 1 if any(k in low for k in ("stereo mix", "sound mapper", "speaker",
-                                             "loopback", "what u hear")) else 0
+        # Loopback / speaker-monitor endpoints capture SYSTEM AUDIO, not a person. Choosing one as
+        # the "mic" makes JARVIS hear its own voice and whatever media is playing, then trigger on
+        # it — strictly worse than admitting there's no working mic. Never eligible.
+        if any(k in low for k in ("stereo mix", "loopback", "what u hear", "speaker", "wave out",
+                                  "monitor of")):
+            continue
+        deprio = 1 if "sound mapper" in low else 0     # legit alias of the default; just last
         candidates.append((deprio, host_rank(hostapis[d["hostapi"]]["name"]), i, d))
     candidates.sort(key=lambda t: (t[0], t[1], t[2]))
 
@@ -5204,10 +5225,12 @@ def _pick_input_device(sd):
                 break
         if not found:
             continue
-        if found[3] > 0:                     # live audio → best; use immediately
+        if found[3] > LIVE_LEVEL:             # live audio → best; use immediately
             return found[0], found[1], found[2]
         if fallback is None:
             fallback = found                 # keep the first streaming-but-silent device
+    if silent_default:                       # everything is silent: honor the user's own default
+        return silent_default
     if fallback:
         return fallback[0], fallback[1], fallback[2]
     return None, None, None
@@ -5434,6 +5457,9 @@ def _voice_worker() -> None:
             triggered = False
             voiced: list = []
             level_tick = 0
+            dead_frames = 0                           # consecutive digital-silence frames (~30 ms each)
+            dead_warned = False
+            DEAD_MIC_FRAMES = 300                     # ~9 s of nothing at all → say so, once
 
             while _listening:
                 try:
@@ -5468,6 +5494,19 @@ def _voice_worker() -> None:
                     leftover = leftover[FRAME:]
 
                     energy = int(np.abs(frame).mean())
+                    # A working mic always has a noise floor. Nine straight seconds of exact
+                    # digital silence means Windows is blocking/muting it (or the wrong device is
+                    # open) — say so once instead of failing silently like "voice just doesn't work".
+                    if energy <= 1:
+                        dead_frames += 1
+                        if dead_frames >= DEAD_MIC_FRAMES and not dead_warned:
+                            dead_warned = True
+                            broadcast_from_thread({"type": "system", "text":
+                                "The microphone is delivering only silence. Check Windows Settings → "
+                                "Privacy & security → Microphone (allow desktop apps), that it isn't "
+                                "muted, and that the right input device is selected."})
+                    else:
+                        dead_frames = 0
                     level_tick += 1
                     if level_tick % 6 == 0:          # ~every 180 ms: drives the orb + live meter
                         # `hearing` mirrors the VAD trigger so the UI lights up on real speech,
