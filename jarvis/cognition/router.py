@@ -104,14 +104,24 @@ def plan_from_governor(
 ) -> RoutePlan:
     """Build a RoutePlan from a Governor decision + availability mask."""
     rung = str(decision.get("rung") or "")
-    if tools_needed:
+    # Two misroutes to correct before running:
+    #  1. A request that needs a tool must land on a tool-capable brain (the council has none,
+    #     and small local models fumble tool-calls) — otherwise the answer is fabricated.
+    #  2. The council is a slow 3-model panel that gets neither tools NOR the ambient system
+    #     prompt, so it can't even answer "what's the time". An EXPLICIT "deliberate/debate"
+    #     request is handled upstream (handle_command) and never reaches the planner, so any
+    #     council decision arriving here is a Governor auto-pick — a misfire — and goes to a
+    #     fast brain instead. (If council is the only rung available, it stays.)
+    if tools_needed or rung == "council":
         tool_rungs = [r for r in ("cloud_fast", "cloud_deep", "local_deep", "local_fast") if r in avail]
         if tool_rungs and rung not in tool_rungs:
+            why = ("council auto-pick is slow and can't use tools/context" if rung == "council"
+                   else "request needs a tool")
             rung = tool_rungs[0]
             decision = {
                 **decision,
                 "rung": rung,
-                "rationale": "forced to a tool-capable brain — request needs a tool",
+                "rationale": f"routed to a fast tool-capable brain — {why}",
             }
     if rung not in avail and avail:
         # Prefer healthiest available non-council rung.

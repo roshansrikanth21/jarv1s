@@ -10,6 +10,7 @@ Run: python api.py
 import asyncio
 import atexit
 import base64
+import glob
 import importlib.util
 import io
 import json
@@ -96,7 +97,15 @@ PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
 MEMORY_FILE.parent.mkdir(exist_ok=True)
 TRADING_ROOT = Path(os.environ.get("C0MR4DES_DIR", str(BASE_DIR.parent / "c0mr4des_terminal")))
 
-# Load .env from repo root if present
+# Load .env from repo root if present.
+#
+# API-KEY PRECEDENCE: the Electron app injects keys from its encrypted store as env vars
+# BEFORE this runs, so a plain setdefault would let a STALE stored key shadow a fresh one the
+# user just typed into .env — the exact "I put a new key in but it still says limit reached"
+# trap. So for the known key vars, an explicitly-set .env value OVERRIDES the injected env
+# (editing .env is a deliberate, current action). Everything else keeps setdefault semantics
+# (real env still wins) so runtime overrides like JARVIS_PORT behave normally.
+_ENV_OVERRIDE = {"GROQ_API_KEY", "ANTHROPIC_API_KEY", "MEM0_API_KEY", "GROQ_MODEL"}
 _env_file = BASE_DIR / ".env"
 # Security toggles: an explicit .env value must win over ambient process env (e.g. a parent
 # shell that exported JARVIS_SHELL_APPROVAL=0 for selftests would otherwise silently disable
@@ -118,7 +127,9 @@ if _env_file.exists():
             if len(_v) >= 2 and _v[0] == _v[-1] and _v[0] in "\"'":
                 _v = _v[1:-1]
             if _k in _ENV_FORCE:
-                os.environ[_k] = _v
+                os.environ[_k] = _v          # security toggles: .env always wins
+            elif _k in _ENV_OVERRIDE and _v:
+                os.environ[_k] = _v          # explicit .env value wins over a stale injected key
             else:
                 os.environ.setdefault(_k, _v)
 
@@ -146,7 +157,26 @@ def _anthropic():
     return _AnthropicClient
 
 
-GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
+# GROQ_API_KEY may hold ONE key or SEVERAL (comma/space/newline-separated). With more than
+# one, JARVIS auto-rotates to the next on a rate-limit or auth failure — so when a free-tier
+# key exhausts its daily/minute quota, the next key picks up seamlessly instead of the brain
+# going dead. Add keys any time by editing .env: GROQ_API_KEY=gsk_aaa,gsk_bbb,gsk_ccc
+GROQ_API_KEYS   = [k for k in re.split(r"[,\s]+", os.environ.get("GROQ_API_KEY", "").strip()) if k]
+_groq_key_idx   = 0
+GROQ_API_KEY    = GROQ_API_KEYS[0] if GROQ_API_KEYS else ""
+
+
+def _rotate_groq_key(reason: str = "") -> bool:
+    """Advance to the next configured Groq key (wrapping). Mutates the module-global
+    GROQ_API_KEY so every subsequent client picks up the new key. Returns True if it actually
+    switched (i.e. more than one key is configured)."""
+    global _groq_key_idx, GROQ_API_KEY
+    if len(GROQ_API_KEYS) <= 1:
+        return False
+    _groq_key_idx = (_groq_key_idx + 1) % len(GROQ_API_KEYS)
+    GROQ_API_KEY = GROQ_API_KEYS[_groq_key_idx]
+    log.warning("Groq key rotated to #%d/%d (%s)", _groq_key_idx + 1, len(GROQ_API_KEYS), reason or "failover")
+    return True
 # Cloud model tiers (Groq). Everyday chat must NOT default to a 120B *reasoning* model:
 # reasoning emits a large hidden token stream that (a) overruns max_tokens (the "max
 # completion tokens reached" JSON failures) and (b) exhausts the free tier in a handful of
@@ -160,6 +190,11 @@ GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 # doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL.
 SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "llama-3.1-8b-instant")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
+# Free-tier tokens-per-minute ceiling for the chat model. The whole request (system +
+# history + tools schema) PLUS the completion must fit under this or Groq 413s the call —
+# which used to surface as an empty answer. We size max_tokens against it per round.
+# gpt-oss-120b on-demand = 8000 TPM; bump via env if you're on a paid tier.
+GROQ_TPM_CEILING = int(os.environ.get("JARVIS_GROQ_TPM", "8000"))
 GROQ_TIMEOUT    = float(os.environ.get("JARVIS_GROQ_TIMEOUT", "45"))   # hard cap so a slow/hung API never stalls the agent
 STT_MODEL       = os.environ.get("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 GROQ_VISION_MODEL = os.environ.get("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
@@ -401,6 +436,15 @@ _listening = False
 _awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _listen_thread: threading.Thread | None = None
 _voice_lock = threading.Lock() # serializes mic start/stop so they can't spawn two InputStreams
+# Whisper rate gate — a trigger-happy mic (noisy room / weak VAD) can fire dozens of
+# transcription calls a second, which 429s Groq's Whisper endpoint AND burns the shared
+# rate budget the chat model needs (surfacing as empty replies). This hard-caps the call
+# rate and backs off on 429 so the flood can never happen, whatever the mic does.
+_stt_lock = threading.Lock()
+_stt_last_ts = 0.0             # monotonic time of the last Whisper call
+_stt_backoff_until = 0.0       # skip transcription until this monotonic time (set on 429)
+STT_MIN_GAP = float(os.environ.get("JARVIS_STT_MIN_GAP", "0.6"))   # ≥ this many seconds between calls
+STT_BACKOFF = float(os.environ.get("JARVIS_STT_BACKOFF", "4.0"))   # cool-off after a rate-limit hit
 _tts_playing = False          # frontend reports the exact playback window
 _tts_ended_at = 0.0           # when playback last ended — mic stays muted a beat after, so the
                               # acoustic tail/reverb of JARVIS's own voice can't retrigger the VAD
@@ -947,43 +991,19 @@ TOOLS: list[dict] = [
         "function": {
             "name": "browse",
             "description": (
-                "Drive a REAL Chrome browser to open sites, read live page content, click, "
-                "type, and screenshot — for anything a plain web search can't do (interacting "
-                "with a page, reading JS-rendered content, multi-step navigation, driving web "
-                "apps like WhatsApp/Slack/Gmail). Provide an ordered list of `actions`; JARVIS "
-                "runs them in sequence and returns what each read/page_info produced.\n"
-                "Selector-based ops (when you know the CSS):\n"
-                "  {\"op\":\"navigate\",\"url\":\"https://…\"} — open/go to a URL (http/https only)\n"
-                "  {\"op\":\"read\",\"selector\":\"h3\"} — innerText of the first match "
-                "(omit selector to read the whole page)\n"
-                "  {\"op\":\"read_all\",\"selector\":\".titleline a\"} — innerText of EVERY match\n"
-                "  {\"op\":\"click\",\"selector\":\"button.login\"} — click the first match\n"
-                "  {\"op\":\"type\",\"selector\":\"input[name=q]\",\"text\":\"hello\"} — type into a field\n"
-                "  {\"op\":\"screenshot\"} — capture the viewport\n"
-                "  {\"op\":\"page_info\"} — return {url, title, …}\n"
-                "Text-based ops (when you DON'T have a stable CSS selector — the usual case in "
-                "modern web apps). These match visible text / aria-label / placeholder / title "
-                "case-insensitively; exact match preferred, substring fallback:\n"
-                "  {\"op\":\"find_text\",\"action\":\"click\",\"text\":\"Send\"} — click the first "
-                "visible element whose label is \"Send\"\n"
-                "  {\"op\":\"find_text\",\"action\":\"type\",\"text\":\"Type a message\","
-                "\"text2\":\"hey\"} — type \"hey\" into the field whose placeholder/label is "
-                "\"Type a message\" (handles React-controlled inputs + contenteditable)\n"
-                "  {\"op\":\"find_text\",\"action\":\"read\",\"text\":\"Roshan\"} — first visible "
-                "element containing \"Roshan\" (use to disambiguate contacts / search results)\n"
-                "  optional \"role\" narrows the search (e.g. role:\"button\")\n"
-                "Timing (web apps load asynchronously):\n"
-                "  {\"op\":\"wait_for_text\",\"text\":\"Chats\",\"timeout_ms\":5000} — poll until "
-                "the text appears (or timeout)\n"
-                "  {\"op\":\"wait_ms\",\"ms\":1500} — hard sleep\n"
-                "Shortcuts:\n"
-                "  {\"op\":\"open_app\",\"app\":\"whatsapp\"} — smart-open a known web app "
-                "(whatsapp/slack/discord/spotify/gmail/youtube/x/reddit/github/notion/…)\n"
-                "Example — send a WhatsApp message: [{\"op\":\"open_app\",\"app\":\"whatsapp\"},"
-                "{\"op\":\"wait_for_text\",\"text\":\"Chats\"},{\"op\":\"find_text\","
-                "\"action\":\"click\",\"text\":\"Roshan\"},{\"op\":\"find_text\",\"action\":"
-                "\"type\",\"text\":\"Type a message\",\"text2\":\"hey\"},{\"op\":\"find_text\","
-                "\"action\":\"click\",\"text\":\"Send\"}]"
+                "Drive a REAL Chrome browser to open sites, read live/JS-rendered content, "
+                "click, type, screenshot, and drive web apps (WhatsApp/Slack/Gmail) — for what "
+                "a plain web search can't do. Pass an ordered `actions` list of {op,…}:\n"
+                "navigate(url) · read(selector?) · read_all(selector) · click(selector) · "
+                "type(selector,text) · screenshot · page_info.\n"
+                "When you lack a stable CSS selector (usual in modern apps) use find_text, which "
+                "matches visible text/aria-label/placeholder case-insensitively: "
+                "find_text(action:click,text:'Send') · find_text(action:type,text:'Type a "
+                "message',text2:'hey') · find_text(action:read,text:'Roshan'); optional role: "
+                "narrows it. Timing: wait_for_text(text,timeout_ms) · wait_ms(ms). Shortcut: "
+                "open_app(app: whatsapp/slack/discord/spotify/gmail/youtube/x/github/notion/…).\n"
+                "Send a WhatsApp msg: [open_app whatsapp → wait_for_text 'Chats' → find_text "
+                "click 'Roshan' → find_text type 'Type a message'/'hey' → find_text click 'Send']."
             ),
             "parameters": {
                 "type": "object",
@@ -1039,29 +1059,19 @@ TOOLS: list[dict] = [
         "function": {
             "name": "pentest",
             "description": (
-                "ACTIVE security testing against a target, in an isolated Kali container. REFUSED "
-                "unless the target is in the authorized scope (labs, CTF/HTB, or a bug-bounty "
-                "program) — enforced, not advisory; authorize first with the `scope` tool.\n"
-                "tasks: ports (nmap) · probe (subfinder→httpx: which subdomains are LIVE + status "
-                "codes, 200=reachable) · urls (gau/waybackurls + katana crawl: harvest + JS URLs) · "
-                "candidates (gf: harvested URLs mapped to likely vuln classes — xss/sqli/lfi/ssrf/"
-                "redirect — the 'where to look' map) · js (extract endpoints from JavaScript) · "
-                "params (arjun) · asn (amass intel — related domains/seeds the org owns) · secrets "
-                "(grep harvested JS for leaked api keys/tokens) · dirs (ffuf content discovery) · "
-                "nuclei (templated CVE/misconfig "
-                "scan) · takeover (subdomain-takeover check across subdomains — high-value) · web "
-                "(nikto) · sqli (sqlmap) · xss (dalfox — CONFIRMS reflected/DOM XSS on "
-                "the candidates, with PoC) · scanall (enumerate ALL live subdomains → nuclei across "
-                "the whole attack surface; slow) · full · report (writes a Markdown assessment "
-                "from everything JARVIS has remembered about the target — no target tool needed).\n"
-                "SCOPE: only the ACTIVE tasks (ports/dirs/nuclei/web/sqli/xss/scanall/probe/urls/"
-                "candidates/js/full) need the target in scope. `report` reads memory and `recon` is "
-                "passive — call those for ANY target without scope. Don't refuse a report for scope; "
-                "just call it.\n"
-                "Efficient bug-bounty order — run ONE task at a time so each result guides the next, "
-                "reporting findings between steps: probe → ports → urls → candidates → js → nuclei → "
-                "targeted tests (sqli/params) on the candidates → finally `report`. Call the tool per "
-                "step (don't say you will — actually call it); report exactly what each returns."
+                "ACTIVE security testing in an isolated Kali container. REFUSED unless the target "
+                "is in authorized scope (labs, CTF/HTB, bug-bounty) — enforced; authorize via the "
+                "`scope` tool first.\n"
+                "tasks: ports(nmap) · probe(live subdomains + status) · urls(gau/katana harvest) · "
+                "candidates(gf vuln-class map: xss/sqli/lfi/ssrf/redirect) · js(endpoints from JS) · "
+                "params(arjun) · asn(amass intel) · secrets(leaked keys in JS) · dirs(ffuf) · "
+                "nuclei(CVE/misconfig) · takeover(subdomain takeover) · web(nikto) · sqli(sqlmap) · "
+                "xss(dalfox, confirms w/ PoC) · scanall(nuclei across all live subs; slow) · full · "
+                "report(Markdown assessment from memory — no scope needed).\n"
+                "Only ACTIVE tasks need scope; `report`/`recon` don't — call those for any target. "
+                "Efficient order, ONE task per call (report findings between): probe → ports → urls "
+                "→ candidates → js → nuclei → sqli/params on candidates → report. Actually call it "
+                "each step; report exactly what it returns."
             ),
             "parameters": {
                 "type": "object",
@@ -1187,61 +1197,23 @@ TOOLS: list[dict] = [
         "function": {
             "name": "desktop",
             "description": (
-                "Control the Windows desktop, hardware toggles, mouse/keyboard, "
-                "notifications, webcam, and installed packages. Use this instead of "
-                "`launch_app` for anything Windows-system-shaped.\n"
-                "Actions (pass one per call):\n"
-                "  open_path       — open a file/folder in Explorer. args: path\n"
-                "  open_settings   — open a Settings page. args: page  (apps, display, "
-                "network, sound, wifi, bluetooth, personalization, notifications, "
-                "startupapps, defaultapps, updates, storage, region, keyboard, mouse, …)\n"
-                "  open_control_panel — args: applet  (programs, network, sound, display, "
-                "mouse, keyboard, regional, power, firewall, datetime, system, fonts, "
-                "userpasswords)\n"
-                "  open_registry   — open regedit, optionally pre-navigated. args: key "
-                "(optional, e.g. 'HKCU\\\\Software\\\\Microsoft')\n"
-                "  open_component  — args: component  (task_manager, device_manager, "
-                "services, event_viewer, disk_management, resource_monitor, perfmon, "
-                "msconfig, cmd, powershell, gpedit, secpol, notepad, calc, screenshot)\n"
-                "  list_apps       — list installed packages via winget. args: filter\n"
-                "  uninstall_app   — uninstall via winget. args: app, confirm. REQUIRES "
-                "confirm=true to actually run — first call is a dry-run showing what "
-                "would be removed. If 2+ packages match, be more specific.\n"
-                "  system_volume   — args: action (up|down|mute|set), level (0-100 for set). "
-                "'set' is approximate.\n"
-                "  brightness      — args: action (up|down|set), level (0-100 for set). "
-                "WMI — works on laptop internal displays only.\n"
-                "  toggle_wifi     — args: state (on|off). Usually needs admin.\n"
-                "  mouse_click     — args: x, y, button (left|right|middle), clicks. "
-                "Absolute screen coords.\n"
-                "  mouse_move      — args: x, y, duration (0-3 seconds).\n"
-                "  mouse_scroll    — args: clicks (+up / -down, capped ±20).\n"
-                "  type_text       — args: text, confirm. Requires confirm=true for text "
-                ">60 chars or containing newlines/tabs. Preview the payload to the user "
-                "and get their yes before setting confirm.\n"
-                "  key_press       — args: keys ('enter' | 'esc' | 'f5' | 'ctrl+c' | "
-                "'cmd+shift+p'). Allowlisted: a-z, 0-9, named keys (enter/esc/tab/space/"
-                "backspace/delete/arrows/home/end/pageup/pagedown/f1-f24), modifiers "
-                "(ctrl/alt/shift/cmd/win).\n"
-                "  notify          — args: title, message, timeout (2-30s). Native OS toast.\n"
-                "  capture_webcam  — args: path (optional). Grabs one frame; returns file "
-                "path. Feed the path to `analyze_image` for vision reasoning.\n"
-                "  window_focus / window_minimize / window_maximize / window_restore / "
-                "window_close — args: title (substring, case-insensitive). Refuses if 0 "
-                "or 2+ windows match — surface the list to the user first.\n"
-                "  window_list     — enumerate visible windows so you can pick one.\n"
-                "  remind          — args: sub_action (schedule|list|cancel), when, "
-                "message, title. `when` accepts ISO ('2026-07-15T15:00'), 'in 5 minutes', "
-                "'tomorrow 9am', 'today 15:00', or 'HH:MM'. Uses OS-native scheduling "
-                "(Windows Task Scheduler) so the toast fires even if JARVIS is closed. "
-                "list returns pending reminders; cancel takes id from schedule/list.\n"
-                "YouTube/Spotify/Netflix playback control: use key_press with media "
-                "keys (playpause / nexttrack / prevtrack / stop / volumemute / volumeup "
-                "/ volumedown) — they work in any focused player.\n"
-                "Safety: destructive/irreversible actions (uninstall_app, long type_text) "
-                "MUST go through the confirm gate. Read-only / navigational actions "
-                "(open_*, list_apps, notify, capture_webcam, mouse_move, window_list, "
-                "remind list) don't."
+                "Control the Windows desktop — use instead of `launch_app` for anything "
+                "system-shaped. Pass one `action`; args noted:\n"
+                "open_path(path) · open_settings(page: apps/display/network/sound/wifi/"
+                "bluetooth/notifications/updates/storage/…) · open_control_panel(applet) · "
+                "open_registry(key?) · open_component(component: task_manager/device_manager/"
+                "services/event_viewer/cmd/powershell/notepad/calc/…) · list_apps(filter?) · "
+                "uninstall_app(app, confirm) — confirm=false is a dry-run; needs confirm=true "
+                "to run · system_volume(action up/down/mute/set, level) · brightness(action, "
+                "level) · toggle_wifi(state on/off) · mouse_click(x,y,button,clicks) · "
+                "mouse_move(x,y,duration) · mouse_scroll(clicks ±20) · type_text(text, confirm "
+                "— confirm=true if >60 chars) · key_press(keys e.g. 'enter'/'ctrl+c'; media "
+                "keys playpause/nexttrack/volumeup control any player) · notify(title,message,"
+                "timeout) · capture_webcam(path?) · window_focus/minimize/maximize/restore/"
+                "close(title) · window_list · remind(sub_action schedule/list/cancel, when, "
+                "message, title — when: ISO / 'in 5 minutes' / 'tomorrow 9am' / 'HH:MM', "
+                "OS-native so it fires even if JARVIS is closed).\n"
+                "Destructive actions (uninstall_app, long type_text) MUST use the confirm gate."
             ),
             "parameters": {
                 "type": "object",
@@ -1554,6 +1526,74 @@ _LAUNCH_ALLOWLIST = {
     "calculator": "calc.exe", "paint": "mspaint.exe",
     "obs": "obs64.exe", "steam": "steam.exe",
 }
+
+
+def _resolve_launch_target(cmd: str) -> str | None:
+    """Resolve an allowlisted exe to a launchable full path. A bare `Popen("spotify.exe")` only
+    searches PATH, which FAILS for apps that install to per-user dirs (Spotify, Discord). We
+    consult, in order: PATH, the Windows 'App Paths' registry (where most apps register their
+    exe), and a few known per-user locations. Returns a path/command to launch, or None if the
+    app can't be found anywhere (so the caller reports honestly instead of a silent no-op)."""
+    import shutil
+    if shutil.which(cmd):
+        return cmd
+    if os.name == "nt":
+        try:
+            import winreg
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{cmd}") as k:
+                        val, _ = winreg.QueryValueEx(k, None)
+                        if val and os.path.exists(val.strip('"')):
+                            return val.strip('"')
+                except FileNotFoundError:
+                    continue
+        except Exception:
+            pass
+        appdata = os.environ.get("APPDATA", "")
+        local = os.environ.get("LOCALAPPDATA", "")
+        known: dict[str, list[str]] = {
+            "spotify.exe": [os.path.join(appdata, "Spotify", "Spotify.exe")],
+            "discord.exe": sorted(glob.glob(os.path.join(local, "Discord", "app-*", "Discord.exe")), reverse=True),
+            "code": [os.path.join(local, "Programs", "Microsoft VS Code", "Code.exe")],
+            "steam.exe": [r"C:\Program Files (x86)\Steam\steam.exe"],
+        }
+        for p in known.get(cmd, []):
+            if p and os.path.exists(p):
+                return p
+        # Microsoft Store apps (e.g. Spotify from the Store) expose an execution-alias stub here;
+        # running the stub launches the packaged app. This one path covers most Store installs.
+        alias = os.path.join(local, "Microsoft", "WindowsApps", cmd)
+        if os.path.exists(alias):
+            return alias
+    return None
+
+
+def _launch_resolved(raw: str, cmd: str) -> str:
+    """Launch an allowlisted app, resolving per-user install paths first. Reports honestly:
+    only claims success when a process was actually started. Always an argv list with
+    shell=False — `cmd` only ever comes from _LAUNCH_ALLOWLIST, but there's no reason to
+    hand it to a shell."""
+    target = _resolve_launch_target(cmd)
+    # A console app (PowerShell) needs its OWN visible console; GUI apps need no flag. Never
+    # CREATE_NO_WINDOW here — it would launch an invisible terminal.
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if cmd.lower() == "powershell.exe" else 0
+    quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                 shell=False, creationflags=flags)
+    try:
+        if target:
+            subprocess.Popen([target], **quiet)
+            return f"Launched {raw}."
+        # Last resort: `start` uses ShellExecute, which is App-Paths-aware where a bare exec isn't.
+        if os.name == "nt":
+            rc = subprocess.run(["cmd", "/c", "start", "", cmd], capture_output=True, text=True)
+            if rc.returncode == 0:
+                return f"Launched {raw}."
+            return f"Couldn't find {raw} on this machine — it may not be installed."
+        subprocess.Popen([cmd], **quiet)
+        return f"Launched {raw}."
+    except Exception as exc:
+        return f"Failed to launch {raw}: {exc}"
 
 
 def _next_id(items: list[dict]) -> int:
@@ -2324,18 +2364,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         if not cmd:
             supported = ", ".join(sorted(_LAUNCH_ALLOWLIST))
             return f"Unknown app '{raw}'. Supported: {supported}"
-        try:
-            # argv list — never shell=True. Allowlist entries are fixed binaries/names.
-            subprocess.Popen(
-                [cmd],
-                shell=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            return f"Launched {raw}."
-        except Exception as exc:
-            return f"Failed to launch {raw}: {exc}"
+        return _launch_resolved(raw, cmd)
 
     if name == "desktop":
         # Windows-system-shaped ops: Explorer paths, Settings pages, Control Panel,
@@ -3089,10 +3118,16 @@ def _build_system_prompt(query: str = "") -> str:
     nm = _user_name() or "the user"
     base = _BASE_PROMPT.replace("__USER__", nm)
 
+    # An explicit, authoritative clock line so the model NEVER refuses "what's the time" — it
+    # has this; the softer ambient line alone made it hedge ("I can't tell the time").
+    _now = datetime.now().strftime("%A, %B %-d %Y, %-I:%M %p") if os.name != "nt" \
+        else datetime.now().strftime("%A, %B %d %Y, %I:%M %p")
+    time_line = (f"Right now it is {_now} (local, authoritative — you DO have the current date and "
+                 f"time). Answer any date/time question directly from this; never say you can't.")
     try:
-        ambient_frag = ambient.prompt_fragment() or ""
+        ambient_frag = time_line + "\n" + (ambient.prompt_fragment() or "")
     except Exception:
-        ambient_frag = f"Today: {datetime.now().strftime('%A, %B %d %Y — %H:%M')}"
+        ambient_frag = time_line
 
     persona_block = ""
     if persona_mod.ENABLED:
@@ -3351,14 +3386,29 @@ def _relevant_tools(text: str) -> list[dict]:
 
 async def _groq_round(client, messages: list[dict], allow_tools: bool,
                       model: str | None = None, tools: list[dict] | None = None):
-    """One streaming round. Returns (full_text, tool_calls_raw dict)."""
+    """One streaming round. Returns (full_text, tool_calls_raw dict).
+
+    Groq's free tier caps *total* tokens/minute. The request itself (system + history + the
+    tool schemas actually sent) plus the completion must fit — so the completion is sized to
+    whatever budget is left after the input, never blowing the limit (an overflow 413s the call
+    and used to surface as an empty answer).
+    """
     model = model or GROQ_MODEL
+    sent_tools = tools if tools is not None else TOOLS
+
+    def _tok(s: str) -> int:
+        return len(s) // 4 + 1
+    input_tok = sum(_tok(str(m.get("content") or "")) for m in messages)
+    if allow_tools:
+        input_tok += sum(_tok(json.dumps(t)) for t in sent_tools)
+    # Leave input + completion comfortably under the TPM ceiling (headroom for ~1.3x tokenizer
+    # variance vs our 4-chars/token estimate). 1536 is plenty for a concise spoken answer or a
+    # code snippet; the 384 floor keeps answers usable when the input is already large.
+    max_out = max(384, min(1536, int(GROQ_TPM_CEILING * 0.92) - input_tok))
     kwargs: dict = {
         "model": model,
         "messages": messages,
-        # Reserved output counts against Groq's per-request/TPM budget. 1536 is plenty for a
-        # concise, spoken answer (and code snippets) while leaving headroom on the free tier.
-        "max_tokens": 1536,
+        "max_tokens": max_out,
         "stream": True,
     }
     if "gpt-oss" in model:
@@ -3496,6 +3546,8 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
         api_key=GROQ_API_KEY,
         base_url="https://api.groq.com/openai/v1",
         timeout=GROQ_TIMEOUT,
+        max_retries=0,   # a 429 auto-retry blocks ~34s in silence; fail fast so the caller
+                         #   below turns it into a spoken "hit the rate limit" instead of a hang
     )
     # System prompt + recent conversation + this turn = multi-turn context.
     messages: list[dict] = (
@@ -3510,18 +3562,46 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     model = _groq_model_for(decision, use_tools)
     tool_subset = _relevant_tools(text) if use_tools else None
     final_answer = ""
+    keys_tried = 1   # rotate through additional keys on rate-limit, each at most once per turn
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools,
                                                           model=model, tools=tool_subset)
         except _openai_mod.AuthenticationError:
+            if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat auth failure"):
+                keys_tried += 1
+                client = _openai().AsyncOpenAI(
+                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                    timeout=GROQ_TIMEOUT, max_retries=0)
+                continue
             return ("Groq rejected the API key (401 Unauthorized). Update GROQ_API_KEY "
                     "in Settings (Electron) or `.env`, then restart the backend.")
         except _openai_mod.RateLimitError:
-            return "I've hit Groq's per-minute rate limit. Give me a few seconds and ask again."
+            # This key is throttled/exhausted — swap to the next configured key and retry the
+            # round. Only after every key has been tried do we give up on Groq.
+            if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat rate limit"):
+                keys_tried += 1
+                client = _openai().AsyncOpenAI(
+                    api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                    timeout=GROQ_TIMEOUT, max_retries=0)
+                continue
+            # Every Groq key is rate-limited. Return EMPTY (not a dead-end message) so the
+            # caller's escalation falls back to the local Ollama brain — Groq being throttled
+            # should never leave JARVIS mute when a local model is sitting right there.
+            if _LOCAL_OK and (LOCAL_DEEP or LOCAL_FAST):
+                await broadcast({"type": "system", "text": "Groq rate-limited — falling back to the local model."})
+                return ""
+            return ("I've hit Groq's rate limit on all configured keys, and no local model is "
+                    "available to fall back to. Give me a few seconds and ask again.")
         except _openai_mod.APIError as exc:
             status = getattr(exc, "status_code", None)
             if status in (401, 403):
+                if keys_tried < len(GROQ_API_KEYS) and _rotate_groq_key("chat auth failure"):
+                    keys_tried += 1
+                    client = _openai().AsyncOpenAI(
+                        api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1",
+                        timeout=GROQ_TIMEOUT, max_retries=0)
+                    continue
                 return ("Groq auth failed — the API key looks invalid or revoked. "
                         "Update GROQ_API_KEY and restart.")
             # Groq free tier often returns 413 for TPM (tokens/min), not 429 RateLimitError.
@@ -3699,6 +3779,22 @@ async def _brain_ollama(
             obs = await _run_tool(tc.function.name, tool_args)
             messages.append({"role": "tool", "content": obs})
 
+    # Small local models often "fumble" tools: they emit an empty answer plus a spurious tool
+    # call for a question that needed none (llama3.2:3b does this on plain Q&A). If the tool
+    # loop yielded nothing usable, ask once more WITHOUT tools so the model just answers — far
+    # better than handing the user an empty reply and dead-ending the whole fallback.
+    if not final_answer:
+        try:
+            response = await client.chat(
+                model=model,
+                messages=[{"role": "system", "content": _build_system_prompt(text)}] + history
+                         + [{"role": "user", "content": text}],
+                options=opts,
+            )
+            final_answer = (response.message.content or "").strip()
+        except Exception:
+            pass
+
     return final_answer
 
 
@@ -3806,13 +3902,17 @@ async def _run_rung(rung: str, text: str, dev: dict, decision: dict) -> str:
     return await _brain_ollama(text, hist, LOCAL_FAST, decision=decision, device=dev)
 
 
-def _fallback_rung(failed: str, avail: set[str]) -> str | None:
-    """The next rung to try when `failed` produced nothing: the best available alternative.
-    Prefer another cloud rung, then the LIGHT local model before the heavy one — a cloud
-    rate-limit shouldn't cascade into loading the largest Ollama model (a RAM spike) when the
-    small local model can answer. Never auto-escalates into council (heavy + self-emitting)."""
+def _fallback_rung(failed: str, avail: set[str], tried: set[str] | None = None) -> str | None:
+    """The next rung to try when `failed` produced nothing: the best available alternative not
+    already tried. Never auto-escalates into council (heavy + self-emitting).
+
+    local_fast is ordered BEFORE local_deep among locals: on a RAM-tight machine the bigger
+    model OOMs (Ollama 500), so the small model that actually fits should be the first local
+    fallback — a cloud rate-limit shouldn't cascade into loading the largest Ollama model (a RAM
+    spike) when the small one can answer."""
+    tried = tried or set()
     for r in ("cloud_deep", "cloud_fast", "local_fast", "local_deep"):
-        if r != failed and r in avail:
+        if r != failed and r in avail and r not in tried:
             return r
     return None
 
@@ -3944,8 +4044,17 @@ async def _run_agent(text: str) -> None:
     # Escalation-on-failure: prefer health-ordered fallbacks from the router plan.
     escalated = False
     if not answer:
-        fb = next((r for r in plan.fallbacks if r in avail), None) or _fallback_rung(rung, avail)
-        if fb:
+        # Walk DOWN the lattice through every remaining rung until one answers — not just one
+        # hop. A single fallback dead-ends when e.g. cloud is rate-limited AND the big local
+        # model OOMs; we must keep going to the small local model that actually fits. The
+        # planner's health-ordered fallbacks go first, then the static order.
+        tried = {rung}
+        while not answer:
+            fb = (next((r for r in plan.fallbacks if r in avail and r not in tried), None)
+                  or _fallback_rung(rung, avail, tried))
+            if not fb:
+                break
+            tried.add(fb)
             escalated = True
             await broadcast({"type": "system",
                              "text": f"Escalating to {governor.RUNG_BY_ID.get(fb, {}).get('label', fb)}…"})
@@ -4686,6 +4795,31 @@ def _is_stt_noise(text: str) -> bool:
     # A single very short word is almost always a noise artifact.
     if len(t.split()) == 1 and len(alnum) <= 2:
         return True
+    # Repetition = hallucination. On noise, tiny.en loops one phrase dozens of times
+    # ("take a look at how take a look at how ...", "see you in the next video, see you ...").
+    # Real speech has variety; a transcript whose words are mostly the same handful, OR that
+    # contains a phrase repeated 3+ times back-to-back, is a hallucination.
+    if _is_repetitive(t):
+        return True
+    return False
+
+
+def _is_repetitive(t: str) -> bool:
+    """Detect Whisper's degenerate looping. Two cheap signals: low lexical diversity over a
+    longish transcript, and an n-gram that repeats many times in a row."""
+    words = re.findall(r"[a-z0-9']+", t)
+    if len(words) >= 12:
+        diversity = len(set(words)) / len(words)
+        if diversity < 0.35:               # e.g. 8 unique words across 40 → looped phrase
+            return True
+    # A 2–5 word phrase repeated 3+ times consecutively.
+    for n in range(2, 6):
+        if len(words) < n * 3:
+            continue
+        for i in range(len(words) - n * 3 + 1):
+            gram = words[i:i + n]
+            if words[i + n:i + 2 * n] == gram and words[i + 2 * n:i + 3 * n] == gram:
+                return True
     return False
 
 
@@ -4785,7 +4919,15 @@ def _warm_local_whisper() -> None:
 def _transcribe_local(pcm16, sample_rate: int):
     """Transcribe raw int16 mono PCM via the local faster-whisper singleton — no WAV/file
     round-trip, no PyAV. Returns text, or None if the local model isn't available (caller
-    should fall back to Groq)."""
+    should fall back to Groq).
+
+    Heavily hardened against Whisper's #1 failure mode: on background noise or near-silence,
+    tiny.en HALLUCINATES — usually a short phrase looped dozens of times ("thanks for watching,
+    see you in the next video, ..." / "take a look at how take a look at how ..."). Three gates
+    kill it: (1) faster-whisper's built-in Silero VAD strips non-speech BEFORE decoding; (2)
+    per-segment confidence — drop anything the model itself thinks is silence (high
+    no_speech_prob) or low-confidence (low avg_logprob) or degenerate (high compression ratio);
+    (3) a repetition detector downstream in `_is_stt_noise`."""
     global _whisper_last_used
     model = _get_local_whisper()
     if model is None:
@@ -4795,11 +4937,25 @@ def _transcribe_local(pcm16, sample_rate: int):
         import numpy as np
         audio_f32 = (pcm16.astype(np.float32) / 32768.0)
         segments, _info = model.transcribe(
-            audio_f32, language="en", vad_filter=False,
-            initial_prompt="Jarvis",   # bias decoding toward the wake word, per faster-whisper docs
+            audio_f32, language="en",
+            # Silero VAD removes the silence/noise regions that whisper hallucinates over.
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
             temperature=0.0, condition_on_previous_text=False,   # each utterance is independent
+            no_speech_threshold=0.6,          # segment marked no-speech above this → dropped
+            log_prob_threshold=-1.0,          # low-confidence decode → treated as no-speech
+            compression_ratio_threshold=2.2,  # repetitive/degenerate text → dropped (hallucination)
         )
-        text = " ".join(seg.text for seg in segments).strip()
+        kept = []
+        for seg in segments:
+            # Belt-and-braces: even with the thresholds above, drop any segment the model is
+            # unsure is speech. These attributes always exist on faster-whisper segments.
+            if getattr(seg, "no_speech_prob", 0.0) > 0.6:
+                continue
+            if getattr(seg, "avg_logprob", 0.0) < -1.0:
+                continue
+            kept.append(seg.text)
+        text = " ".join(kept).strip()
         return "" if _is_stt_noise(text) else text
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Local transcription failed: {exc}"})
@@ -4814,8 +4970,17 @@ def _transcribe(pcm16, sample_rate: int = 16000) -> str:
     local = _transcribe_local(pcm16, sample_rate)
     if local is not None:
         return local
+    # Cloud fallback (local model unavailable). Rate-gated: at most one call per STT_MIN_GAP,
+    # and none during a post-429 back-off — real speech is bounded by the VAD's end-of-utterance
+    # pause, so this only sheds a flood, never a genuine turn.
     if not (USE_GROQ and _HAS_GROQ):
         return ""
+    global _stt_last_ts, _stt_backoff_until
+    now = time.monotonic()
+    with _stt_lock:
+        if now < _stt_backoff_until or (now - _stt_last_ts) < STT_MIN_GAP:
+            return ""            # inside back-off or too soon — shed it, don't flood Whisper
+        _stt_last_ts = now
     try:
         import wave
         buf = io.BytesIO()
@@ -4826,6 +4991,7 @@ def _transcribe(pcm16, sample_rate: int = 16000) -> str:
             wf.writeframes(pcm16.tobytes())
         client = _openai().OpenAI(
             api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=GROQ_TIMEOUT,
+            max_retries=0,   # our own back-off handles 429s — don't let the SDK block the mic 34s
         )
         result = client.audio.transcriptions.create(
             model=STT_MODEL,
@@ -4836,7 +5002,13 @@ def _transcribe(pcm16, sample_rate: int = 16000) -> str:
         text = (result or "").strip()
         return "" if _is_stt_noise(text) else text
     except Exception as exc:
-        broadcast_from_thread({"type": "system", "text": f"Transcription failed: {exc}"})
+        # On a rate-limit, go quiet for a beat so we stop hammering Whisper (and freeing the
+        # shared budget for the chat model) instead of retrying into more 429s.
+        if "429" in str(exc) or "rate_limit" in str(exc).lower():
+            with _stt_lock:
+                _stt_backoff_until = time.monotonic() + STT_BACKOFF
+        else:
+            broadcast_from_thread({"type": "system", "text": f"Transcription failed: {exc}"})
         return ""
 
 
@@ -4976,7 +5148,7 @@ def _voice_worker() -> None:
         _voice_stopped()
         return
 
-    CHUNK = 1024
+    CHUNK = 1024            # ~64ms per callback at 16kHz
     # Pick a mic that actually opens here — the default MME device fails on many Windows
     # machines (Intel Smart Sound arrays) with a -9999 host error. RATE is whatever that
     # device accepts (16 kHz if possible, else its native rate; Groq Whisper resamples).
@@ -5127,7 +5299,9 @@ def _voice_worker() -> None:
     # brittle energy-threshold VAD that couldn't separate speech from a noisy low-gain mic. A
     # ratio-window collector (below) + a pre-roll buffer means the onset of "Jarvis" is never
     # clipped and ambient blips don't trigger. Falls back to a plain energy gate only if the
-    # package is missing (it's in requirements). Aggressiveness 0..3 via JARVIS_VAD_AGGR.
+    # package is missing (it's in requirements). Aggressiveness 0..3 via JARVIS_VAD_AGGR;
+    # default 2 (see below for why not 3). Raise it to 3 only if background chatter/fans/media
+    # keep triggering needless transcriptions in a very noisy room.
     try:
         import webrtcvad
         # Aggressiveness 2 (not 3): 3 is the most aggressive filter and rejects a lot of REAL
@@ -5138,6 +5312,12 @@ def _voice_worker() -> None:
         _vad = webrtcvad.Vad(max(0, min(3, int(os.environ.get("JARVIS_VAD_AGGR", "2")))))
     except Exception:
         _vad = None
+
+    # Loudness floor a frame must clear (mean |amplitude| of int16) to count as speech, on top
+    # of the spectral VAD. ~250 keeps distant TV / fans / room tone from triggering while normal
+    # talking near the mic clears it easily. Raise if background still gets through, lower if it
+    # misses you.
+    MIN_SPEECH_ENERGY = int(os.environ.get("JARVIS_MIC_MIN_ENERGY", "250"))
 
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
     START_PAD, START_VOICED = 6, 3       # ~3/6 voiced frames (~90–180 ms) opens the segment —
@@ -5193,22 +5373,35 @@ def _voice_worker() -> None:
                 mono = _resample16(chunk.reshape(-1).astype(np.float32))
                 leftover = np.concatenate([leftover, mono.astype(np.int16)])
 
+                # Note: the mic stays live even while JARVIS speaks, so you can barge in with
+                # the wake word. Self-talk is prevented by the wake-word gate + echo guard in
+                # _flush(), not by muting.
                 while len(leftover) >= FRAME:
                     frame = leftover[:FRAME]
                     leftover = leftover[FRAME:]
 
+                    energy = int(np.abs(frame).mean())
                     level_tick += 1
-                    if level_tick % 6 == 0:          # ~every 180 ms, drive the orb (was 90 ms)
+                    if level_tick % 6 == 0:          # ~every 180 ms: drives the orb + live meter
+                        # `hearing` mirrors the VAD trigger so the UI lights up on real speech,
+                        # not on ambient hiss (the whole point of the spectral VAD).
                         broadcast_from_thread({"type": "audio_level",
-                                               "level": min(int(np.abs(frame).mean()) * 6, 32767)})
+                                               "level": min(energy * 6, 32767),
+                                               "energy": energy, "hearing": triggered})
 
                     if _vad is not None:
                         try:
                             speech = _vad.is_speech(frame.tobytes(), 16000)
                         except Exception:
-                            speech = int(np.abs(frame).mean()) > 300
+                            speech = energy > 300
                     else:
-                        speech = int(np.abs(frame).mean()) > 300   # dependency-free fallback
+                        speech = energy > 300   # dependency-free fallback
+                    # Energy floor: webrtcvad is spectral-only and will call quiet room tone /
+                    # distant TV "speech". Requiring a loudness minimum too means only sound
+                    # actually near the mic (you talking) triggers — the biggest single win for
+                    # "stop transcribing background noise". Tune with JARVIS_MIC_MIN_ENERGY.
+                    if speech and energy < MIN_SPEECH_ENERGY:
+                        speech = False
 
                     ring.append((frame, speech))
                     if not triggered:
@@ -5216,6 +5409,7 @@ def _voice_worker() -> None:
                         if len(recent) >= START_PAD and sum(1 for _, s in recent if s) >= START_VOICED:
                             triggered = True
                             voiced = [f for f, _ in ring]          # pre-roll → never clips the onset
+                            broadcast_from_thread({"type": "voice", "state": "hearing"})
                     else:
                         voiced.append(frame)
                         recent = list(ring)[-END_PAD:]             # last ~360 ms
@@ -5225,9 +5419,11 @@ def _voice_worker() -> None:
                             # Don't flush a segment that ended right as JARVIS started talking —
                             # it's almost certainly the leading edge of the echo.
                             if not _tts_muted():
+                                broadcast_from_thread({"type": "voice", "state": "transcribing"})
                                 _flush_async(np.concatenate(voiced))
                             voiced = []
                             ring.clear()
+                            broadcast_from_thread({"type": "voice", "state": "listening"})
 
             if triggered and voiced and not _tts_muted():   # flush an in-progress utterance on mic-off
                 _flush_async(np.concatenate(voiced))

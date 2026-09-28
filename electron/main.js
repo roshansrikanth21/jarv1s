@@ -2,7 +2,7 @@ import electron from "electron";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
-import { spawn } from "child_process";
+import { spawn, execFileSync } from "child_process";
 
 const {
   app,
@@ -178,9 +178,11 @@ function resolvePythonPath() {
       ? path.join(root, "venv", "Scripts", "python.exe")
       : path.join(root, "venv", "bin", "python");
 
-  // Prefer an explicit override, then the in-repo venv. Do NOT fall through to bare
-  // `py`/`python` — a system interpreter often lacks FastAPI and other project deps,
-  // which surfaces as a failed backend boot in Electron.
+  // Order: explicit override → in-repo venv → a system interpreter that PASSES the dep probe.
+  // A bare system `py`/`python` is never used blindly: it usually lacks FastAPI and the native
+  // voice deps (faster_whisper + webrtcvad + sounddevice), which surfaces as a failed boot or
+  // silently degraded voice. The standard repo venv is trusted without probing, so the common
+  // case pays no startup cost; only the no-venv case spawns (slow) probe subprocesses.
   const override = process.env.JARVIS_PYTHON;
   if (override) {
     if (
@@ -189,7 +191,7 @@ function resolvePythonPath() {
       override === "python" ||
       override === "python3"
     ) {
-      return { path: override, isPackaged: false, hint: null };
+      return { path: override, isPackaged: false, verified: true, hint: null };
     }
     return {
       path: null,
@@ -198,10 +200,30 @@ function resolvePythonPath() {
     };
   }
 
-  const repoVenv = venvPy(appRoot);
-  if (fs.existsSync(repoVenv)) {
-    return { path: repoVenv, isPackaged: false, hint: null };
+  const venvs = [venvPy(appRoot), venvPy(path.resolve(appRoot, ".."))].filter(fs.existsSync);
+  if (venvs.length) {
+    return { path: venvs[0], isPackaged: false, verified: true, hint: null };
   }
+
+  const hasBackendDeps = (py) => {
+    try {
+      // Stub `av` before importing faster_whisper, exactly like api.py's _import_faster_whisper:
+      // faster_whisper's __init__ pulls in PyAV, whose native DLL Windows Smart App Control can
+      // block, and the mic hands raw PCM so PyAV is never actually needed. This mirrors the
+      // real import path so it accepts an interpreter api.py can genuinely run voice on.
+      const probe =
+        "import sys,types; sys.modules.setdefault('av', types.ModuleType('av')); " +
+        "import fastapi, faster_whisper, webrtcvad, sounddevice, openai, edge_tts";
+      const args = (py === "py" ? ["-3"] : []).concat(["-c", probe]);
+      execFileSync(py, args, { stdio: "ignore", timeout: 20000 });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const systemPys = isWindows ? ["py", "python"] : ["python3", "python"];
+  const withDeps = systemPys.find(hasBackendDeps);
+  if (withDeps) return { path: withDeps, isPackaged: false, verified: true, hint: null };
 
   return {
     path: null,
