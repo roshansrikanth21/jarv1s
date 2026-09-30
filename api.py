@@ -5077,26 +5077,36 @@ def _transcribe_local(pcm16, sample_rate: int):
     try:
         import numpy as np
         audio_f32 = (pcm16.astype(np.float32) / 32768.0)
-        segments, _info = model.transcribe(
-            audio_f32, language="en",
-            # Silero VAD removes the silence/noise regions that whisper hallucinates over.
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=200),
-            temperature=0.0, condition_on_previous_text=False,   # each utterance is independent
-            no_speech_threshold=0.6,          # segment marked no-speech above this → dropped
-            log_prob_threshold=-1.0,          # low-confidence decode → treated as no-speech
-            compression_ratio_threshold=2.2,  # repetitive/degenerate text → dropped (hallucination)
-        )
-        kept = []
-        for seg in segments:
-            # Belt-and-braces: even with the thresholds above, drop any segment the model is
-            # unsure is speech. These attributes always exist on faster-whisper segments.
-            if getattr(seg, "no_speech_prob", 0.0) > 0.6:
-                continue
-            if getattr(seg, "avg_logprob", 0.0) < -1.0:
-                continue
-            kept.append(seg.text)
-        text = " ".join(kept).strip()
+        def _decode(use_vad: bool):
+            kwargs = dict(
+                language="en",
+                vad_filter=use_vad,
+                temperature=0.0,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                log_prob_threshold=-1.0,
+                compression_ratio_threshold=2.2,
+            )
+            if use_vad:
+                kwargs["vad_parameters"] = dict(
+                    min_silence_duration_ms=300,
+                    speech_pad_ms=240,
+                    threshold=0.35,
+                )
+            segments, _info = model.transcribe(audio_f32, **kwargs)
+            kept = []
+            for seg in segments:
+                if getattr(seg, "no_speech_prob", 0.0) > 0.6:
+                    continue
+                if getattr(seg, "avg_logprob", 0.0) < -1.0:
+                    continue
+                kept.append(seg.text)
+            return " ".join(kept).strip()
+
+        text = _decode(True)
+        # Energy-gated clips are already speech. If Silero drops the whole clip, decode once more.
+        if not text and len(audio_f32) > 16000 * 0.35:
+            text = _decode(False)
         return "" if _is_stt_noise(text) else text
     except Exception as exc:
         broadcast_from_thread({"type": "system", "text": f"Local transcription failed: {exc}"})

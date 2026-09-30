@@ -16,4 +16,6 @@ contextBridge.exposeInMainWorld("electronAPI", {
   getApiKeyStatus: () => ipcRenderer.invoke("keys:status"),
   setApiKeys: (keys) => ipcRenderer.invoke("keys:set", keys),
   openExternal: (url) => ipcRenderer.send("open-external", url),
+  restoreWindow: () => ipcRenderer.send("pill-restore"),
+  resizePill: (open) => ipcRenderer.send("pill-resize", open),
 });

@@ -15,7 +15,7 @@ JARVIS is a **desktop companion agent** that runs on your machine: you speak or 
 
 The design bet is **embodiment**. The process reads host signals (battery, load, free RAM) and a **governor** chooses the cheapest cognition that still clears a quality bar — local fast models when the machine is strained, stronger cloud models when the task needs them, and an optional multi-model “council” for hard questions. Memory is persistent on disk (Cortex): facts, recent episodes, and future reminders feed the next turn. Mood and tone shift with context (affect layer), and optional **skills** are on-disk playbooks the agent can load when a task matches.
 
-You interact through an Electron app with several UI “decks” (Prime, Command Deck, Focus, Terminal, Chat). Under the hood a Python FastAPI backend owns WebSocket chat, tools, voice, and memory; the React UI is a client.
+You interact through an Electron app with several UI decks (Prime, Stark, Command Deck, Focus, Terminal, Chat). Under the hood a Python FastAPI backend owns WebSocket chat, tools, voice, and memory; the React UI is a client. Minimizing the window leaves a small desktop pill (`public/pill.html`), not a second full app.
 
 **Beta means:** documented capabilities exist in this repository and are usable, but APIs, UX, and packaging can change. The stack is **Windows-first** for desktop and browser automation. It is not production-hardened, not multi-user, and not claimed to offer equal desktop control on macOS/Linux.
 
@@ -306,7 +306,7 @@ Without any cloud key **and** without Ollama models, the process can still boot,
 | UI loads but API/WS never connect | Port split (8000 busy / remapped) or wrong `JARVIS_PORT` | Free 8000, **or** set the same `JARVIS_PORT` for backend and Vite; desktop mode refuses silent remapping |
 | `/api/agent/status` is 404 on 8000 | Another process (e.g. WSL/Docker relay) owns the port | Stop that process or set `JARVIS_PORT`; Electron only reuses a backend that returns `"app": "jarvis"` |
 | Import errors / missing `yaml` | Incomplete pip install | `venv\Scripts\pip install -r requirements.txt` (`PyYAML` is listed explicitly) |
-| Voice / STT silent | No mic permission; missing `faster-whisper` and no Groq | Install requirements; set `GROQ_API_KEY` for cloud STT fallback |
+| Voice / STT silent | No mic permission; a loopback or silent device; missing `faster-whisper` and no Groq | Install requirements; pick a real microphone; set `GROQ_API_KEY` for cloud STT fallback. A clip the VAD empties is decoded once more without VAD before it is dropped. |
 | Cloud replies say the model does not exist | Groq retired the configured id | Leave `GROQ_MODEL` unset, or set it to an id from `GET https://api.groq.com/openai/v1/models`. JARVIS retries once against the live list. |
 | `browse` fails | Chrome / harness path | Install Chrome; set `JARVIS_CHROME` / `JARVIS_BH_CLI` if needed (see `.env.example`) |
 | Pentest says Docker unavailable | Engine down or image missing | Start Docker Desktop; build `jarvis-recon:latest` |
@@ -347,17 +347,18 @@ In the Electron app, **Settings** can store `GROQ` / `ANTHROPIC` / `MEM0` keys v
 
 ## User interfaces
 
-Five decks share one backend. The switcher persists `jarvis_ui_preset` in `localStorage` (`src/routes/index.tsx`). Legacy `classic` maps to Command Deck.
+Six decks share one backend. The switcher persists `jarvis_ui_preset` in `localStorage` (`src/routes/index.tsx`). Legacy `classic` maps to Command Deck.
 
 | Preset id | Label | Role |
 | --- | --- | --- |
 | `prime` | Prime | Default HUD |
+| `stark` | Stark | Machine readout, weather, and quick asks |
 | `overhaul` | Command Deck | Amber ops deck |
 | `focus` | Focus | Minimal |
 | `terminal` | Terminal | Console-oriented |
 | `chat` | Chat | Conversation-first |
 
-Shared chrome includes Settings, Live Ops, and window controls.
+Shared chrome is Settings, Activity, and window controls. Minimizing the Electron window shows the desktop pill. Deck names are not repeated in each top bar; the switcher at the bottom already names the deck.
 
 ---
 
@@ -436,8 +437,10 @@ jarv1s/
 ├── routers/rest.py        # HTTP routes
 ├── scripts/audit_az.py    # Local audit. Reads GROQ_API_KEY from the environment
 ├── tests/
-├── electron/main.js
-├── src/decks/
+├── electron/main.js       # Window, backend spawn, minimize → desktop pill
+├── public/pill.html       # Small always-on-top island used while minimized
+├── docs/JARVIS_Architecture_Final.pptx
+├── src/decks/             # prime, stark, overhaul, focus, terminal, chat
 ├── requirements.txt
 ├── package.json
 ├── .env.example

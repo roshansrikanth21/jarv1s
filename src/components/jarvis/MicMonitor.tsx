@@ -1,34 +1,52 @@
-// MicMonitor — an always-visible, deck-agnostic voice-input indicator. It opens its own
-// WebSocket and reacts LIVE to the mic: a waveform that moves with your voice, a status
-// ("Listening" → "Hearing you" → "Transcribing"), and the last thing it heard. The whole
-// point: you can SEE whether the mic is picking you up, instead of guessing.
+// Compact voice pill. Inside the main window it sits at the bottom edge.
+// When Electron minimizes the deck, a separate always-on-top window loads
+// ?surface=pill so the same control stays on the desktop.
 import { useEffect, useRef, useState } from "react";
 
 type VoiceState = "off" | "listening" | "hearing" | "transcribing";
 
-const BARS = 16;
+const BARS = 12;
+
+function isPillSurface() {
+  return new URLSearchParams(window.location.search).get("surface") === "pill";
+}
 
 export function MicMonitor() {
-  const [state, setState] = useState<VoiceState>("off");
+  const dock = isPillSurface();
+  const [state, setState] = useState<VoiceState>(dock ? "listening" : "off");
   const [heard, setHeard] = useState("");
+  const [open, setOpen] = useState(false);
   const heardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // live audio values live in refs; a rAF loop paints the bars so it stays smooth
+  const wsRef = useRef<WebSocket | null>(null);
   const energyRef = useRef(0);
   const threshRef = useRef(650);
-  const hearingRef = useRef(false);
   const barsRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<VoiceState>("off");
   stateRef.current = state;
 
   useEffect(() => {
-    let ws: WebSocket | null = null,
-      stop = false;
+    if (!dock) return;
+    (window as Window & { electronAPI?: { resizePill?: (open: boolean) => void } }).electronAPI?.resizePill?.(open);
+  }, [dock, open]);
+
+  useEffect(() => {
+    if (!dock) return;
+    const prev = document.body.style.background;
+    document.documentElement.style.background = "transparent";
+    document.body.style.background = "transparent";
+    return () => {
+      document.body.style.background = prev;
+    };
+  }, [dock]);
+
+  useEffect(() => {
+    let stop = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
     const url = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
     const connect = () => {
       if (stop) return;
-      ws = new WebSocket(url());
+      const ws = new WebSocket(url());
+      wsRef.current = ws;
       ws.onmessage = (e) => {
         let d: Record<string, unknown>;
         try {
@@ -38,20 +56,18 @@ export function MicMonitor() {
         }
         if (d.type === "audio_level") {
           const en = Number(d.energy) || 0;
-          energyRef.current = energyRef.current * 0.55 + en * 0.45; // smooth the jitter
+          energyRef.current = energyRef.current * 0.55 + en * 0.45;
           if (d.thresh) threshRef.current = Number(d.thresh);
-          hearingRef.current = !!d.hearing;
           if (stateRef.current === "off") setState("listening");
         }
         if (d.type === "voice" && typeof d.state === "string") {
           setState(d.state as VoiceState);
-          if (d.thresh) threshRef.current = Number(d.thresh);
         }
         if ((d.type === "transcription" || d.type === "transcript") && d.text) {
           setHeard(String(d.text));
           setState("listening");
           if (heardTimer.current) clearTimeout(heardTimer.current);
-          heardTimer.current = setTimeout(() => setHeard(""), 7000);
+          heardTimer.current = setTimeout(() => setHeard(""), 8000);
         }
       };
       ws.onclose = () => {
@@ -59,7 +75,7 @@ export function MicMonitor() {
       };
       ws.onerror = () => {
         try {
-          ws?.close();
+          ws.close();
         } catch {
           /* ignore */
         }
@@ -67,27 +83,25 @@ export function MicMonitor() {
     };
     connect();
 
-    // paint loop — waveform bars react to the live energy relative to the trigger threshold
     let raf = 0;
-    const bars = barsRef.current;
-    const paint = () => {
+    let last = 0;
+    const paint = (now: number) => {
+      raf = requestAnimationFrame(paint);
+      if (document.hidden && !dock) return;
+      if (now - last < 50) return;
+      last = now;
+      const el = barsRef.current;
+      if (!el) return;
       const rel = Math.min(1, energyRef.current / Math.max(120, threshRef.current * 1.5));
       const over = energyRef.current > threshRef.current;
-      const el = barsRef.current || bars;
-      if (el) {
-        const children = el.children;
-        for (let i = 0; i < children.length; i++) {
-          const b = children[i] as HTMLElement;
-          // per-bar shape (center taller) + a little life so it reads as a waveform
-          const shape = 0.45 + 0.55 * Math.sin((i / (BARS - 1)) * Math.PI);
-          const jitter = 0.7 + 0.3 * Math.random();
-          const h = 8 + rel * 30 * shape * jitter;
-          b.style.height = `${h}px`;
-          b.style.background = over ? "#41ff9e" : rel > 0.15 ? "#5fdcff" : "#3a5566";
-          b.style.opacity = String(0.35 + rel * 0.65);
-        }
+      const children = el.children;
+      for (let i = 0; i < children.length; i++) {
+        const b = children[i] as HTMLElement;
+        const shape = 0.45 + 0.55 * Math.sin((i / (BARS - 1)) * Math.PI);
+        const h = 6 + rel * 18 * shape;
+        b.style.height = `${h}px`;
+        b.style.background = over ? "#d4c8b0" : "#707a88";
       }
-      raf = requestAnimationFrame(paint);
     };
     raf = requestAnimationFrame(paint);
 
@@ -97,97 +111,146 @@ export function MicMonitor() {
       if (heardTimer.current) clearTimeout(heardTimer.current);
       cancelAnimationFrame(raf);
       try {
-        ws?.close();
+        wsRef.current?.close();
       } catch {
         /* ignore */
       }
     };
-  }, []);
+  }, [dock]);
 
-  if (state === "off") return null;
+  const send = (payload: Record<string, unknown>) => {
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
+  };
+
+  if (!dock && state === "off") return null;
 
   const label =
     state === "hearing"
-      ? "Hearing you…"
+      ? "Hearing you"
       : state === "transcribing"
-        ? "Transcribing…"
-        : "Listening — say “Jarvis”";
-  const dot = state === "hearing" ? "#41ff9e" : state === "transcribing" ? "#ffd24a" : "#5fdcff";
+        ? "Transcribing"
+        : state === "off"
+          ? "Mic off"
+          : "Listening";
+  const dot = state === "hearing" ? "#d4c8b0" : state === "transcribing" ? "#c8a050" : "#8a96a6";
+
+  const ask = (text: string) => {
+    send({ action: "command", text });
+    setOpen(false);
+    const api = (window as Window & { electronAPI?: { restoreWindow?: () => void } }).electronAPI;
+    api?.restoreWindow?.();
+  };
+
+  const actions: { name: string; hint: string; run: () => void }[] = [
+    {
+      name: "Open",
+      hint: "Bring the deck forward",
+      run: () =>
+        (window as Window & { electronAPI?: { restoreWindow?: () => void } }).electronAPI?.restoreWindow?.(),
+    },
+    { name: "Weather", hint: "Ask for the local forecast", run: () => ask("what is the weather here") },
+    { name: "Status", hint: "CPU, memory, battery", run: () => ask("give me cpu, memory, and battery") },
+    {
+      name: state === "off" ? "Listen" : "Pause",
+      hint: state === "off" ? "Turn the microphone on" : "Stop listening",
+      run: () => {
+        send({ action: state === "off" ? "start_listening" : "stop_listening" });
+        setState(state === "off" ? "listening" : "off");
+        setOpen(false);
+      },
+    },
+  ];
 
   return (
     <div
       className="no-drag"
       style={{
         position: "fixed",
-        top: 12,
+        top: 7,
         left: "50%",
         transform: "translateX(-50%)",
         zIndex: 100001,
         display: "flex",
+        flexDirection: "column",
         alignItems: "center",
-        gap: 12,
-        background: "rgba(6,12,18,0.92)",
-        border: `1px solid ${dot}44`,
-        borderRadius: 999,
-        padding: "7px 16px 7px 12px",
-        backdropFilter: "blur(10px)",
-        boxShadow: `0 4px 24px rgba(0,0,0,0.45), 0 0 16px ${dot}22`,
-        fontFamily: "'JetBrains Mono', ui-monospace, monospace",
-        maxWidth: "min(92vw, 620px)",
+        fontFamily: "Segoe UI, sans-serif",
+        pointerEvents: "auto",
       }}
     >
-      {/* status dot */}
-      <span
-        style={{
-          width: 9,
-          height: 9,
-          borderRadius: "50%",
-          background: dot,
-          flexShrink: 0,
-          boxShadow: `0 0 8px ${dot}`,
-          animation: state !== "listening" ? "micPulse 0.9s ease-in-out infinite" : "none",
-        }}
-      />
-      {/* live waveform */}
       <div
-        ref={barsRef}
-        style={{ display: "flex", alignItems: "center", gap: 2, height: 40, flexShrink: 0 }}
+        style={{
+          width: open ? 232 : undefined,
+          background: "rgba(8,10,14,0.92)",
+          border: "1px solid rgba(255,255,255,0.12)",
+          borderRadius: open ? 22 : 999,
+          boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+          backdropFilter: "blur(16px)",
+          overflow: "hidden",
+        }}
       >
-        {Array.from({ length: BARS }).map((_, i) => (
-          <span
-            key={i}
-            style={{
-              width: 3,
-              height: 8,
-              borderRadius: 2,
-              background: "#3a5566",
-              transition: "height 0.06s linear, background 0.1s linear",
-            }}
-          />
-        ))}
-      </div>
-      {/* label + last heard */}
-      <div style={{ minWidth: 0, display: "flex", flexDirection: "column", lineHeight: 1.2 }}>
-        <span style={{ fontSize: 11, letterSpacing: "0.06em", color: dot, whiteSpace: "nowrap" }}>
-          {label}
-        </span>
-        {heard && (
-          <span
-            style={{
-              fontSize: 10.5,
-              color: "#c8ddd4",
-              opacity: 0.85,
-              overflow: "hidden",
-              textOverflow: "ellipsis",
-              whiteSpace: "nowrap",
-              maxWidth: 320,
-            }}
-          >
-            heard: “{heard}”
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label="JARVIS voice"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            height: 28,
+            width: "100%",
+            background: "transparent",
+            border: "none",
+            padding: "0 12px 0 10px",
+            color: "rgba(232,236,240,0.92)",
+            cursor: "pointer",
+          }}
+        >
+          <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot, flexShrink: 0 }} />
+          <div ref={barsRef} style={{ display: "flex", alignItems: "center", gap: 2, height: 16 }}>
+            {Array.from({ length: BARS }).map((_, i) => (
+              <span key={i} style={{ width: 2, height: 4, borderRadius: 1, background: "rgba(232,236,240,0.35)" }} />
+            ))}
+          </div>
+          <span style={{ fontSize: 12, letterSpacing: "0.01em", whiteSpace: "nowrap" }}>
+            {heard || label}
           </span>
+        </button>
+        {open && (
+          <div style={{ padding: "2px 6px 8px" }}>
+            {actions.map((item) => (
+              <button
+                key={item.name}
+                type="button"
+                onClick={item.run}
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "flex-start",
+                  width: "100%",
+                  background: "transparent",
+                  color: "rgba(232,236,240,0.92)",
+                  border: "none",
+                  borderRadius: 12,
+                  padding: "7px 10px",
+                  cursor: "pointer",
+                  textAlign: "left",
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = "rgba(255,255,255,0.06)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = "transparent";
+                }}
+              >
+                <span style={{ fontSize: 13 }}>{item.name}</span>
+                <span style={{ fontSize: 11, color: "rgba(232,236,240,0.45)", marginTop: 1 }}>{item.hint}</span>
+              </button>
+            ))}
+          </div>
         )}
       </div>
-      <style>{`@keyframes micPulse { 0%,100%{ transform:scale(1); opacity:1; } 50%{ transform:scale(1.5); opacity:0.5; } }`}</style>
     </div>
   );
 }

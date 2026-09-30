@@ -58,7 +58,7 @@ export default function ChatDeck() {
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
@@ -312,7 +312,7 @@ export default function ChatDeck() {
               borderTop: `1px solid ${BORDER}44`,
             }}
           >
-            JARVIS · local
+            JARVIS
             <span
               style={{
                 display: "inline-block",
@@ -367,11 +367,21 @@ export default function ChatDeck() {
         </div>
 
         {/* conversation */}
-        <div ref={scrollRef} style={{ flex: 1, overflowY: "auto", padding: "8px 16px 24px" }}>
+        <div
+          ref={scrollRef}
+          style={{
+            flex: 1,
+            overflowY: "auto",
+            padding: "8px 16px 24px",
+            display: "flex",
+            flexDirection: "column",
+          }}
+        >
           <div
             style={{
-              maxWidth: 768,
-              margin: "0 auto",
+              maxWidth: 720,
+              width: "100%",
+              margin: lines.length <= 1 && !stream ? "auto" : "0 auto",
               display: "flex",
               flexDirection: "column",
               gap: 22,
@@ -381,7 +391,7 @@ export default function ChatDeck() {
               <div
                 style={{
                   textAlign: "center",
-                  marginTop: "22vh",
+                  margin: "auto",
                   color: TEXT,
                   fontSize: 26,
                   fontWeight: 600,
@@ -401,8 +411,8 @@ export default function ChatDeck() {
         </div>
 
         {/* composer */}
-        <div style={{ flexShrink: 0, padding: "0 16px 18px" }}>
-          <div style={{ maxWidth: 768, margin: "0 auto" }}>
+        <div style={{ flexShrink: 0, padding: "0 16px 18px", width: "100%" }}>
+          <div style={{ width: "min(720px, 100%)", margin: "0 auto" }}>
             {attachments.length > 0 && (
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
                 {attachments.map((a) => (

@@ -832,7 +832,6 @@ function CommandDeck() {
           </div>
           <div>
             <p className="hud-logo-name">JARVIS</p>
-            <p className="hud-logo-sub">personal AI</p>
           </div>
         </div>
 

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>JARVIS</title>
+  <style>
+    html, body { margin: 0; background: transparent; overflow: hidden; font-family: "Segoe UI", sans-serif; }
+    .island {
+      margin: 6px auto 0;
+      width: 168px;
+      background: rgba(12, 12, 14, 0.88);
+      border: 1px solid rgba(255,255,255,0.14);
+      border-radius: 999px;
+      overflow: hidden;
+      backdrop-filter: blur(18px);
+      transition: width 220ms cubic-bezier(.2,.8,.2,1), border-radius 220ms ease;
+    }
+    .island.open { width: 220px; border-radius: 18px; }
+    .face {
+      height: 28px; width: 100%; display: flex; align-items: center; gap: 8px;
+      padding: 0 12px 0 10px; background: transparent; border: 0; color: rgba(244,244,245,.92);
+      cursor: pointer;
+    }
+    .dot { width: 6px; height: 6px; border-radius: 50%; background: #a1a1aa; flex: 0 0 auto; }
+    .bars { display: flex; align-items: center; gap: 2px; height: 14px; }
+    .bars i { width: 2px; height: 4px; border-radius: 1px; background: rgba(244,244,245,.4); display: block; }
+    .label { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .menu { max-height: 0; opacity: 0; transition: max-height 220ms ease, opacity 180ms ease; }
+    .island.open .menu { max-height: 180px; opacity: 1; }
+    button.act {
+      display: flex; flex-direction: column; align-items: flex-start; width: calc(100% - 12px);
+      margin: 0 6px 4px; padding: 7px 8px; border: 0; border-radius: 10px;
+      background: transparent; color: rgba(244,244,245,.92); cursor: pointer; text-align: left;
+    }
+    button.act:hover { background: rgba(255,255,255,.07); }
+    button.act small { color: rgba(244,244,245,.45); font-size: 11px; margin-top: 1px; }
+  </style>
+</head>
+<body>
+  <div class="island" id="island">
+    <button class="face" id="face" type="button" aria-expanded="false">
+      <span class="dot" id="dot"></span>
+      <span class="bars" id="bars"></span>
+      <span class="label" id="label">Listening</span>
+    </button>
+    <div class="menu" id="menu"></div>
+  </div>
+  <script>
+    const bars = document.getElementById("bars");
+    for (let i = 0; i < 10; i++) {
+      const el = document.createElement("i");
+      bars.appendChild(el);
+    }
+    const island = document.getElementById("island");
+    const label = document.getElementById("label");
+    const dot = document.getElementById("dot");
+    const face = document.getElementById("face");
+    let open = false;
+    let ws;
+    let energy = 0;
+    let thresh = 650;
+    const acts = [
+      ["Open", "Bring the deck forward", () => window.electronAPI?.restoreWindow?.()],
+      ["Weather", "Local conditions", () => ask("what is the weather here")],
+      ["Status", "CPU, memory, battery", () => ask("give me cpu, memory, and battery")],
+    ];
+    const menu = document.getElementById("menu");
+    acts.forEach(([name, hint, run]) => {
+      const b = document.createElement("button");
+      b.className = "act";
+      b.innerHTML = "<span>" + name + "</span><small>" + hint + "</small>";
+      b.onclick = () => { run(); setOpen(false); };
+      menu.appendChild(b);
+    });
+    function setOpen(next) {
+      open = next;
+      island.classList.toggle("open", open);
+      face.setAttribute("aria-expanded", String(open));
+      window.electronAPI?.resizePill?.(open);
+    }
+    face.onclick = () => setOpen(!open);
+    function ask(text) {
+      if (ws && ws.readyState === 1) ws.send(JSON.stringify({ action: "command", text }));
+      window.electronAPI?.restoreWindow?.();
+    }
+    function connect() {
+      const proto = location.protocol === "https:" ? "wss:" : "ws:";
+      ws = new WebSocket(proto + "//" + location.host + "/ws");
+      ws.onmessage = (e) => {
+        let d; try { d = JSON.parse(e.data); } catch { return; }
+        if (d.type === "audio_level") {
+          energy = energy * 0.55 + (Number(d.energy) || 0) * 0.45;
+          if (d.thresh) thresh = Number(d.thresh);
+        }
+        if (d.type === "voice" && d.state === "hearing") label.textContent = "Hearing you";
+        if (d.type === "voice" && d.state === "transcribing") label.textContent = "Transcribing";
+        if (d.type === "voice" && d.state === "listening") label.textContent = "Listening";
+        if ((d.type === "transcription" || d.type === "transcript") && d.text) label.textContent = String(d.text);
+      };
+      ws.onclose = () => setTimeout(connect, 1500);
+    }
+    connect();
+    let last = 0;
+    function paint(now) {
+      requestAnimationFrame(paint);
+      if (now - last < 80) return;
+      last = now;
+      const rel = Math.min(1, energy / Math.max(120, thresh * 1.5));
+      [...bars.children].forEach((b, i) => {
+        const shape = 0.45 + 0.55 * Math.sin((i / 9) * Math.PI);
+        b.style.height = (4 + rel * 10 * shape) + "px";
+        b.style.background = energy > thresh ? "#e4e4e7" : "rgba(244,244,245,.4)";
+      });
+      dot.style.background = energy > thresh ? "#e4e4e7" : "#a1a1aa";
+    }
+    requestAnimationFrame(paint);
+  </script>
+</body>
+</html>

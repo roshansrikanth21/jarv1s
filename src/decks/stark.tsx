@@ -1,5 +1,5 @@
 import { motion, type Variants } from "framer-motion";
-import { useEffect, useRef, useState, useMemo, type ReactElement } from "react";
+import { useEffect, useRef, useState, type ReactElement } from "react";
 import { WindowControls } from "@/components/jarvis/WindowControls";
 import { useJarvisSocket, type Role } from "@/hooks/useJarvisSocket";
 
@@ -137,25 +137,15 @@ export default function StarkDeck() {
   const state = speaking ? "speaking" : listening ? "listening" : thinking ? "thinking" : "idle";
   const active = state !== "idle";
 
-  const coreBars = useMemo(() => {
-    const b = dev.cpu / 100;
-    return Array.from({ length: 10 }, (_, i) => {
-      const n = Math.sin(i * 1.8 + dev.cpu * 0.1) * 0.35;
-      return Math.max(0.06, Math.min(1, b + n * b + 0.04));
-    });
-  }, [dev.cpu]);
-
-  const tempF = Math.round((amb.temp * 9) / 5 + 32);
-
   const MODS = [
-    { sv: "sun", l: "Light", c: "give me a full system status report", hi: true },
-    { sv: "lamp", l: "Light", c: "what do you remember about me" },
-    { sv: "shield", l: "Security", c: "scan for security issues" },
-    { sv: "speaker", l: "Noss", c: "toggle voice feedback" },
-    { sv: "gear", l: "Settings", c: "show me your current configuration" },
-    { sv: "monitor", l: "Bookmarks", c: "what is on my screen right now" },
-    { sv: "thermo", l: "Proner", c: "get me the latest tech news" },
-    { sv: "dots", l: "More", c: "what tools do you have" },
+    { sv: "sun", l: "Machine status", c: "give me cpu, memory, and battery", hi: true },
+    { sv: "lamp", l: "What you remember", c: "what do you remember about me" },
+    { sv: "shield", l: "Weather", c: "what is the weather here" },
+    { sv: "speaker", l: "Headlines", c: "what are today's headlines" },
+    { sv: "gear", l: "Time", c: "what time is it" },
+    { sv: "monitor", l: "What's on screen", c: "what is on my screen right now" },
+    { sv: "thermo", l: "Short brief", c: "give me a short status of the machine and the weather" },
+    { sv: "dots", l: "Tool list", c: "what tools do you have" },
   ];
 
   return (
@@ -287,73 +277,36 @@ export default function StarkDeck() {
             flexDirection: "column",
             gap: 5,
             paddingTop: 8,
-            overflow: "hidden",
+            overflow: "auto",
           }}
         >
-          {/* CPU HISTOGRAM */}
           <motion.div variants={slideL(0.8)} initial="hidden" animate="visible">
             <div style={{ padding: "6px 0" }}>
-              <div style={{ display: "flex", gap: 2, alignItems: "flex-end", height: 68 }}>
-                {coreBars.map((v, i) => (
+              <div style={{ display: "flex", gap: 8, alignItems: "flex-end", height: 68 }}>
+                {(
+                  [
+                    ["CPU", dev.cpu],
+                    ["Memory", dev.mem],
+                    ["Battery", dev.bat],
+                  ] as const
+                ).map(([name, value]) => (
                   <div
-                    key={i}
-                    style={{
-                      flex: 1,
-                      display: "flex",
-                      flexDirection: "column",
-                      alignItems: "center",
-                    }}
+                    key={name}
+                    style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}
                   >
                     <div
                       style={{
                         width: "100%",
                         background: `linear-gradient(to top, ${C.amberDim}, ${C.amber})`,
                         transition: "height 0.5s",
-                        height: `${v * 68}px`,
+                        height: `${Math.max(4, value) * 0.68}px`,
                       }}
                     />
+                    <span style={{ marginTop: 4, fontSize: 11, color: C.bright }}>{value}%</span>
+                    <span style={{ fontSize: 11, color: C.dim }}>{name}</span>
                   </div>
                 ))}
               </div>
-              <div style={{ display: "flex", gap: 2, marginTop: 2, fontSize: 5, color: C.dim }}>
-                {coreBars.map((v, i) => (
-                  <span key={i} style={{ flex: 1, textAlign: "center" }}>
-                    {Math.round(v * 100)}%
-                  </span>
-                ))}
-              </div>
-              <div style={{ marginTop: 5, height: 2, background: C.barBg, position: "relative" }}>
-                <div
-                  style={{
-                    height: "100%",
-                    width: `${dev.cpu}%`,
-                    background: C.bar,
-                    transition: "width 0.5s",
-                  }}
-                />
-                <div
-                  style={{
-                    position: "absolute",
-                    right: 0,
-                    top: -2,
-                    width: 5,
-                    height: 5,
-                    background: C.dim,
-                    borderRadius: "50%",
-                  }}
-                />
-              </div>
-            </div>
-          </motion.div>
-
-          {/* SYSTEM BARS */}
-          <motion.div variants={slideL(1.0)} initial="hidden" animate="visible">
-            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-              <SysBar label="CPU" value={dev.cpu} />
-              <SysBar label="GPU" value={dev.cpu > 0 ? Math.min(100, dev.cpu + 8) : 0} />
-              <SysBar label="MEMORY" value={dev.mem} />
-              <SysBar label="REMOTE" value={Math.min(100, Math.round(dev.cpu * 0.6))} />
-              <SysBar label="RESOURCE" value={dev.bat} />
             </div>
           </motion.div>
 
@@ -374,91 +327,15 @@ export default function StarkDeck() {
                   <br />
                   {amb.city}
                 </div>
-                <div style={{ textAlign: "right" }}>
-                  06:00:080
-                  <br />
-                  Wed, <HudClock />
+                <div style={{ textAlign: "right", fontSize: 11, color: C.bright }}>
+                  <HudClock />
                 </div>
               </div>
               <div style={{ fontSize: 16, fontWeight: 300, color: C.bright, margin: "4px 0 6px" }}>
-                Weather
+                {amb.desc || "Weather"}
               </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                {["rain", "cloud", "cloud", "partly", "snow"].map((w, i) => (
-                  <div key={i} style={{ textAlign: "center" }}>
-                    <WxIcon type={w} />
-                    <div style={{ fontSize: 6, color: C.dim, marginTop: 2 }}>-{i + 1}°</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </motion.div>
-
-          {/* TEMP + LOCAL TIME SPLIT */}
-          <motion.div variants={slideL(1.5)} initial="hidden" animate="visible">
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 1fr",
-                border: `1px solid ${C.border}`,
-              }}
-            >
-              <div
-                style={{
-                  padding: "8px 10px",
-                  borderRight: `1px solid ${C.border}`,
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                }}
-              >
-                <WxIcon type="partly" size={28} />
-                <div>
-                  <div style={{ fontSize: 16, fontWeight: 200, color: C.bright }}>{tempF} °F</div>
-                  <div style={{ fontSize: 6, color: C.dim }}>01001 080</div>
-                </div>
-              </div>
-              <div style={{ padding: "8px 10px" }}>
-                <div style={{ fontSize: 7, color: C.dim }}>Local Time</div>
-                <div style={{ fontSize: 20, fontWeight: 200, color: C.bright, lineHeight: 1.1 }}>
-                  14°
-                </div>
-                <div style={{ fontSize: 6, color: C.dim }}>Monday &nbsp; °F</div>
-                <div style={{ fontSize: 6, color: C.dim }}>06:36</div>
-              </div>
-            </div>
-          </motion.div>
-
-          {/* FORECAST */}
-          <motion.div variants={slideL(1.7)} initial="hidden" animate="visible">
-            <div
-              style={{
-                border: `1px solid ${C.border}`,
-                padding: "8px 10px",
-                background: C.surface,
-              }}
-            >
-              <div style={{ fontSize: 7, color: C.dim, letterSpacing: "0.15em", marginBottom: 3 }}>
-                Local Time
-              </div>
-              <div style={{ fontSize: 20, fontWeight: 200, color: C.bright, lineHeight: 1.1 }}>
-                18° FF
-              </div>
-              <div style={{ display: "flex", marginTop: 6, fontSize: 6 }}>
-                <span style={{ width: 60, color: C.text }}>Saturday</span>
-                {["MON", "THU", "FRI", "BBR", "SAT"].map((d) => (
-                  <span key={d} style={{ width: 34, color: C.dim }}>
-                    {d}
-                  </span>
-                ))}
-              </div>
-              <div style={{ display: "flex", fontSize: 6, color: C.dim }}>
-                <span style={{ width: 60 }}>Saturday</span>
-                {["36°", "34°", "29°", "28°", "26°"].map((t, i) => (
-                  <span key={i} style={{ width: 34 }}>
-                    {t}
-                  </span>
-                ))}
+              <div style={{ fontSize: 13, color: C.text }}>
+                {amb.temp ? `${amb.temp}°C` : "Waiting for weather"}
               </div>
             </div>
           </motion.div>
@@ -472,8 +349,8 @@ export default function StarkDeck() {
                 background: C.surface,
               }}
             >
-              <div style={{ fontSize: 7, color: C.dim, letterSpacing: "0.15em", marginBottom: 6 }}>
-                Local Time
+              <div style={{ fontSize: 11, color: C.dim, letterSpacing: "0.12em", marginBottom: 6 }}>
+                Microphone
               </div>
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <button
@@ -492,15 +369,9 @@ export default function StarkDeck() {
                 </button>
                 <WaveformBars level={level} active={speaking || listening} />
               </div>
-              <div style={{ display: "flex", marginTop: 4, fontSize: 5, color: C.dim }}>
-                {["MON", "TUE", "FRI", "NOON", "WODN", "MOON"].map((d) => (
-                  <span key={d} style={{ flex: 1 }}>
-                    {d}
-                  </span>
-                ))}
-              </div>
             </div>
           </motion.div>
+          <RadialMenu sendAction={sendAction} />
         </div>
 
         {/* ═══ CENTER: ORB ═══ */}
@@ -552,7 +423,7 @@ export default function StarkDeck() {
           {/* TAB BAR */}
           <motion.div variants={slideR(0.9)} initial="hidden" animate="visible">
             <div style={{ display: "flex", border: `1px solid ${C.border}` }}>
-              {["SMARTON", "REDITO", "MODE"].map((t, i) => (
+              {["Actions", "Switches", "Replies"].map((t, i) => (
                 <button
                   key={t}
                   onClick={() => setActiveTab(i)}
@@ -563,7 +434,7 @@ export default function StarkDeck() {
                     border: "none",
                     borderRight: i < 2 ? `1px solid ${C.border}` : "none",
                     color: i === activeTab ? C.bright : C.dim,
-                    fontSize: 7,
+                    fontSize: 11,
                     letterSpacing: "0.12em",
                     cursor: "pointer",
                     fontFamily: "inherit",
@@ -576,56 +447,43 @@ export default function StarkDeck() {
           </motion.div>
 
           {/* TOGGLE SWITCHES */}
+          {activeTab === 1 && (
           <motion.div variants={slideR(1.1)} initial="hidden" animate="visible">
-            <div style={{ padding: "4px 0" }}>
-              <ToggleRow icon="⌂" label="Aunation" sub="Barometer" />
-              <div style={{ height: 6 }} />
-              <ToggleRow label="Bento Chams" />
+            <div style={{ padding: "8px 2px", display: "flex", flexDirection: "column", gap: 8 }}>
+              <SettingToggle label="Listen for Jarvis" field="always_listen" />
+              <SettingToggle label="Save overheard speech" field="store_overheard" />
             </div>
           </motion.div>
+          )}
 
-          {/* ICON GRID 2x4 */}
+          {activeTab === 0 && (
           <motion.div variants={slideR(1.3)} initial="hidden" animate="visible">
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
-              {MODS.map((m, i) => (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+              {MODS.map((m) => (
                 <button
-                  key={i}
-                  className={m.hi ? "sk-btn sk-btn-hi" : "sk-btn"}
+                  key={m.l}
+                  type="button"
                   onClick={() => sendAction("command", { text: m.c })}
+                  style={{
+                    background: C.surface,
+                    color: C.bright,
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 8,
+                    padding: "10px 8px",
+                    fontSize: 12,
+                    cursor: "pointer",
+                    fontFamily: "inherit",
+                    textAlign: "left",
+                  }}
                 >
-                  <GridIcon type={m.sv} active={!!m.hi} />
-                  <span style={{ fontSize: 5, letterSpacing: "0.04em", marginTop: 2 }}>{m.l}</span>
+                  {m.l}
                 </button>
               ))}
             </div>
           </motion.div>
+          )}
 
-          {/* SEARCH BAR */}
-          <motion.div variants={slideR(1.5)} initial="hidden" animate="visible">
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span
-                style={{
-                  fontSize: 7,
-                  color: C.dim,
-                  letterSpacing: "0.12em",
-                  background: C.surface,
-                  border: `1px solid ${C.border}`,
-                  padding: "4px 8px",
-                }}
-              >
-                BOFIR
-              </span>
-              <div style={{ flex: 1, height: 1, background: C.border }} />
-              <span style={{ fontSize: 11, color: C.dim, cursor: "pointer", userSelect: "none" }}>
-                −
-              </span>
-              <span style={{ fontSize: 11, color: C.dim, cursor: "pointer", userSelect: "none" }}>
-                +
-              </span>
-            </div>
-          </motion.div>
-
-          {/* CODE / TRANSCRIPT VIEWER */}
+          {activeTab === 2 && (
           <motion.div
             variants={slideR(1.7)}
             initial="hidden"
@@ -640,22 +498,8 @@ export default function StarkDeck() {
                 flexDirection: "column",
               }}
             >
-              <div style={{ display: "flex", borderBottom: `1px solid ${C.border}`, fontSize: 7 }}>
-                <span
-                  style={{
-                    padding: "5px 10px",
-                    color: C.text,
-                    letterSpacing: "0.1em",
-                    borderBottom: `1px solid ${C.warm}`,
-                  }}
-                >
-                  FEATURES
-                </span>
-                <span style={{ padding: "5px 10px", color: C.dim, letterSpacing: "0.1em" }}>
-                  HOME
-                </span>
-                <div style={{ flex: 1 }} />
-                <span style={{ padding: "5px 10px", color: C.dim, cursor: "pointer" }}>⌕</span>
+              <div style={{ padding: "8px 10px", fontSize: 12, color: C.bright, borderBottom: `1px solid ${C.border}` }}>
+                Replies
               </div>
               <div
                 ref={scrollRef}
@@ -681,6 +525,7 @@ export default function StarkDeck() {
               </div>
             </div>
           </motion.div>
+          )}
         </div>
       </div>
 
@@ -751,9 +596,6 @@ export default function StarkDeck() {
         </div>
       </motion.div>
 
-      {/* RADIAL MENU OVERLAY */}
-      <RadialMenu sendAction={sendAction} />
-
       {/* BOTTOM DATA STRINGS */}
       <motion.div
         variants={fade(2.4)}
@@ -775,23 +617,6 @@ export default function StarkDeck() {
       >
         <span>008909080</span>
         <span>008080008</span>
-      </motion.div>
-
-      {/* 4-POINT STAR */}
-      <motion.div
-        variants={scaleIn(0.6)}
-        initial="hidden"
-        animate="visible"
-        style={{
-          position: "absolute",
-          bottom: 64,
-          right: 50,
-          zIndex: 5,
-        }}
-      >
-        <svg width="42" height="42" viewBox="0 0 24 24" opacity="0.45">
-          <path d="M12 0L14 10L24 12L14 14L12 24L10 14L0 12L10 10Z" fill={C.text} />
-        </svg>
       </motion.div>
 
       {/* LEFT EDGE TICK */}
@@ -1104,6 +929,56 @@ function Msg({ role, text, streaming }: { role: Role; text: string; streaming?: 
       {!me && <span style={{ fontSize: 6, color: C.dim, letterSpacing: "0.12em" }}>JARVIS </span>}
       {text}
       {streaming && <span style={{ animation: "sk-blink 1s steps(1) infinite" }}>▋</span>}
+    </div>
+  );
+}
+
+function SettingToggle({ label, field }: { label: string; field: "always_listen" | "store_overheard" }) {
+  const [on, setOn] = useState(false);
+  useEffect(() => {
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then((d) => setOn(Boolean(d?.[field])))
+      .catch(() => {});
+  }, [field]);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "2px 4px" }}>
+      <div style={{ flex: 1, fontSize: 12, color: C.bright }}>{label}</div>
+      <button
+        type="button"
+        aria-pressed={on}
+        onClick={() => {
+          const next = !on;
+          setOn(next);
+          fetch("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ [field]: next }),
+          }).catch(() => setOn(!next));
+        }}
+        style={{
+          width: 36,
+          height: 18,
+          borderRadius: 9,
+          border: `1px solid ${C.border}`,
+          background: on ? C.amber : C.barBg,
+          cursor: "pointer",
+          position: "relative",
+          padding: 0,
+        }}
+      >
+        <div
+          style={{
+            position: "absolute",
+            top: 2,
+            left: on ? 18 : 2,
+            width: 12,
+            height: 12,
+            borderRadius: "50%",
+            background: C.bright,
+          }}
+        />
+      </button>
     </div>
   );
 }
@@ -1572,13 +1447,12 @@ function RadialMenu({
       initial="hidden"
       animate="visible"
       style={{
-        position: "absolute",
-        top: "46%",
-        left: 170,
-        transform: "translate(-50%, -50%)",
+        position: "relative",
         width: s,
         height: s,
-        zIndex: 8,
+        margin: "8px auto 0",
+        flexShrink: 0,
+        zIndex: 2,
         pointerEvents: "none",
       }}
     >

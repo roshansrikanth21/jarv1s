@@ -374,6 +374,58 @@ function saveWindowState() {
   }
 }
 
+let pillWindow;
+
+function pillPageUrl() {
+  const base = isDev && process.env.JARVIS_USE_VITE === "1" ? devUiUrl : backendUrl;
+  return `${base.replace(/\/$/, "")}/pill.html`;
+}
+
+function showDesktopPill() {
+  if (appIsQuitting) return;
+  if (pillWindow && !pillWindow.isDestroyed()) {
+    pillWindow.showInactive();
+    pillWindow.moveTop();
+    return;
+  }
+  const area = screen.getPrimaryDisplay().workArea;
+  pillWindow = new BrowserWindow({
+    width: 200,
+    height: 44,
+    x: Math.round(area.x + (area.width - 200) / 2),
+    y: area.y + 8,
+    frame: false,
+    transparent: true,
+    backgroundColor: "#00000000",
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    resizable: false,
+    focusable: true,
+    show: true,
+    hasShadow: false,
+    thickFrame: false,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      nodeIntegration: false,
+      contextIsolation: true,
+      backgroundThrottling: false,
+    },
+  });
+  pillWindow.setAlwaysOnTop(true, "screen-saver");
+  pillWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  pillWindow.loadURL(pillPageUrl());
+  pillWindow.webContents.on("did-fail-load", (_e, code, desc) => {
+    console.error("[Electron] Desktop pill failed to load", code, desc, pillPageUrl());
+  });
+  pillWindow.on("closed", () => {
+    pillWindow = null;
+  });
+}
+
+function hideDesktopPill() {
+  if (pillWindow && !pillWindow.isDestroyed()) pillWindow.hide();
+}
+
 function createWindow() {
   const saved = loadWindowState();
   mainWindow = new BrowserWindow({
@@ -409,12 +461,19 @@ function createWindow() {
     mainWindow.focus();
   });
 
+  mainWindow.on("minimize", () => {
+    mainWindow?.webContents.setBackgroundThrottling(true);
+    showDesktopPill();
+  });
   mainWindow.on("hide", () => {
     mainWindow?.webContents.setBackgroundThrottling(true);
+    showDesktopPill();
   });
 
+  mainWindow.on("restore", () => hideDesktopPill());
   mainWindow.on("show", () => {
     mainWindow?.webContents.setBackgroundThrottling(false);
+    hideDesktopPill();
   });
 
   mainWindow.on("close", (event) => {
@@ -726,13 +785,34 @@ function stopTrading() {
 ipcMain.handle("open-trading", openTradingTerminal);
 
 ipcMain.on("window-hide", () => mainWindow?.hide());
-ipcMain.on("window-minimize", () => mainWindow?.minimize());
+ipcMain.on("window-minimize", () => {
+  mainWindow?.minimize();
+  setTimeout(showDesktopPill, 60);
+});
 ipcMain.on("window-toggle-maximize", () => {
   if (!mainWindow) return;
   mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
 });
 ipcMain.on("window-close", () => {
   if (mainWindow) mainWindow.hide();
+});
+ipcMain.on("pill-restore", () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+});
+ipcMain.on("pill-resize", (_event, open) => {
+  if (!pillWindow || pillWindow.isDestroyed()) return;
+  const area = screen.getPrimaryDisplay().workArea;
+  const w = open ? 240 : 200;
+  const h = open ? 228 : 44;
+  pillWindow.setBounds({
+    x: Math.round(area.x + (area.width - w) / 2),
+    y: area.y + 8,
+    width: w,
+    height: h,
+  });
 });
 ipcMain.handle("backend-restart", restartBackend);
 

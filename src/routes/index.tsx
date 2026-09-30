@@ -130,6 +130,15 @@ function Page() {
     };
   }, []);
 
+  const pill = new URLSearchParams(window.location.search).get("surface") === "pill";
+  if (pill) {
+    return (
+      <div style={{ minHeight: "100vh", background: "transparent" }}>
+        <MicMonitor />
+      </div>
+    );
+  }
+
   const Deck = DECKS[preset as keyof typeof DECKS] ?? PrimeDeck;
   return (
     <>

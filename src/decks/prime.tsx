@@ -249,10 +249,10 @@ export default function PrimeDeck() {
     showReconnectHint,
     pendingApproval,
     respondApproval,
-  } = useJarvisSocket("Ready. Speak or type below.");
+  } = useJarvisSocket("Online.");
 
   const [feed, setFeed] = useState<Feed[]>([
-    { id: fid(), at: now(), kind: "system", text: "Ready. Speak or type below." },
+    { id: fid(), at: now(), kind: "system", text: "Online." },
   ]);
   const [input, setInput] = useState("");
   const [busyText, setBusyText] = useState<string | null>(null);
@@ -718,54 +718,56 @@ export default function PrimeDeck() {
       <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* ═══ header ═══ */}
       <header className="pr-header drag">
-        <div className="no-drag" style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+        <div className="no-drag" style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0, overflow: "hidden" }}>
           <span className="pr-wordmark">
             JARV<em>1</em>S
           </span>
-          <span className="pr-header-sub">prime</span>
+          <div className="pr-statusline no-drag">
+            <span>{stateWord}</span>
+            <span style={{ opacity: 0.35 }}>·</span>
+            <span>
+              engine <b>{brainLine}</b>
+            </span>
+            <span style={{ opacity: 0.35 }}>·</span>
+            <span>
+              mode <b>{govMode}</b>
+            </span>
+            {homeo && (
+              <>
+                <span style={{ opacity: 0.35 }}>·</span>
+                <span>
+                  energy <b className="pr-num">{pct(energy)}</b> {homeo.label}
+                </span>
+              </>
+            )}
+            {mood?.enabled && (
+              <>
+                <span style={{ opacity: 0.35 }}>·</span>
+                <span title={mood.colour ?? mood.emotion}>
+                  mood <b>{mood.emotion}</b>
+                </span>
+              </>
+            )}
+          </div>
         </div>
-        <div className="pr-statusline no-drag">
-          <span>{stateWord}</span>
-          <span style={{ opacity: 0.35 }}>·</span>
-          <span>
-            engine <b>{brainLine}</b>
-          </span>
-          <span style={{ opacity: 0.35 }}>·</span>
-          <span>
-            mode <b>{govMode}</b>
-          </span>
-          {homeo && (
-            <>
-              <span style={{ opacity: 0.35 }}>·</span>
-              <span>
-                energy <b className="pr-num">{pct(energy)}</b> {homeo.label}
-              </span>
-            </>
-          )}
-          {mood?.enabled && (
-            <>
-              <span style={{ opacity: 0.35 }}>·</span>
-              <span title={mood.colour ?? mood.emotion}>
-                mood <b>{mood.emotion}</b>
-              </span>
-            </>
-          )}
+        <div aria-hidden />
+        <div className="no-drag" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", minWidth: 0 }}>
+          <div className="pr-trust" title="Connection, mic, and speaker status">
+            <span className="pr-trust-item">
+              <i className={`pr-trust-dot ${connected ? "pr-trust-dot--on" : ""}`} />
+              <span className="pr-lab">conn</span>
+            </span>
+            <span className="pr-trust-item">
+              <i className={`pr-trust-dot ${listening ? "pr-trust-dot--hot" : ""}`} />
+              <span className="pr-lab">mic</span>
+            </span>
+            <span className="pr-trust-item">
+              <i className={`pr-trust-dot ${speaking ? "pr-trust-dot--tx" : ""}`} />
+              <span className="pr-lab">speak</span>
+            </span>
+          </div>
+          <WindowControls variant="prime" onSettings={() => setSettingsOpen(true)} />
         </div>
-        <div className="pr-trust no-drag" title="Connection, mic, and speaker status">
-          <span className="pr-trust-item">
-            <i className={`pr-trust-dot ${connected ? "pr-trust-dot--on" : ""}`} />
-            <span className="pr-lab">conn</span>
-          </span>
-          <span className="pr-trust-item">
-            <i className={`pr-trust-dot ${listening ? "pr-trust-dot--hot" : ""}`} />
-            <span className="pr-lab">mic</span>
-          </span>
-          <span className="pr-trust-item">
-            <i className={`pr-trust-dot ${speaking ? "pr-trust-dot--tx" : ""}`} />
-            <span className="pr-lab">speak</span>
-          </span>
-        </div>
-        <WindowControls variant="prime" onSettings={() => setSettingsOpen(true)} />
       </header>
 
       <div className="pr-body">
@@ -856,7 +858,7 @@ export default function PrimeDeck() {
             type="button"
             className="pr-orb-stage no-drag"
             onClick={toggleMic}
-            title={listening ? "Stop listening" : "Tap core — speak"}
+            title={listening ? "Stop listening" : "Click to speak"}
           >
             {/* Reticle lives INSIDE the stage so it's always concentric with the orb — as a
                 sibling it centered on the column and drifted above the orb (the caption below
@@ -876,7 +878,7 @@ export default function PrimeDeck() {
 
           <div className="pr-arena-foot">
             <ContentPanel data={contentPanel} onDismiss={() => setContentPanel(null)} />
-            <span className="pr-lab">core · {stateWord}</span>
+            <span className="pr-lab">{stateWord}</span>
             {busyText && !agentCaption && (
               <p className="pr-arena-thinking">
                 <span className="pr-thinking-dots" aria-hidden />
@@ -891,7 +893,7 @@ export default function PrimeDeck() {
               </p>
             )}
             {!agentCaption && !busyText && (
-              <p className="pr-arena-idle">Tap the core to speak · type in the activity panel</p>
+              <p className="pr-arena-idle">Click the core, or type below</p>
             )}
           </div>
         </main>

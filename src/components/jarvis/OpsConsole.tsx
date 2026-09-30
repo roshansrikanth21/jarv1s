@@ -220,7 +220,7 @@ export function OpsConsole({
           }}
         />
         <span style={{ fontSize: 12, letterSpacing: "0.26em", fontWeight: 700, color: accent }}>
-          LIVE OPS CONSOLE
+          Activity
         </span>
         <span style={{ fontSize: 9, color: "var(--c-muted)", letterSpacing: "0.06em" }}>
           {opCount} operation{opCount === 1 ? "" : "s"} · ground truth

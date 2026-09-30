@@ -90,16 +90,6 @@ export default function FocusDeck() {
                 }}
               />
               <span style={{ fontSize: 13, letterSpacing: "0.32em", fontWeight: 600 }}>JARVIS</span>
-              <span
-                style={{
-                  fontSize: 9,
-                  color: "rgba(232, 238, 242, 0.55)",
-                  letterSpacing: "0.2em",
-                  textTransform: "uppercase",
-                }}
-              >
-                focus
-              </span>
             </div>
             {mood?.enabled && (
               <div

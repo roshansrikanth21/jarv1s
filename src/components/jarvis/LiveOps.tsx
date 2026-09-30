@@ -214,7 +214,7 @@ export function LiveOps() {
           boxShadow: `0 0 18px ${ACCENT}22`,
         }}
       >
-        ● LIVE OPS{unseen > 0 && !open ? ` (${unseen})` : ""}
+        Activity{unseen > 0 && !open ? ` (${unseen})` : ""}
       </button>
 
       {/* drawer */}
@@ -240,7 +240,7 @@ export function LiveOps() {
       >
         <div style={{ padding: "14px 14px 10px", borderBottom: `1px solid ${ACCENT}22` }}>
           <div style={{ fontSize: 12, letterSpacing: "0.28em", color: ACCENT, fontWeight: 700 }}>
-            ● LIVE OPS
+            Activity
           </div>
           <div style={{ fontSize: 9.5, color: "#7fa094", marginTop: 5, lineHeight: 1.45 }}>
             Real tool executions only. If JARVIS claims it did something and there's no card here,

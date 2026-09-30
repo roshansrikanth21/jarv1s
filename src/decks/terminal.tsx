@@ -76,7 +76,7 @@ export default function TerminalDeck() {
             fontSize: 11,
           }}
         >
-          <span style={{ letterSpacing: "0.15em" }}>JARVIS://terminal</span>
+          <span style={{ letterSpacing: "0.15em" }}>JARVIS</span>
           <span style={{ opacity: 0.85 }}>
             {mood?.enabled ? `[${mood.emotion}] ` : ""}
             {connected
