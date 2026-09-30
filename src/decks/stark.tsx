@@ -269,7 +269,12 @@ export default function StarkDeck() {
                 ).map(([name, value]) => (
                   <div
                     key={name}
-                    style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}
+                    style={{
+                      flex: 1,
+                      display: "flex",
+                      flexDirection: "column",
+                      alignItems: "center",
+                    }}
                   >
                     <div
                       style={{
@@ -427,85 +432,92 @@ export default function StarkDeck() {
 
           {/* TOGGLE SWITCHES */}
           {activeTab === 1 && (
-          <motion.div variants={slideR(1.1)} initial="hidden" animate="visible">
-            <div style={{ padding: "8px 2px", display: "flex", flexDirection: "column", gap: 8 }}>
-              <SettingToggle label="Listen for Jarvis" field="always_listen" />
-              <SettingToggle label="Save overheard speech" field="store_overheard" />
-            </div>
-          </motion.div>
+            <motion.div variants={slideR(1.1)} initial="hidden" animate="visible">
+              <div style={{ padding: "8px 2px", display: "flex", flexDirection: "column", gap: 8 }}>
+                <SettingToggle label="Listen for Jarvis" field="always_listen" />
+                <SettingToggle label="Save overheard speech" field="store_overheard" />
+              </div>
+            </motion.div>
           )}
 
           {activeTab === 0 && (
-          <motion.div variants={slideR(1.3)} initial="hidden" animate="visible">
-            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 6 }}>
-              {MODS.map((m) => (
-                <button
-                  key={m.l}
-                  type="button"
-                  onClick={() => sendAction("command", { text: m.c })}
-                  style={{
-                    background: C.surface,
-                    color: C.bright,
-                    border: `1px solid ${C.border}`,
-                    borderRadius: 8,
-                    padding: "8px 10px",
-                    fontSize: 13,
-                    lineHeight: 1.3,
-                    cursor: "pointer",
-                    fontFamily: "inherit",
-                    textAlign: "left",
-                    whiteSpace: "normal",
-                  }}
-                >
-                  {m.l}
-                </button>
-              ))}
-            </div>
-          </motion.div>
+            <motion.div variants={slideR(1.3)} initial="hidden" animate="visible">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 6 }}>
+                {MODS.map((m) => (
+                  <button
+                    key={m.l}
+                    type="button"
+                    onClick={() => sendAction("command", { text: m.c })}
+                    style={{
+                      background: C.surface,
+                      color: C.bright,
+                      border: `1px solid ${C.border}`,
+                      borderRadius: 8,
+                      padding: "8px 10px",
+                      fontSize: 13,
+                      lineHeight: 1.3,
+                      cursor: "pointer",
+                      fontFamily: "inherit",
+                      textAlign: "left",
+                      whiteSpace: "normal",
+                    }}
+                  >
+                    {m.l}
+                  </button>
+                ))}
+              </div>
+            </motion.div>
           )}
 
           {activeTab === 2 && (
-          <motion.div
-            variants={slideR(1.7)}
-            initial="hidden"
-            animate="visible"
-            style={{ flex: 1, minHeight: 0 }}
-          >
-            <div
-              style={{
-                border: `1px solid ${C.border}`,
-                height: "100%",
-                display: "flex",
-                flexDirection: "column",
-              }}
+            <motion.div
+              variants={slideR(1.7)}
+              initial="hidden"
+              animate="visible"
+              style={{ flex: 1, minHeight: 0 }}
             >
-              <div style={{ padding: "8px 10px", fontSize: 12, color: C.bright, borderBottom: `1px solid ${C.border}` }}>
-                Replies
-              </div>
               <div
-                ref={scrollRef}
                 style={{
-                  flex: 1,
-                  overflowY: "auto",
-                  padding: "6px 10px",
+                  border: `1px solid ${C.border}`,
+                  height: "100%",
                   display: "flex",
                   flexDirection: "column",
-                  gap: 4,
                 }}
               >
-                {lines.length > 0 || stream ? (
-                  <>
-                    {lines.slice(-40).map((l) => (
-                      <Msg key={l.id} role={l.role} text={l.text} />
-                    ))}
-                    {stream && <Msg role="agent" text={stream} streaming />}
-                  </>
-                ) : (
-                  <CodePlaceholder />
-                )}
+                <div
+                  style={{
+                    padding: "8px 10px",
+                    fontSize: 12,
+                    color: C.bright,
+                    borderBottom: `1px solid ${C.border}`,
+                  }}
+                >
+                  Replies
+                </div>
+                <div
+                  ref={scrollRef}
+                  style={{
+                    flex: 1,
+                    overflowY: "auto",
+                    padding: "6px 10px",
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 4,
+                  }}
+                >
+                  {lines.length > 0 || stream ? (
+                    <>
+                      {lines.slice(-40).map((l) => (
+                        <Msg key={l.id} role={l.role} text={l.text} />
+                      ))}
+                      {stream && <Msg role="agent" text={stream} streaming />}
+                    </>
+                  ) : (
+                    <CodePlaceholder />
+                  )}
+                </div>
               </div>
-            </div>
-          </motion.div>
+            </motion.div>
           )}
         </div>
       </div>
@@ -891,7 +903,13 @@ function Msg({ role, text, streaming }: { role: Role; text: string; streaming?: 
   );
 }
 
-function SettingToggle({ label, field }: { label: string; field: "always_listen" | "store_overheard" }) {
+function SettingToggle({
+  label,
+  field,
+}: {
+  label: string;
+  field: "always_listen" | "store_overheard";
+}) {
   const [on, setOn] = useState(false);
   useEffect(() => {
     fetch("/api/settings")

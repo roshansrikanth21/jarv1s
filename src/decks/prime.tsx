@@ -718,7 +718,16 @@ export default function PrimeDeck() {
       <ToolApprovalBanner request={pendingApproval} onRespond={respondApproval} />
       {/* ═══ header ═══ */}
       <header className="pr-header drag">
-        <div className="no-drag" style={{ display: "flex", alignItems: "center", gap: 12, minWidth: 0, overflow: "hidden" }}>
+        <div
+          className="no-drag"
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            minWidth: 0,
+            overflow: "hidden",
+          }}
+        >
           <span className="pr-wordmark">
             JARV<em>1</em>S
           </span>
@@ -751,7 +760,10 @@ export default function PrimeDeck() {
           </div>
         </div>
         <div aria-hidden />
-        <div className="no-drag" style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", minWidth: 0 }}>
+        <div
+          className="no-drag"
+          style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", minWidth: 0 }}
+        >
           <div className="pr-trust" title="Connection, mic, and speaker status">
             <span className="pr-trust-item">
               <i className={`pr-trust-dot ${connected ? "pr-trust-dot--on" : ""}`} />

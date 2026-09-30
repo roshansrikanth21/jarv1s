@@ -26,7 +26,9 @@ export function MicMonitor() {
 
   useEffect(() => {
     if (!dock) return;
-    (window as Window & { electronAPI?: { resizePill?: (open: boolean) => void } }).electronAPI?.resizePill?.(open);
+    (
+      window as Window & { electronAPI?: { resizePill?: (open: boolean) => void } }
+    ).electronAPI?.resizePill?.(open);
   }, [dock, open]);
 
   useEffect(() => {
@@ -147,10 +149,20 @@ export function MicMonitor() {
       name: "Open",
       hint: "Bring the deck forward",
       run: () =>
-        (window as Window & { electronAPI?: { restoreWindow?: () => void } }).electronAPI?.restoreWindow?.(),
+        (
+          window as Window & { electronAPI?: { restoreWindow?: () => void } }
+        ).electronAPI?.restoreWindow?.(),
     },
-    { name: "Weather", hint: "Ask for the local forecast", run: () => ask("what is the weather here") },
-    { name: "Status", hint: "CPU, memory, battery", run: () => ask("give me cpu, memory, and battery") },
+    {
+      name: "Weather",
+      hint: "Ask for the local forecast",
+      run: () => ask("what is the weather here"),
+    },
+    {
+      name: "Status",
+      hint: "CPU, memory, battery",
+      run: () => ask("give me cpu, memory, and battery"),
+    },
     {
       name: state === "off" ? "Listen" : "Pause",
       hint: state === "off" ? "Turn the microphone on" : "Stop listening",
@@ -207,10 +219,20 @@ export function MicMonitor() {
             cursor: "pointer",
           }}
         >
-          <span style={{ width: 6, height: 6, borderRadius: "50%", background: dot, flexShrink: 0 }} />
+          <span
+            style={{ width: 6, height: 6, borderRadius: "50%", background: dot, flexShrink: 0 }}
+          />
           <div ref={barsRef} style={{ display: "flex", alignItems: "center", gap: 2, height: 16 }}>
             {Array.from({ length: BARS }).map((_, i) => (
-              <span key={i} style={{ width: 2, height: 4, borderRadius: 1, background: "rgba(232,236,240,0.35)" }} />
+              <span
+                key={i}
+                style={{
+                  width: 2,
+                  height: 4,
+                  borderRadius: 1,
+                  background: "rgba(232,236,240,0.35)",
+                }}
+              />
             ))}
           </div>
           <span style={{ fontSize: 12, letterSpacing: "0.01em", whiteSpace: "nowrap" }}>
@@ -245,7 +267,9 @@ export function MicMonitor() {
                 }}
               >
                 <span style={{ fontSize: 13 }}>{item.name}</span>
-                <span style={{ fontSize: 11, color: "rgba(232,236,240,0.45)", marginTop: 1 }}>{item.hint}</span>
+                <span style={{ fontSize: 11, color: "rgba(232,236,240,0.45)", marginTop: 1 }}>
+                  {item.hint}
+                </span>
               </button>
             ))}
           </div>
