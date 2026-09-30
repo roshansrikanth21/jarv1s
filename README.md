@@ -96,41 +96,20 @@ Subsystem map (same capabilities, named by module):
 ## Architecture
 
 ```mermaid
-flowchart LR
-  subgraph Shell["Electron shell"]
-    UI["React decks, Vite 8080"]
-    Keys["OS safeStorage keys"]
-  end
-
-  subgraph Backend["Python api.py"]
-    WS["FastAPI and WebSocket"]
-    Gov["Governor"]
-    Cortex["Cortex"]
-    Skills["Playbooks"]
-    Tools["Tool runtime"]
-    Voice["STT, TTS, VAD"]
-  end
-
-  subgraph External["External, optional"]
-    Groq["Groq"]
-    Claude["Anthropic"]
-    Ollama["Ollama"]
-    Edge["Edge TTS"]
-    Docker["Docker recon image"]
-  end
-
-  UI <-->|"api and ws, same port"| WS
-  Keys -->|env at spawn| Backend
-  WS --> Gov --> Tools
-  WS --> Cortex
-  WS --> Skills
-  WS --> Voice
-  Gov --> Groq
-  Gov --> Claude
-  Gov --> Ollama
-  Voice --> Edge
+graph LR
+  UI[React decks] --> WS[FastAPI]
+  Keys[safeStorage] --> WS
+  WS --> Gov[Governor]
+  WS --> Cortex[Cortex]
+  WS --> Skills[Playbooks]
+  WS --> Voice[Voice]
+  Gov --> Groq[Groq]
+  Gov --> Claude[Anthropic]
+  Gov --> Ollama[Ollama]
+  Gov --> Tools[Tools]
   Voice --> Groq
-  Tools --> Docker
+  Voice --> Edge[Edge TTS]
+  Tools --> Docker[Docker]
 ```
 
 ```mermaid
