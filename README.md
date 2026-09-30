@@ -98,28 +98,28 @@ Subsystem map (same capabilities, named by module):
 ```mermaid
 flowchart LR
   subgraph Shell["Electron shell"]
-    UI["React decks<br/>Vite :8080 in desktop:dev"]
-    Keys["OS safeStorage<br/>GROQ / ANTHROPIC / MEM0"]
+    UI["React decks, Vite 8080"]
+    Keys["OS safeStorage keys"]
   end
 
-  subgraph Backend["Python · api.py"]
-    WS["FastAPI + WebSocket"]
+  subgraph Backend["Python api.py"]
+    WS["FastAPI and WebSocket"]
     Gov["Governor"]
     Cortex["Cortex"]
-    Skills["jarvis/playbooks"]
+    Skills["Playbooks"]
     Tools["Tool runtime"]
-    Voice["STT / TTS / VAD"]
+    Voice["STT, TTS, VAD"]
   end
 
-  subgraph External["External (optional)"]
+  subgraph External["External, optional"]
     Groq["Groq"]
     Claude["Anthropic"]
     Ollama["Ollama"]
     Edge["Edge TTS"]
-    Docker["Docker · jarvis-recon"]
+    Docker["Docker recon image"]
   end
 
-  UI <-->|"/api · /ws<br/>(same JARVIS_PORT)"| WS
+  UI <-->|"api and ws, same port"| WS
   Keys -->|env at spawn| Backend
   WS --> Gov --> Tools
   WS --> Cortex
@@ -138,21 +138,21 @@ sequenceDiagram
   participant U as User
   participant FE as React deck
   participant API as api.py
-  participant C as Cortex / skills
+  participant C as Cortex
   participant G as Governor
   participant B as Brain
   participant T as Tools
 
-  U->>FE: text / mic
-  FE->>API: WebSocket action:command
-  API->>C: build_system_prompt (+ skills catalog)
+  U->>FE: text or mic
+  FE->>API: WebSocket command
+  API->>C: build system prompt
   API->>G: choose rung
-  G->>B: chat (+ tool schemas)
+  G->>B: chat with tool schemas
   B->>T: tool calls
   T-->>B: observations
   B-->>API: answer
-  API->>FE: tokens / state / TTS
-  API->>C: record_turn (async extract)
+  API->>FE: tokens, state, TTS
+  API->>C: record turn
 ```
 
 **Port contract:** in `desktop:dev`, Vite proxies `/api` and `/ws` to `http://127.0.0.1:${JARVIS_PORT||8000}`. The backend must listen on that same port. Desktop mode does **not** silently bind a different free port when the preferred port is taken — otherwise the UI and API would disagree about where the backend lives.
