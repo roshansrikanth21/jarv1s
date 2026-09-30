@@ -50,8 +50,8 @@ debug-*.log
 # Machine-local audit runs, agent scratch, import profiles (never commit)
 .local/
 
-# Local editor / agent settings (machine-specific)
-.claude/settings.local.json
+# Local editor / agent settings (machine-specific, may contain absolute paths)
+.claude/
 .serena/
 
 # Playwright

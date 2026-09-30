@@ -167,7 +167,7 @@ def _notify(title: str, message: str) -> None:
     """Fire a Windows toast via JARVIS's desktop layer (falls back to plyer, then silent)."""
     try:
         sys.path.insert(0, str(ROOT.parent))   # repo root, where desktop.py lives
-        import desktop
+        import jarvis.act.desktop as desktop
         # desktop.notify(title, message) — same call the `desktop` tool uses.
         desktop.notify(title, message)         # type: ignore[attr-defined]
         return

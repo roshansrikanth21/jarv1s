@@ -52,6 +52,25 @@ const drawH = (d = 0): Variants => ({
 type Dev = { cpu: number; mem: number; bat: number };
 type Amb = { city: string; temp: number; desc: string };
 
+/** Owns the 1Hz tick so the rest of the deck does not re-render every second. */
+function HudClock() {
+  const [clock, setClock] = useState("");
+  useEffect(() => {
+    const tick = () =>
+      setClock(
+        new Date().toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        }),
+      );
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+  return <>{clock}</>;
+}
+
 export default function StarkDeck() {
   const {
     connected,
@@ -68,28 +87,12 @@ export default function StarkDeck() {
   const [input, setInput] = useState("");
   const [dev, setDev] = useState<Dev>({ cpu: 0, mem: 0, bat: 0 });
   const [amb, setAmb] = useState<Amb>({ city: "—", temp: 0, desc: "" });
-  const [clock, setClock] = useState("");
   const [activeTab, setActiveTab] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 9e6, behavior: "smooth" });
   }, [lines.length, stream]);
-  useEffect(() => {
-    const t = setInterval(
-      () =>
-        setClock(
-          new Date().toLocaleTimeString([], {
-            hour: "2-digit",
-            minute: "2-digit",
-            second: "2-digit",
-          }),
-        ),
-      1000,
-    );
-    return () => clearInterval(t);
-  }, []);
-
   useEffect(() => {
     let alive = true;
     const pull = () =>
@@ -374,7 +377,7 @@ export default function StarkDeck() {
                 <div style={{ textAlign: "right" }}>
                   06:00:080
                   <br />
-                  Wed, {clock}
+                  Wed, <HudClock />
                 </div>
               </div>
               <div style={{ fontSize: 16, fontWeight: 300, color: C.bright, margin: "4px 0 6px" }}>

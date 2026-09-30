@@ -12,13 +12,13 @@ stale data.
 Config (Claude Desktop example, claude_desktop_config.json) — use YOUR paths:
     "jarvis-memory": {
       "command": "C:\\path\\to\\jarv1s\\venv\\Scripts\\python.exe",
-      "args": ["C:\\path\\to\\jarv1s\\memory_mcp.py"],
+      "args": ["-m", "jarvis.memory_mcp"],
       "env": { "JARVIS_MEMORY_SOURCE": "claude" }
     }
 Gemini CLI (~/.gemini/settings.json) uses the same command/args shape with
 JARVIS_MEMORY_SOURCE=gemini, so provenance survives per client.
 
-ChatGPT mode:  python memory_mcp.py --http [port]
+ChatGPT mode:  python -m jarvis.memory_mcp --http [port]
 Runs the same two tools as a streamable-HTTP MCP server on 127.0.0.1:<port>/mcp
 (default 8765), guarded by JARVIS_MEMORY_TOKEN as a bearer token. ChatGPT can't
 reach localhost, so tunnel it when you want it connected, e.g.:
@@ -33,13 +33,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from pathlib import Path
-
 from mcp.server.fastmcp import FastMCP
+
+from jarvis.paths import ROOT
 
 # Pick up JARVIS_MEMORY_TOKEN etc. from the repo .env (same loader behaviour as api.py:
 # existing environment wins, .env fills the gaps).
-_env_file = Path(__file__).resolve().parent / ".env"
+_env_file = ROOT / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
         _line = _line.strip()

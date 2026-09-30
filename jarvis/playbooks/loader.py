@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from jarvis.paths import ROOT
+
 log = logging.getLogger("jarvis.skills")
 
 try:
@@ -31,9 +33,9 @@ except ImportError:  # pragma: no cover — requirements.txt pins PyYAML; soft-f
 _raw_root = (os.environ.get("JARVIS_SKILLS_DIR") or "").strip()
 if _raw_root:
     _p = Path(_raw_root)
-    SKILLS_ROOT = _p if _p.is_absolute() else (Path(__file__).parent / _p).resolve()
+    SKILLS_ROOT = _p if _p.is_absolute() else (ROOT / _p).resolve()
 else:
-    SKILLS_ROOT = (Path(__file__).parent / "skills").resolve()
+    SKILLS_ROOT = (ROOT / "skills").resolve()
 
 # Bundled seed skills — create() refuses to overwrite these unless force=True.
 SEED_SLUGS = frozenset({"deep-web-research", "market-brief", "system-triage"})

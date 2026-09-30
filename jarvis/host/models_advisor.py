@@ -15,6 +15,8 @@ import shutil
 import time
 from pathlib import Path
 
+from jarvis.paths import ROOT
+
 import importlib.util as _ilu
 
 # Availability without importing — the real `ollama` import (~1.5s) is deferred to _ollama_mod()
@@ -118,7 +120,7 @@ RAM_RESERVE_PCT = 0.15          # % of total RAM held back for the OS + apps
 RAM_USABLE_PCT = 0.70           # max share of (total − reserve) offered to a model
 MODEL_RAM_OVERHEAD = 1.35       # weights + KV cache / activations beyond on-disk size
 MAX_RECOMMENDATIONS = 5
-_BENCH_FILE = Path(__file__).resolve().parent / "memory" / "jarvis_model_benchmarks.json"
+_BENCH_FILE = ROOT / "memory" / "jarvis_model_benchmarks.json"
 _INST_CACHE_TTL = 45.0
 _inst_cache: dict = {"at": 0.0, "data": []}
 _tools_cache: dict[str, tuple[float, bool]] = {}

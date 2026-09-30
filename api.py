@@ -57,19 +57,18 @@ _tcap = str(max(1, min(4, (os.cpu_count() or 4))))
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_var, _tcap)
 
-import desktop
-import device
-import governor
-import models_advisor
-import skills
-
-import ambient
-import briefing
-import perception
-import persona as persona_mod
-import subagents
-import system_monitor
-import web_search as websearch_mod
+import jarvis.host.device as device
+import jarvis.host.system_monitor as system_monitor
+import jarvis.host.models_advisor as models_advisor
+import jarvis.cognition.governor as governor
+import jarvis.playbooks.loader as skills
+import jarvis.presence.ambient as ambient
+import jarvis.presence.briefing as briefing
+import jarvis.presence.perception as perception
+import jarvis.presence.persona as persona_mod
+import jarvis.agents.subagents as subagents
+import jarvis.act.desktop as desktop
+import jarvis.act.web_search as websearch_mod
 
 import cortex
 from jarvis.memory.dialogue import DialogueStore
@@ -209,6 +208,30 @@ def _groq_key_rejected() -> bool:
     return _rotate_groq_key("auth failure")
 
 
+def _pick_served_groq_model(key: str, *, avoid: str = "") -> str:
+    """Chat model this key can call when the configured id 404s.
+
+    Groq retires model ids without notice. The fallback is the account's live
+    /models list. Whisper, TTS, and classifier models are skipped.
+    """
+    req = urllib.request.Request(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {key}", "User-Agent": "jarvis/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return ""
+    ids = [m.get("id", "") for m in payload.get("data", []) if m.get("id") and m["id"] != avoid]
+    skip = ("whisper", "orpheus", "prompt-guard", "embed", "tts")
+    chat = [mid for mid in ids if not any(s in mid.lower() for s in skip)]
+    for pref in ("qwen/qwen3.8-27b", "openai/gpt-oss-20b", "openai/gpt-oss-120b"):
+        if pref in chat:
+            return pref
+    return chat[0] if chat else ""
+
+
 def _probe_groq_key(key: str) -> str:
     """'valid' | 'invalid' | 'unknown' via Groq's free GET /models (consumes no tokens).
     'unknown' (offline, 429, 5xx) must never mark a key bad."""
@@ -230,11 +253,10 @@ def _probe_groq_key(key: str) -> str:
 # model for the explicit council only.
 #   fast : greetings / trivial chat  — cheap, high rate limits
 #   main : normal + tool-calling work — strong, non-reasoning, no hidden-token blowup
-GROQ_FAST_MODEL = os.environ.get("JARVIS_GROQ_FAST_MODEL", "llama-3.1-8b-instant")
-GROQ_MODEL      = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-# Sub-agents on the cheap fast model so a spawn_agents fan-out (up to 5 × 6 = 30 API hits)
-# doesn't blow the free-tier TPM/RPM. Override with JARVIS_SUBAGENT_MODEL.
-SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "llama-3.1-8b-instant")
+GROQ_FAST_MODEL = os.environ.get("JARVIS_GROQ_FAST_MODEL", "qwen/qwen3.8-27b")
+GROQ_MODEL      = os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b")
+# Sub-agents on the same served chat model. The old llama-3.1/3.3 ids 404 on current Groq keys.
+SUBAGENT_MODEL  = os.environ.get("JARVIS_SUBAGENT_MODEL", "qwen/qwen3.8-27b")
 GROQ_REASONING  = os.environ.get("GROQ_REASONING_EFFORT", "low")       # low | medium | high (gpt-oss only); low = snappier
 # Free-tier tokens-per-minute ceiling for the chat model. The whole request (system +
 # history + tools schema) PLUS the completion must fit under this or Groq 413s the call —
@@ -343,7 +365,7 @@ _session = SessionState(session_id="local")
 # aggregator reconciles them into one decision. Triggered on demand (see TRIGGERS).
 MOA_PROPOSERS = [m.strip() for m in os.environ.get(
     "JARVIS_MOA_PROPOSERS",
-    "llama-3.3-70b-versatile,qwen/qwen3-32b,meta-llama/llama-4-scout-17b-16e-instruct",
+    "qwen/qwen3.8-27b,openai/gpt-oss-20b,openai/gpt-oss-120b",
 ).split(",") if m.strip()]
 MOA_AGGREGATOR = os.environ.get("JARVIS_MOA_AGGREGATOR", "openai/gpt-oss-120b")
 MOA_TRIGGERS = ("deliberate", "council", "debate", "think hard about", "convene", "panel")
@@ -657,6 +679,19 @@ def _disk_root() -> str:
         return str(BASE_DIR.anchor) or (os.environ.get("SystemDrive", "C:") + "\\")
     except Exception:
         return os.environ.get("SystemDrive", "C:") + "\\"
+
+
+def disk_stats() -> tuple[float, int]:
+    """Percent used and free bytes.
+
+    psutil.disk_usage crashes on Windows for a drive anchor like ``C:\\``
+    (SystemError: bad format char). shutil talks to the Win32 API directly.
+    """
+    import shutil
+    root = _disk_root() or (os.environ.get("SystemDrive", "C:") + "\\")
+    usage = shutil.disk_usage(root)
+    pct = (usage.used / usage.total * 100.0) if usage.total else 0.0
+    return pct, usage.free
 
 
 def _user_name() -> str:
@@ -2135,7 +2170,7 @@ def _bugbounty_run(domain: str) -> str:
     stays step-by-step and honest, and every phase feeds cortex. Active phases are scope-gated
     (they refuse if the domain isn't authorized); recon/probe are broad. Ask for a `report`
     after for the write-up. (nuclei/scanall are heavier — run them as a follow-up.)"""
-    import pentest as _pt
+    import jarvis.act.pentest as _pt
     host = _pt._host_of(domain) or (domain or "").strip()
     if not host:
         return "Give a domain to sweep, e.g. bugbounty acme.com."
@@ -2170,7 +2205,7 @@ def _pentest_report(target: str) -> str:
     """Turn everything cortex has learned about a target into a Markdown assessment report —
     the bug-bounty deliverable (methodology phase 7). Fact-driven, with derived next steps."""
     try:
-        import pentest as _pt
+        import jarvis.act.pentest as _pt
         import cortex
         host = _pt._host_of(target) or (target or "").strip()
         if not host:
@@ -2347,7 +2382,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return _bugbounty_run(args.get("target", ""))
 
     if name in ("recon", "pentest", "scope"):
-        import pentest as _pt
+        import jarvis.act.pentest as _pt
         if name == "recon":
             tgt = args.get("target", "")
             return _augment_and_learn("recon", tgt, "", _pt.recon(tgt))
@@ -2388,7 +2423,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         snap = system_monitor.snapshot()
         cpu = snap["cpu_percent"]
         ram = snap["ram_percent"]
-        disk = psutil.disk_usage(_disk_root())
+        disk_pct, disk_free = disk_stats()
         procs = sorted(
             psutil.process_iter(["name", "cpu_percent"]),
             key=lambda p: p.info.get("cpu_percent") or 0,
@@ -2404,7 +2439,7 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         tail = f" | {' | '.join(extra)}" if extra else ""
         return (
             f"CPU {cpu}% | RAM {ram}% ({vm.used // 2**30}GB/{vm.total // 2**30}GB) | "
-            f"Disk {disk.percent}% | Top procs: {', '.join(top)}{tail}"
+            f"Disk {disk_pct:.0f}% | Top procs: {', '.join(top)}{tail}"
         )
 
     if name == "launch_app":
@@ -3469,17 +3504,18 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool,
     stream = await client.chat.completions.create(**kwargs)
 
     full_text = ""
+    reasoning = ""
     tool_calls_raw: dict[int, dict] = {}
     thinking_sent = False
     async for chunk in stream:
         delta = chunk.choices[0].delta if chunk.choices else None
         if not delta:
             continue
-        # gpt-oss streams chain-of-thought on a separate `reasoning` channel —
-        # don't speak/display it, just flag that the model is thinking.
-        if getattr(delta, "reasoning", None) and not thinking_sent:
-            thinking_sent = True
-            await broadcast({"type": "state", "status": "thinking", "text": "Reasoning..."})
+        if getattr(delta, "reasoning", None):
+            reasoning += delta.reasoning
+            if not thinking_sent:
+                thinking_sent = True
+                await broadcast({"type": "state", "status": "thinking", "text": "Reasoning..."})
         if delta.content:
             full_text += delta.content
             await broadcast({"type": "llm_chunk", "text": delta.content})
@@ -3491,6 +3527,11 @@ async def _groq_round(client, messages: list[dict], allow_tools: bool,
                 if tc.id:                 tool_calls_raw[idx]["id"]   = tc.id
                 if tc.function.name:      tool_calls_raw[idx]["name"] = tc.function.name
                 if tc.function.arguments: tool_calls_raw[idx]["arguments"] += tc.function.arguments
+    # gpt-oss often leaves `content` empty and puts the answer in `reasoning`.
+    # Dropping that makes a successful call look like a mute turn.
+    if not full_text.strip() and reasoning.strip():
+        full_text = reasoning.strip()
+        await broadcast({"type": "llm_chunk", "text": full_text})
     return full_text, tool_calls_raw
 
 
@@ -3654,6 +3695,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     tool_subset = _relevant_tools(text) if use_tools else None
     final_answer = ""
     keys_tried = 1   # rotate through additional keys on rate-limit, each at most once per turn
+    swapped_model = False
     for _ in range(8):
         try:
             full_text, tool_calls_raw = await _groq_round(client, messages, allow_tools=use_tools,
@@ -3691,6 +3733,16 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
                         timeout=GROQ_TIMEOUT, max_retries=0)
                     continue
                 return await _groq_auth_dead_end()
+            if status == 404:
+                alt = _pick_served_groq_model(GROQ_API_KEY, avoid=model) if not swapped_model else ""
+                if alt:
+                    swapped_model = True
+                    model = alt
+                    await broadcast({"type": "system", "text": f"Configured Groq model is unavailable. Using {alt}."})
+                    continue
+                return (f"Groq does not serve `{model}` on this key. "
+                        "Set GROQ_MODEL to an id from the account's model list. "
+                        "The key itself was not rejected.")
             # Groq free tier often returns 413 for TPM (tokens/min), not 429 RateLimitError.
             if status in (413, 429):
                 return ("Groq rate/token limit hit (HTTP "
@@ -4476,7 +4528,9 @@ def _match_wake_word(text: str):
         if not hit and _wake_fuzzy(tok):
             hit = True
         if hit:
-            return " ".join(tokens[idx + 1:]).strip(" ,.!?:;-'\"")
+            # Keep '?' — it is the difference between a question and a statement for the model.
+            # Other trailing punctuation is Whisper junk and is stripped.
+            return " ".join(tokens[idx + 1:]).strip(" ,.!:;-'\"")
     return None
 
 

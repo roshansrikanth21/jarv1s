@@ -22,7 +22,6 @@ from fastapi.responses import JSONResponse
 def register(app: FastAPI) -> None:
     import api as core
 
-    _disk_root = core._disk_root
     _routing_label = core._routing_label
     _active_model = core._active_model
     _short_model = core._short_model
@@ -46,7 +45,7 @@ def register(app: FastAPI) -> None:
     async def agent_status() -> dict:
         cpu  = core.psutil.cpu_percent(interval=0)
         vm   = core.psutil.virtual_memory()
-        disk = core.psutil.disk_usage(_disk_root())
+        disk_pct, disk_free = core.disk_stats()
         try:
             _rss_mb = round(core.psutil.Process().memory_info().rss / (1024 * 1024), 1)
         except Exception:
@@ -113,8 +112,8 @@ def register(app: FastAPI) -> None:
                 "cpu":  round(cpu),
                 "ram":  round(vm.percent),
                 # Host volume fill (not JARVIS I/O). Free space is the actionable signal.
-                "disk": round(disk.percent),
-                "disk_free_gb": round(disk.free / (1024 ** 3), 1),
+                "disk": round(disk_pct),
+                "disk_free_gb": round(disk_free / (1024 ** 3), 1),
                 "jarvis_rss_mb": _rss_mb,
             },
         }

@@ -12,10 +12,11 @@ _CMD_BLOCK_RE = re.compile(
     r"(?:^|\s)(?:rm\s+-rf|del(?:ete)?\s+|erase\s+|remove-item\b|"
     r"format\s+|shutdown|reboot|mkfs|diskpart|"
     r"reg\s+delete|curl\s+.+\|\s*(?:ba)?sh|(?:powershell|pwsh)\s+-(?:e|enc|encodedcommand)\b|"
-    r"invoke-expression|iex\s|wget\s+.+\|\s*sh)",
+    r"invoke-expression|iex\s|wget\s+.+\|\s*sh|"
+    r"(?:python|python3|py)\s+-c\b|node\s+-e\b)",
     re.I,
 )
-_CMD_META_RE = re.compile(r"[;&|`>]|(?:\$\()")
+_CMD_META_RE = re.compile(r"[;&|`>\n\r]|(?:\$\()")
 
 MAX_COMMAND_LEN = 500
 

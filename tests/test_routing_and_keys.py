@@ -172,6 +172,47 @@ class GroqKeyHealth(unittest.TestCase):
         self.assertIsNone(api._groq_key_alert)
 
 
+class WakeWordAndNoise(unittest.TestCase):
+    """The text layer of the voice pipeline (verified separately against real SAPI speech)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import api
+        cls.api = api
+
+    def test_wake_word_forms_extract_the_command(self):
+        m = self.api._match_wake_word
+        self.assertEqual(m("Hey Jarvis, what time is it?"), "what time is it?")
+        self.assertEqual(m("hello jarvis open calculator"), "open calculator")
+        self.assertEqual(m("hi jarvis play some music"), "play some music")
+        self.assertEqual(m("okay jarvis stop"), "stop")
+        self.assertEqual(m("jarvis open spotify"), "open spotify")
+
+    def test_bare_wake_word_arms_the_listener(self):
+        m = self.api._match_wake_word
+        for s in ("Jarvis", "jarvis.", "hey jarvis", "Hello, Jarvis!"):
+            self.assertEqual(m(s), "", s)
+
+    def test_ordinary_speech_is_not_a_wake_word(self):
+        m = self.api._match_wake_word
+        for s in ("we saw travis yesterday", "we should get lunch and watch the game",
+                  "that's a jarvis-shaped hole in my plan", ""):
+            self.assertIsNone(m(s), s)
+
+    def test_whisper_hallucinations_are_dropped(self):
+        n = self.api._is_stt_noise
+        for s in ("thanks for watching", "Thank you.", "you", "",
+                  "take a look at how take a look at how take a look at how take a look at how",
+                  "see you in the next video see you in the next video see you in the next video"):
+            self.assertTrue(n(s), s)
+
+    def test_real_commands_are_kept(self):
+        n = self.api._is_stt_noise
+        for s in ("open calculator", "what time is it", "stop", "remind me to call mom at five",
+                  "play some music"):
+            self.assertFalse(n(s), s)
+
+
 class _FakeSD:
     """Scripted stand-in for `sounddevice`: each device is 'live', 'silent' (flat, but with a loud
     pop on open — the exact trap that fooled a peak-based check), or 'error'."""

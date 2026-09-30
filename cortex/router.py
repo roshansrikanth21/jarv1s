@@ -25,9 +25,9 @@ log = logging.getLogger("jarvis.cortex")
 # reasoning model spends its token budget on hidden chain-of-thought and then trips
 # "max completion tokens reached before generating a valid document" (observed on gpt-oss-20b).
 GROQ_MODEL_EXTRACT = os.environ.get("JARVIS_ROUTER_EXTRACT",
-                                    os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant"))
+                                    os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b"))
 GROQ_MODEL_CONSOL = os.environ.get("JARVIS_ROUTER_CONSOL",
-                                   os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"))
+                                   os.environ.get("GROQ_MODEL", "qwen/qwen3.8-27b"))
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
 LOCAL_FAST = os.environ.get("JARVIS_LOCAL_FAST", "qwen2.5:7b")
 LOCAL_DEEP = os.environ.get("JARVIS_LOCAL_DEEP", "")

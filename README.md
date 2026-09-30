@@ -59,12 +59,12 @@ You interact through an Electron app with several UI “decks” (Prime, Command
 | Area | Maturity | What’s in the tree |
 | --- | --- | --- |
 | Voice (VAD → STT → wake → TTS) | **Beta** | `webrtcvad-wheels` / energy gate; local `faster-whisper`; Groq Whisper fallback; Edge TTS |
-| Governor routing | **Beta** | Lattice + LinUCB (`governor.py`); modes auto / eco / local / cloud |
+| Governor routing | **Beta** | Lattice + LinUCB (`jarvis/cognition/governor.py`) |
 | Cortex memory | **Beta** | SQLite WAL + optional Chroma; WordHash embeddings if Ollama embed model missing |
 | Desktop / OS control | **Beta** | Windows-oriented (`desktop.py`) |
 | Browser automation | **Beta** | Structured `browse` tool; needs Chrome (+ optional browser-harness paths) |
 | Markets / ICT | **Beta** | Analysis via `ict_scan` — **not** trade execution |
-| Skills | **Beta** | `skills.py` + `skills/*/SKILL.md`; `use_skill` / `create_skill` |
+| Skills | **Beta** | `jarvis/playbooks/loader.py` + `skills/*/SKILL.md` |
 | Pentest / research | **Experimental** | Scope-gated active tools; Docker + `jarvis-recon:latest` |
 | Electron shell | **Beta** | Dev path (`npm run desktop:dev`) is primary; packaged sidecar is separate |
 
@@ -86,9 +86,9 @@ What you can actually do with the code in this tree:
 
 Subsystem map (same capabilities, named by module):
 
-- **Governor** — rung selection from difficulty + device energy (`governor.py`, `device.py`)
+- **Governor** — rung selection from difficulty + device energy (`jarvis/cognition/governor.py`, `jarvis/host/device.py`)
 - **Cortex** — prompt build, async extraction, optional `python -m cortex.dreaming`
-- **Affect** — PAD mood (`persona.py`), transcript cues (`perception.py`), ambient time/place/weather (`ambient.py`)
+- **Affect** — PAD mood (`jarvis/presence/persona.py`), transcript cues (`jarvis/presence/perception.py`), ambient time/place/weather (`jarvis/presence/ambient.py`)
 - **Skills** — on-disk playbooks; catalog in the system prompt; full body via `use_skill`
 
 ---
@@ -106,7 +106,7 @@ flowchart LR
     WS["FastAPI + WebSocket"]
     Gov["Governor"]
     Cortex["Cortex"]
-    Skills["skills.py"]
+    Skills["jarvis/playbooks"]
     Tools["Tool runtime"]
     Voice["STT / TTS / VAD"]
   end
@@ -307,6 +307,7 @@ Without any cloud key **and** without Ollama models, the process can still boot,
 | `/api/agent/status` is 404 on 8000 | Another process (e.g. WSL/Docker relay) owns the port | Stop that process or set `JARVIS_PORT`; Electron only reuses a backend that returns `"app": "jarvis"` |
 | Import errors / missing `yaml` | Incomplete pip install | `venv\Scripts\pip install -r requirements.txt` (`PyYAML` is listed explicitly) |
 | Voice / STT silent | No mic permission; missing `faster-whisper` and no Groq | Install requirements; set `GROQ_API_KEY` for cloud STT fallback |
+| Cloud replies say the model does not exist | Groq retired the configured id | Leave `GROQ_MODEL` unset, or set it to an id from `GET https://api.groq.com/openai/v1/models`. JARVIS retries once against the live list. |
 | `browse` fails | Chrome / harness path | Install Chrome; set `JARVIS_CHROME` / `JARVIS_BH_CLI` if needed (see `.env.example`) |
 | Pentest says Docker unavailable | Engine down or image missing | Start Docker Desktop; build `jarvis-recon:latest` |
 | Second Electron window does nothing | Single-instance lock | Focus the existing window |
@@ -321,7 +322,7 @@ Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example
 | --- | --- |
 | `GROQ_API_KEY` | Primary cloud brain / Whisper / vision (OpenAI-compatible Groq API) |
 | `ANTHROPIC_API_KEY` | Optional Claude path |
-| `GROQ_MODEL` | Default model id (code default: `llama-3.3-70b-versatile` if unset) |
+| `GROQ_MODEL` | Preferred chat model. Default `qwen/qwen3.8-27b`. If Groq returns 404, JARVIS picks another chat model from that key's live `/models` list (skips Whisper and TTS). |
 | `JARVIS_SUBAGENT_MODEL` | Smaller/faster model for `spawn_agents` |
 | `JARVIS_TTS_VOICE` / voice via Settings | Edge neural voices |
 | `JARVIS_WAKE_WORDS` / `JARVIS_WAKE_REQUIRED` | Wake gate |
@@ -387,7 +388,7 @@ HTTP helpers include `/api/agent/status` (includes `"app": "jarvis"`), `/api/set
 
 ## Skills
 
-Skills are **procedural playbooks** stored on disk so the agent can reuse a known procedure instead of improvising every time. Each skill is a folder under `skills/<slug>/` containing a `SKILL.md` file: YAML frontmatter (`name`, `description`) plus a markdown body of steps. Discovery is handled by `skills.py`; the default root is `<repo>/skills`.
+Skills are **procedural playbooks** stored on disk so the agent can reuse a known procedure instead of improvising every time. Each skill is a folder under `skills/<slug>/` containing a `SKILL.md` file: YAML frontmatter (`name`, `description`) plus a markdown body of steps. Discovery is handled by `jarvis/playbooks/loader.py`; the default root is `<repo>/skills`.
 
 At prompt time the model only sees a short `[SKILLS]` catalog (names + descriptions). When a task fits, it calls `use_skill` to load the full instructions. `create_skill` can write new playbooks; bundled seed slugs are protected from overwrite unless forced in code.
 
@@ -421,23 +422,22 @@ Scope allowlist for active attacks: `memory/jarvis_scope.json` (gitignored).
 
 ```
 jarv1s/
-├── api.py                 # FastAPI app, WebSocket, agent loops, tools, voice
-├── governor.py            # Compute-elastic routing + bandit
-├── device.py              # Embodiment / energy sensing
-├── cortex/                # Cognitive memory (SQLite, vectors, dreaming, Mem0 sync)
-├── skills.py              # Skill discovery / catalog / create
+├── api.py                 # Process entry. FastAPI, WebSocket, turn loop, voice
+├── jarvis/host/           # device, model advisor, hardware watchdog
+├── jarvis/cognition/      # governor + route plans
+├── jarvis/presence/       # ambient, briefing, perception, persona
+├── jarvis/act/            # desktop, web search, reminders, scoped research
+├── jarvis/agents/         # parallel specialists
+├── jarvis/playbooks/      # skill loader; playbooks stay in skills/
+├── jarvis/memory_mcp.py   # separate process: python -m jarvis.memory_mcp
+├── jarvis/                # also memory, policy, events, session, telemetry
 ├── skills/                # Seed SKILL.md playbooks
-├── persona.py · perception.py · ambient.py
-├── subagents.py · desktop.py · pentest.py · memory_mcp.py
-├── jarvis/                # Kernel packages (memory, policy, router, events, telemetry)
-├── tests/                 # Python unit tests (`npm run test:kernel`)
-├── docs/ARCHITECTURE_V2.md
-├── routers/rest.py        # HTTP routes registered on the FastAPI app
-├── electron/main.js       # Desktop shell, venv spawn, safeStorage keys
-├── src/decks/             # prime · overhaul · focus · terminal · chat
-├── src/hooks/useJarvisSocket.ts
-├── docker/jarvis-recon/   # Recommended pentest image Dockerfile
-├── e2e/                   # Playwright smoke
+├── cortex/                # SQLite memory, vectors, dreaming
+├── routers/rest.py        # HTTP routes
+├── scripts/audit_az.py    # Local audit. Reads GROQ_API_KEY from the environment
+├── tests/
+├── electron/main.js
+├── src/decks/
 ├── requirements.txt
 ├── package.json
 ├── .env.example

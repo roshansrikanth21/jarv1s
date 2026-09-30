@@ -47,7 +47,7 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     // both correct here and immune to that layout quirk.
     let w = 0,
       h = 0,
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dpr = Math.min(window.devicePixelRatio || 1, 1.25);
     let motes: Mote[] = [];
     const streaks: Streak[] = [];
 
@@ -70,7 +70,7 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     const resize = () => {
       w = window.innerWidth;
       h = window.innerHeight;
-      dpr = Math.min(window.devicePixelRatio || 1, 2);
+      dpr = Math.min(window.devicePixelRatio || 1, 1.25);
       canvas.width = Math.max(1, Math.floor(w * dpr));
       canvas.height = Math.max(1, Math.floor(h * dpr));
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -85,15 +85,12 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
     let bloom = 0;
     let raf = 0;
     let last = performance.now();
+    let lastDraw = 0;
     let streakTimer = 0;
 
     const targetFor = (s: AmbientState) => (s === "speaking" ? 1 : s === "listening" ? 0.62 : 0.32);
 
     const frame = (now: number) => {
-      if (document.hidden) {
-        raf = 0;
-        return;
-      }
       const dt = Math.min(48, now - last) / 16.67; // ~frames elapsed, clamped
       last = now;
 
@@ -103,10 +100,7 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
       const vw = window.innerWidth,
         vh = window.innerHeight;
       if (vw > 0 && vh > 0 && (vw !== w || vh !== h)) resize();
-      if (w === 0 || h === 0) {
-        raf = requestAnimationFrame(frame);
-        return;
-      }
+      if (w === 0 || h === 0) return;
 
       const s = stateRef.current;
       const moodBoost = 0.75 + 0.5 * Math.max(0, Math.min(1, intensityRef.current));
@@ -179,17 +173,31 @@ export function HudAmbient({ state = "idle", intensity = 0.5, rgb = AMBER }: Pro
         if (st.x > w + 30 || st.life > st.max) streaks.splice(i, 1);
       }
       ctx.globalCompositeOperation = "source-over";
-
-      raf = requestAnimationFrame(frame);
     };
+
+    const pump = (now: number) => {
+      if (document.hidden) {
+        raf = 0;
+        return;
+      }
+      raf = requestAnimationFrame(pump);
+      const s = stateRef.current;
+      const live = s === "speaking" || s === "listening";
+      // Idle field is a slow drift. Drawing it at 30fps keeps the same motion
+      // because dt is real elapsed time, and drops a full-window clear+fill in half.
+      if (!live && now - lastDraw < 33) return;
+      lastDraw = now;
+      frame(now);
+    };
+
     const onVis = () => {
       if (!document.hidden && !raf) {
         last = performance.now();
-        raf = requestAnimationFrame(frame);
+        raf = requestAnimationFrame(pump);
       }
     };
     document.addEventListener("visibilitychange", onVis);
-    if (!document.hidden) raf = requestAnimationFrame(frame);
+    if (!document.hidden) raf = requestAnimationFrame(pump);
 
     return () => {
       cancelAnimationFrame(raf);

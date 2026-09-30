@@ -51,6 +51,9 @@ class TestShellPolicy(unittest.TestCase):
 
     def test_block_destructive(self) -> None:
         self.assertIn("blocked", (check_command("rm -rf /") or "").lower())
+        self.assertIsNotNone(check_command('python -c "print(1)"'))
+        self.assertIsNotNone(check_command("node -e console.log(1)"))
+        self.assertIsNotNone(check_command("whoami\nRemove-Item foo"))
 
     def test_block_chaining(self) -> None:
         self.assertIn("chaining", (check_command("echo a && echo b") or "").lower())

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
-import ambient
-import web_search
+from jarvis.presence import ambient
+from jarvis.act import web_search
 
 
 def today_key() -> str:

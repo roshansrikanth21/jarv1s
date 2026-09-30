@@ -122,7 +122,9 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
       alpha: true,
       powerPreference: "high-performance",
     });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    // Line geometry with antialiasing does not get sharper past 1.5x, and 2x
+    // quadrupled the fill rate of a full-time WebGL loop.
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
     renderer.setSize(w, h);
     renderer.setClearColor(0x000000, 0);
     mount.appendChild(renderer.domElement);
@@ -160,6 +162,7 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
     let rpm = 0;
     let raf = 0;
     let t0 = performance.now();
+    let lastDraw = 0;
     const _dirVec = new THREE.Vector3(); // reused across frames — no per-frame allocation
 
     const animate = (now: number) => {
@@ -169,10 +172,13 @@ export function CoreOrb3D({ state, audioLevel = 0, onCoordinates }: Props) {
         return;
       }
       raf = requestAnimationFrame(animate);
+      const st = stateRef.current;
+      const live = st === "thinking" || st === "speaking" || st === "listening";
+      // Ambient spin stays continuous via dt; only the GPU draw is capped.
+      if (!live && now - lastDraw < 32) return;
+      lastDraw = now;
       const dt = Math.min(0.05, (now - t0) / 1000);
       t0 = now;
-
-      const st = stateRef.current;
       const lvl = levelRef.current;
       const baseSpeed =
         st === "thinking"

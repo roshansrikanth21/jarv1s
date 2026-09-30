@@ -26,6 +26,8 @@ import shutil
 import subprocess
 import sys
 
+from jarvis.paths import ROOT
+
 IS_WINDOWS = sys.platform.startswith("win")
 
 # Recognized ms-settings URIs. Not exhaustive — Windows adds pages every release —
@@ -683,7 +685,7 @@ def capture_webcam(save_path: str | None = None) -> str:
         if save_path:
             out = _P(save_path)
         else:
-            out_dir = _P(__file__).resolve().parent / "memory" / "webcam"
+            out_dir = ROOT / "memory" / "webcam"
             out_dir.mkdir(parents=True, exist_ok=True)
             out = out_dir / f"webcam_{int(time.time())}.jpg"
         cv2.imwrite(str(out), frame)
@@ -774,7 +776,7 @@ def window_list() -> str:
 def remind(sub_action: str, args: dict) -> str:
     """schedule / list / cancel. All calls delegated to reminder.py."""
     try:
-        import reminder
+        from jarvis.act import reminder
     except Exception as exc:
         return f"remind: reminder module unavailable ({exc})."
     sub = (sub_action or "").strip().lower()
