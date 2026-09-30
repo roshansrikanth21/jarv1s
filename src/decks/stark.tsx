@@ -226,29 +226,6 @@ export default function StarkDeck() {
         />
       </motion.div>
 
-      {/* TOP DATA STRINGS */}
-      <motion.div
-        variants={fade(0.5)}
-        initial="hidden"
-        animate="visible"
-        style={{
-          position: "absolute",
-          top: 32,
-          left: 0,
-          right: 0,
-          display: "flex",
-          justifyContent: "center",
-          gap: 220,
-          fontSize: 7,
-          color: C.dim,
-          letterSpacing: "0.12em",
-          zIndex: 4,
-        }}
-      >
-        <span>095350888</span>
-        <span>890899808</span>
-      </motion.div>
-
       {/* HEADER (window controls) */}
       <div className="drag" style={{ position: "absolute", top: 8, right: 30, zIndex: 20 }}>
         <div className="no-drag">
@@ -393,20 +370,20 @@ export default function StarkDeck() {
             initial="hidden"
             animate="visible"
             style={{
-              fontSize: 7,
-              letterSpacing: "0.4em",
+              fontSize: 12,
+              letterSpacing: "0.08em",
               color: C.dim,
               marginTop: 6,
               textAlign: "center",
             }}
           >
             {state === "speaking"
-              ? "◂ TRANSMITTING ▸"
+              ? "Speaking"
               : state === "listening"
-                ? "◂ RECEIVING ▸"
+                ? "Listening"
                 : state === "thinking"
-                  ? "◂ PROCESSING ▸"
-                  : "◂ STANDBY ▸"}
+                  ? "Thinking"
+                  : "Idle"}
           </motion.div>
         </motion.div>
 
@@ -417,7 +394,9 @@ export default function StarkDeck() {
             flexDirection: "column",
             gap: 5,
             paddingTop: 8,
-            overflow: "hidden",
+            paddingRight: 28,
+            overflow: "auto",
+            minWidth: 0,
           }}
         >
           {/* TAB BAR */}
@@ -458,7 +437,7 @@ export default function StarkDeck() {
 
           {activeTab === 0 && (
           <motion.div variants={slideR(1.3)} initial="hidden" animate="visible">
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 6 }}>
               {MODS.map((m) => (
                 <button
                   key={m.l}
@@ -469,11 +448,13 @@ export default function StarkDeck() {
                     color: C.bright,
                     border: `1px solid ${C.border}`,
                     borderRadius: 8,
-                    padding: "10px 8px",
-                    fontSize: 12,
+                    padding: "8px 10px",
+                    fontSize: 13,
+                    lineHeight: 1.3,
                     cursor: "pointer",
                     fontFamily: "inherit",
                     textAlign: "left",
+                    whiteSpace: "normal",
                   }}
                 >
                   {m.l}
@@ -594,29 +575,6 @@ export default function StarkDeck() {
             <MicGlyph />
           </button>
         </div>
-      </motion.div>
-
-      {/* BOTTOM DATA STRINGS */}
-      <motion.div
-        variants={fade(2.4)}
-        initial="hidden"
-        animate="visible"
-        style={{
-          position: "absolute",
-          bottom: 28,
-          left: 0,
-          right: 0,
-          zIndex: 3,
-          display: "flex",
-          justifyContent: "center",
-          gap: 200,
-          fontSize: 7,
-          color: C.mute,
-          letterSpacing: "0.12em",
-        }}
-      >
-        <span>008909080</span>
-        <span>008080008</span>
       </motion.div>
 
       {/* LEFT EDGE TICK */}
