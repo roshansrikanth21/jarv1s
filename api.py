@@ -10,6 +10,7 @@ Run: python api.py
 import asyncio
 import atexit
 import base64
+import contextvars
 import glob
 import importlib.util
 import io
@@ -495,6 +496,15 @@ app.add_middleware(
 
 # ── State ──────────────────────────────────────────────────────────────────────
 active_connections: list[WebSocket] = []
+# Remote callers (POST /api/ask, used by the OpenClaw MCP bridge) need the reply of the
+# turn they started, but replies only go out via broadcast(). A caller registers a queue
+# here for the life of its turn; broadcast() copies llm_response + agent_tool events in.
+_reply_listeners: list[asyncio.Queue] = []
+# False inside a turn started with speak=false. asyncio copies context into tasks it
+# creates, so this reaches the turn task and every filler / final reply it schedules,
+# while voice, alerts and briefings (other contexts) keep the default and still speak.
+_SPEAK_REPLY: contextvars.ContextVar[bool] = contextvars.ContextVar("jarvis_speak_reply",
+                                                                    default=True)
 task_list:   list[dict] = []
 agent_trace: list[dict] = []
 memories:    list[dict] = []
@@ -743,6 +753,9 @@ def _ict_cache_put(key: tuple, value: dict) -> None:
 
 # ── WebSocket broadcast ────────────────────────────────────────────────────────
 async def broadcast(data: dict) -> None:
+    if _reply_listeners and data.get("type") in ("llm_response", "agent_tool"):
+        for q in list(_reply_listeners):
+            q.put_nowait(data)
     # Snapshot before iterating: an `await` inside this loop yields control, and a
     # concurrent connect/disconnect mutating the live list mid-iteration could
     # otherwise silently skip a socket (list iteration doesn't raise on resize).
@@ -4632,6 +4645,54 @@ async def dispatch_command(text: str) -> None:
     _current_task = asyncio.create_task(handle_command(text))
 
 
+async def ask_and_wait(text: str, *, speak: bool = True, timeout: float = 120.0) -> dict:
+    """Run one turn exactly like a typed/voice command, but wait for it and return what
+    JARVIS said — for callers outside the HUD (POST /api/ask → OpenClaw MCP bridge).
+
+    Same path as every other command (dispatch_command: barge-in, turn generation,
+    governor, tools, memory writes), so remote turns behave identically and show up in
+    the HUD. Returns {status, reply, tools, elapsed_s}, where status is
+      ok          the turn finished
+      timeout     still running after `timeout` s (left running; reply may be partial)
+      interrupted a newer command barged in and cancelled this turn
+    """
+    q: asyncio.Queue = asyncio.Queue()
+    _reply_listeners.append(q)
+    token = _SPEAK_REPLY.set(bool(speak))
+    t0 = time.time()
+    status = "ok"
+    try:
+        await dispatch_command(text)
+        task = _current_task      # the turn dispatch_command just started
+        if task is not None:
+            try:
+                # shield: a timeout stops our wait, not JARVIS's turn.
+                await asyncio.wait_for(asyncio.shield(task), timeout)
+            except asyncio.TimeoutError:
+                status = "timeout"
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    raise         # our own request was cancelled, not the turn
+                status = "interrupted"
+    finally:
+        _SPEAK_REPLY.reset(token)
+        _reply_listeners.remove(q)
+    replies: list[str] = []
+    tools: list[str] = []
+    while not q.empty():
+        ev = q.get_nowait()
+        if ev.get("type") == "llm_response":
+            replies.append(str(ev.get("text") or ""))
+        elif ev.get("type") == "agent_tool":
+            tools.append(str((ev.get("step") or {}).get("action") or ""))
+    return {
+        "status": status,
+        "reply": "\n".join(r for r in replies if r).strip(),
+        "tools": [t for t in tools if t],
+        "elapsed_s": round(time.time() - t0, 2),
+    }
+
+
 # ── Mixture-of-Agents (multi-agent deliberation) ────────────────────────────────
 def _short_model(m: str) -> str:
     return m.split("/")[-1].replace("-instruct", "").replace("-versatile", "")
@@ -4803,6 +4864,8 @@ def _voice_params(base_rate: str) -> tuple[str, str]:
 async def _schedule_speak(text: str) -> None:
     """Cancel any in-flight speech before starting new audio."""
     global _speak_task
+    if not _SPEAK_REPLY.get():
+        return   # turn was started silently (remote /api/ask with speak=false)
     if _speak_task and not _speak_task.done():
         _speak_task.cancel()
         try:
