@@ -46,6 +46,7 @@ You interact through an Electron app with several UI decks (Prime, Stark, Comman
   - [User interfaces](#user-interfaces)
   - [Tools](#tools)
   - [Skills](#skills)
+  - [OpenClaw](#openclaw)
   - [Optional: Docker pentest image](#optional-docker-pentest-image)
   - [Repository layout](#repository-layout)
   - [Development checks](#development-checks)
@@ -312,6 +313,9 @@ Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example
 | `JARVIS_WS_PORTS` / `JARVIS_WS_ALLOW_ALL` | WebSocket Origin policy |
 | `JARVIS_BROWSE_ALLOWLIST` | Optional host allowlist for browse |
 | `JARVIS_MEMORY_TOKEN` | Bearer for memory hub HTTP; blank = loopback-oriented use |
+| `JARVIS_AGENT_TOKEN` | Bearer required by `POST /api/ask` (OpenClaw bridge); blank = loopback / trusted origin only |
+| `JARVIS_MCP_TOKEN` / `JARVIS_MCP_HOST` | Bearer + bind address for `python -m jarvis.agent_mcp --http` |
+| `JARVIS_ASK_TIMEOUT` | Seconds the OpenClaw bridge waits for a reply (default 120) |
 | `JARVIS_PYTHON` | Explicit Python for Electron if `./venv` is absent |
 | `JARVIS_PORT` | Backend bind + Vite proxy target (must match in `desktop:dev`) |
 | `JARVIS_ALLOW_PORT_FALLBACK` | Allow bind on a free port when preferred is busy (**off** for typical desktop/Vite) |
@@ -362,7 +366,7 @@ Registered agent tools (names as in `api.py` `TOOLS`):
 | `use_skill` / `create_skill` | Load / author on-disk skill playbooks |
 | `recon` / `pentest` / `bugbounty` / `report` / `scope` | Research / engagement |
 
-HTTP helpers include `/api/agent/status` (includes `"app": "jarvis"`), `/api/settings`, `/api/skills`, and memory hub routes under `/api/memory/*` (see `routers/rest.py`).
+HTTP helpers include `/api/agent/status` (includes `"app": "jarvis"`), `/api/settings`, `/api/skills`, `/api/ask` (run a turn and return the reply — see [OpenClaw](#openclaw)), and memory hub routes under `/api/memory/*` (see `routers/rest.py`).
 
 ---
 
@@ -379,6 +383,37 @@ Bundled seeds in this repository:
 - `system-triage`
 
 Override the skills directory with an absolute `JARVIS_SKILLS_DIR` if needed.
+
+---
+
+## OpenClaw
+
+[OpenClaw](https://docs.openclaw.ai) can hand requests to JARVIS — so "open notepad on my laptop" sent from WhatsApp or Telegram runs on this PC. The bridge is an MCP server, `jarvis/agent_mcp.py`, that forwards to the running backend:
+
+| MCP tool | What it does |
+| --- | --- |
+| `jarvis_ask` | Runs a full JARVIS turn (tools, desktop, memory) and returns the reply. `speak=false` answers silently |
+| `jarvis_status` | Is JARVIS up, which brain, memory count |
+| `jarvis_recall` | Semantic search over JARVIS's memory (private memories excluded) |
+| `jarvis_remember` | Store a durable fact, tagged `source_model=openclaw` |
+
+**Same machine (stdio).** With OpenClaw installed and `./venv` set up:
+
+```bat
+venv\Scripts\python scripts\openclaw_setup.py
+```
+
+This runs `openclaw mcp add jarvis …` with this machine's paths (OpenClaw probes the server before saving), installs the skill in `integrations/openclaw/jarvis/` so OpenClaw's agent knows when to use JARVIS, and reloads MCP. Add `--dry-run` to only print the commands. Check with `openclaw mcp probe jarvis`; undo with `openclaw mcp unset jarvis`. JARVIS must be running for the tools to answer — otherwise they say so.
+
+**Another machine or WSL (streamable HTTP).** Set `JARVIS_MCP_TOKEN` in `.env`, then:
+
+```bat
+venv\Scripts\python -m jarvis.agent_mcp --http 8766 --host 0.0.0.0
+```
+
+and on the OpenClaw side: `openclaw mcp add jarvis --url http://<pc-ip>:8766/mcp --transport streamable-http --header "Authorization=Bearer <token>" --timeout 180`. The server refuses to start without the token. The JARVIS backend itself stays on loopback; only the bridge port is exposed.
+
+Under the hood the bridge calls `POST /api/ask` (`{"message", "speak", "timeout_s"}` → `{"status", "reply", "tools", "elapsed_s"}`). Unlike `/api/command` it waits for the turn and returns what JARVIS said. Remote turns go through the same dispatch as voice and typed input, so they show up in the HUD, can be barged in on (`status: "interrupted"`), and privileged tools still wait for approval in the UI. `/api/ask` accepts loopback/trusted-origin callers, or only a matching bearer once `JARVIS_AGENT_TOKEN` is set.
 
 ---
 
@@ -410,11 +445,14 @@ jarv1s/
 ├── jarvis/agents/         # parallel specialists
 ├── jarvis/playbooks/      # skill loader; playbooks stay in skills/
 ├── jarvis/memory_mcp.py   # separate process: python -m jarvis.memory_mcp
+├── jarvis/agent_mcp.py    # separate process: OpenClaw bridge (python -m jarvis.agent_mcp)
 ├── jarvis/                # also memory, policy, events, session, telemetry
+├── integrations/openclaw/ # OpenClaw skill telling its agent when to use JARVIS
 ├── skills/                # Seed SKILL.md playbooks
 ├── cortex/                # SQLite memory, vectors, dreaming
 ├── routers/rest.py        # HTTP routes
 ├── scripts/audit_az.py    # Local audit. Reads GROQ_API_KEY from the environment
+├── scripts/openclaw_setup.py  # Registers JARVIS with a local OpenClaw install
 ├── tests/
 ├── electron/main.js       # Window, backend spawn, minimize → desktop pill
 ├── public/pill.html       # Small always-on-top island used while minimized

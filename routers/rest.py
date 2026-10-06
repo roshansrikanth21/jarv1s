@@ -138,6 +138,37 @@ def register(app: FastAPI) -> None:
         return JSONResponse({"status": "processing"})
 
 
+    # ── Remote ask — run a turn and return the reply (OpenClaw MCP bridge) ─────────
+    # /api/command fires and forgets; external agents need the answer back. This drives
+    # the FULL agent (shell, desktop, browse), so it is never left open: with
+    # JARVIS_AGENT_TOKEN set a matching bearer is required; without it, the same
+    # loopback / trusted-origin rule as /api/command applies.
+    def _ask_authed(request: Request) -> bool:
+        token = os.environ.get("JARVIS_AGENT_TOKEN", "")
+        if token:
+            return request.headers.get("authorization", "") == f"Bearer {token}"
+        return _mutating_allowed(request)
+
+    @app.post("/api/ask")
+    async def ask_endpoint(request: Request) -> JSONResponse:
+        if not _ask_authed(request):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        text = str(body.get("message") or "").strip()
+        if not text:
+            return JSONResponse({"error": "message is required"}, status_code=400)
+        try:
+            timeout = max(5.0, min(300.0, float(body.get("timeout_s", 120))))
+        except (TypeError, ValueError):
+            timeout = 120.0
+        result = await core.ask_and_wait(text, speak=bool(body.get("speak", True)),
+                                         timeout=timeout)
+        return JSONResponse(result)
+
+
     @app.get("/api/ict")
     async def ict_endpoint(symbol: str = "nifty", interval: str = "15m") -> dict:
         """Structured ICT read for the Markets panel."""
