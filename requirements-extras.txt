@@ -1,0 +1,21 @@
+# Optional JARVIS extras — heavy packages for features that switch themselves off
+# (with an install hint) when missing. Install all of them on top of the core:
+#   venv\Scripts\pip install -r requirements-extras.txt
+# or just the lines you want, e.g.  venv\Scripts\pip install yfinance pandas
+
+# ICT market scanner (Nifty, Sensex, NSE stocks) — ~75 MB
+yfinance
+pandas
+
+# Video understanding: frame sampling (opencv) + URL download (yt-dlp) — ~135 MB.
+# Also used by the webcam snapshot tool.
+opencv-python-headless
+yt-dlp
+
+# Persistent Chroma vector index for cortex — ~200 MB on disk with its deps and
+# ~60 MB RAM at runtime. Without it cortex uses a compact in-RAM cosine index that
+# is rebuilt from SQLite on boot, so recall still works.
+chromadb
+
+# Mem0 cloud mirror for cortex — only useful if MEM0_API_KEY is set.
+mem0ai

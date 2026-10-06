@@ -17,6 +17,8 @@ import logging
 import math
 import os
 import re
+from array import array
+from collections import OrderedDict
 from typing import Callable
 
 log = logging.getLogger("jarvis.cortex")
@@ -26,7 +28,11 @@ WORDHASH_DIM = 128
 
 _backend: str | None = None
 _ollama_dim: int | None = None
-_cache: dict[str, list[float]] = {}
+# Bounded LRU of recent embeddings, stored as float32 arrays (~3 KB per 768-dim vector
+# instead of ~24 KB as a list of Python floats). Unbounded, this grew with every unique
+# utterance for the life of the process.
+CACHE_MAX = max(0, int(os.environ.get("JARVIS_EMBED_CACHE", "512") or 0))
+_cache: "OrderedDict[str, array]" = OrderedDict()
 _word_re = re.compile(r"[a-z0-9']+")
 
 
@@ -118,8 +124,10 @@ def embed(text: str) -> list[float]:
     text = (text or "").strip()
     if not text:
         return [0.0] * (dim() or WORDHASH_DIM)
-    if text in _cache:
-        return _cache[text]
+    hit = _cache.get(text)
+    if hit is not None:
+        _cache.move_to_end(text)
+        return hit.tolist()
     if _backend is None:
         _pick_backend(text)
     if _backend == "ollama":
@@ -130,8 +138,13 @@ def embed(text: str) -> list[float]:
             return [0.0] * (_ollama_dim or WORDHASH_DIM)
     else:
         v = _wordhash_embed(text)
-    _cache[text] = v
-    return v
+    packed = array("f", v)
+    if CACHE_MAX:
+        _cache[text] = packed
+        if len(_cache) > CACHE_MAX:
+            _cache.popitem(last=False)
+    # Hand back the float32-rounded values so a cache hit and a miss agree exactly.
+    return packed.tolist()
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:

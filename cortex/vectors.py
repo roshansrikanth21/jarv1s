@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+from array import array
 from typing import Iterable
 
 from . import embeddings, paths, store
@@ -31,7 +32,7 @@ _impl: str = "none"        # "chroma" | "memory" | "none"
 _dim: int = 0
 
 # In-RAM fallback: {collection_name: {id: (vector, metadata_dict, document)}}
-_mem_index: dict[str, dict[str, tuple[list[float], dict, str]]] = {
+_mem_index: dict[str, dict[str, tuple[array, dict, str]]] = {
     FACTS_COLLECTION: {},
     EPISODES_COLLECTION: {},
 }
@@ -144,7 +145,8 @@ def _upsert(collection: str, doc_id: str, text: str, metadata: dict) -> None:
             return
         except Exception as exc:
             log.warning("cortex.vectors: chroma upsert failed (%s) — degrading to memory.", exc)
-    _mem_index[collection][doc_id] = (vec, dict(metadata), text)
+    # float32 keeps the in-RAM fallback index ~8x smaller than lists of Python floats.
+    _mem_index[collection][doc_id] = (array("f", vec), dict(metadata), text)
 
 
 def index_fact(fact: dict) -> None:

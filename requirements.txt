@@ -2,6 +2,10 @@
 #   python -m venv venv
 #   venv\Scripts\pip install -r requirements.txt   (Windows)
 #   venv/bin/pip install -r requirements.txt        (macOS/Linux)
+#
+# This is the lean core (~400 MB smaller than before). Market scanner, video
+# understanding, Chroma vectors and the Mem0 mirror live in requirements-extras.txt;
+# each one degrades gracefully (with an install hint) when its package is absent.
 
 # Web server
 fastapi
@@ -35,29 +39,11 @@ psutil
 mss
 Pillow
 
-# Market data for the ICT scanner (Indian markets: Nifty, Sensex, NSE stocks)
-yfinance
-pandas
-
-# Video understanding: frame sampling (opencv) + URL download (yt-dlp);
-# audio is transcribed by Groq Whisper, so no ffmpeg binary needed.
-opencv-python-headless
-yt-dlp
-
 # Document uploads — PDF text extraction (docx/text use stdlib only)
 pypdf
 
 # Cross-model memory hub — MCP server so Claude/ChatGPT/Gemini share JARVIS's store
-mcp
-
-# Cortex vector index — semantic recall over facts + episodes. Falls back to a
-# pure-Python in-RAM cosine index if this is missing, so JARVIS still boots.
-chromadb
-
-# Optional cortex cloud mirror — pushes durable facts + nightly dreaming summaries
-# to Mem0 so other devices/apps read the same memory. Gated on MEM0_API_KEY;
-# without the key or this package installed, cortex simply skips the sync.
-mem0ai
+mcp<2   # 2.x renamed FastMCP; jarvis.agent_mcp + memory hub use the v1 API
 
 # Local compute layer (governor/device/consolidation/models_advisor) talks to Ollama
 ollama

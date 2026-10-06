@@ -157,7 +157,7 @@ That loop is the product. The install commands below only get you into it.
 | Python | **3.10+** with a project **`./venv`** |
 | Node.js | **20+** (Vite 7 / Electron in `package.json`) |
 | Brain (at least one) | `GROQ_API_KEY` and/or `ANTHROPIC_API_KEY` and/or **Ollama** with a tool-capable model |
-| Disk / RAM | Local Whisper and Chroma can use significant RAM; a machine with adequate free memory is recommended |
+| Disk / RAM | Core venv is ~400 MB lighter without the extras; for everyday use launch with `launch-jarvis.cmd` / `npm run desktop` (no Vite dev server, ~700 MB less RAM than `desktop:dev`). Local Ollama models are only offered when free RAM allows |
 
 **Optional**
 
@@ -167,7 +167,10 @@ That loop is the product. The install commands below only get you into it.
 | Local rungs | Ollama + a chat model (e.g. `qwen2.5:7b`) |
 | `browse` | Google Chrome; optional `JARVIS_BH_*` / `JARVIS_CHROME` |
 | Pentest tools | Docker Desktop **running** + built `jarvis-recon:latest` |
-| Mem0 mirror | `MEM0_API_KEY` + `mem0ai` (already in `requirements.txt`) |
+| Mem0 mirror | `MEM0_API_KEY` + `mem0ai` (`requirements-extras.txt`) |
+| ICT market scanner | `yfinance` + `pandas` (`requirements-extras.txt`) |
+| Video understanding / webcam snapshot | `opencv-python-headless` + `yt-dlp` (`requirements-extras.txt`) |
+| Persistent Chroma vector index | `chromadb` (`requirements-extras.txt`); without it cortex uses a compact in-RAM index rebuilt from SQLite on boot |
 
 ---
 
@@ -192,6 +195,12 @@ Electron will **not** fall back to a bare global `python` / `py`. It looks for `
 python -m venv venv
 venv\Scripts\pip install --upgrade pip
 venv\Scripts\pip install -r requirements.txt
+```
+
+That is the lean core. The heavy optional features (market scanner, video understanding, Chroma vectors, Mem0 mirror) are in a separate file — install it only if you want them; each feature tells you what to install if you use it without:
+
+```bat
+venv\Scripts\pip install -r requirements-extras.txt
 ```
 
 ### 3. Environment file
@@ -266,6 +275,7 @@ docker build -t jarvis-recon:latest -f docker/jarvis-recon/Dockerfile docker/jar
 | `npm run electron:dev` | Alias of `desktop:dev` |
 | `npm run desktop` | `vite build` then Electron (UI served from backend when `dist` is present) |
 | `npm run desktop:fast` | Electron only (expects a backend already available / previous build) |
+| `launch-jarvis.cmd` | **Lightest everyday launch** — builds `dist` once, then Electron only (no Vite dev server, ~700 MB less RAM than `desktop:dev`) |
 | `venv\Scripts\python.exe api.py` | Backend only (default `http://127.0.0.1:8000`) |
 | `npm run dev` | Frontend only; proxies `/api` + `/ws` to `JARVIS_PORT` (default 8000) — start `api.py` yourself |
 | `npm run typecheck` | `tsc --noEmit` |
@@ -458,7 +468,8 @@ jarv1s/
 ├── public/pill.html       # Small always-on-top island used while minimized
 ├── docs/JARVIS_Architecture_Final.pptx
 ├── src/decks/             # prime, stark, overhaul, focus, terminal, chat
-├── requirements.txt
+├── requirements.txt          # lean core
+├── requirements-extras.txt   # optional heavy features
 ├── package.json
 ├── .env.example
 └── README.md
