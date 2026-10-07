@@ -288,6 +288,12 @@ Simple OS commands skip the reasoning model entirely. A deterministic router (`j
 
 This is both the latency win (simple commands finish in well under a second instead of a multi-second model round-trip) and the anti-fabrication win (the reply is built from a verified result). Set `JARVIS_FASTPATH=0` to route everything through the agent.
 
+**Files, verified.** The `files` tool (and the fast path) create/open/delete files and folders and confirm the real filesystem state before reporting. Multi-step requests run one verified step at a time and stop honestly on failure — "create a folder called ProjectX in my documents and a file readme.txt in it with …" makes the folder, verifies it, then the file, and only then says done. Because these go through the deterministic fast path, they work even when the cloud model is rate-limited. `delete` is confirm-gated.
+
+**Fabrication guard.** As a backstop, if a request was clearly a PC action, the agent ran **no** tool, yet the reply claims it did something ("Done", "Created…"), JARVIS replaces that with the truth ("I didn't actually carry that out") instead of letting a false success through. Verified tools already report honestly; this catches the case where the model skips the tool and just asserts completion.
+
+**Mic auto-recovery.** If the audio stream drops mid-session (device unplugged, grabbed exclusively, driver glitch), the voice supervisor re-probes the microphone and restarts the session with backoff — no app restart, no reconnect needed — up to `JARVIS_VOICE_MAX_RECONNECT` tries (default 6). An explicit mic-off is never auto-recovered.
+
 **Debug mode.** With `JARVIS_DEBUG=1` (or the UI toggle) every turn emits a `debug_trace` with per-stage timings — `stt`, `route`, `exec`, `verify`, `respond`, `total` — to the ops console, and the same breakdown is logged at INFO (`[trace] …`). Use it to find the real bottleneck before optimizing.
 
 **Tasks.** The task queue is backend-owned state (`jarvis/session/tasks.py`), not UI state — it survives a deck switch and reads the same from every view. Each task has a stable, never-reused id (`TASK-001`, `TASK-002`, …) and a real lifecycle: *created → queued → running → waiting → completed*, or *failed* / *cancelled*. "add a task to …", "complete task 3", and "cancel task 2" take the deterministic fast path so the task is actually created/updated (not just acknowledged); the `add_task` / `complete_task` / `cancel_task` tools accept a `TASK-###` or a bare number.
@@ -330,6 +336,7 @@ Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example
 | `JARVIS_CLIENT_GRACE_SEC` | Seconds to keep the mic/tasks alive after the last client drops, so a deck switch doesn't kill them (default 3) |
 | `JARVIS_WAKE_ENGINE` | `text` (default, Whisper + string match) or `openwakeword` (dedicated acoustic engine; needs `pip install openwakeword`) |
 | `JARVIS_WAKE_MODEL` / `JARVIS_WAKE_THRESHOLD` | openWakeWord model (default `hey_jarvis`) and detection threshold (default `0.5`, tune live per mic) |
+| `JARVIS_VOICE_MAX_RECONNECT` | Mic-drop recovery attempts before giving up (default 6) |
 | `JARVIS_EMOTION` / `JARVIS_SARCASM` | Affect layer (`0` disables emotion) |
 | `JARVIS_HOME_CITY` | Pin ambient location |
 | `JARVIS_SHELL_APPROVAL` / `JARVIS_APPROVAL_TOOLS` | UI confirm before privileged tools (default includes `run_command`) |

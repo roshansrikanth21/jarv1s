@@ -73,6 +73,7 @@ import jarvis.act.web_search as websearch_mod
 import jarvis.act.fastpath as fastpath
 import jarvis.act.verify as verify
 import jarvis.act.wake as wake
+import jarvis.act.filesystem as filesystem
 
 import cortex
 from jarvis.memory.dialogue import DialogueStore
@@ -526,6 +527,7 @@ _overheard:  list[dict] = []   # rolling log of everything heard (ambient memory
 _overheard_dirty = 0           # utterances since last persist (throttles disk writes)
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
+_user_stopped_voice = False    # True after an explicit stop — tells the supervisor NOT to recover
 _awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _last_ack_at = 0.0            # last time a wake-ack played — dedupes acoustic + text wake
 _listen_thread: threading.Thread | None = None
@@ -546,6 +548,7 @@ _tts_gen = 0                  # bumped per TTS clip; lets a stale mute-failsafe 
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task: asyncio.Task[None] | None = None  # in-flight _speak task (for barge-in cancel)
+_turn_tool_calls = 0          # tools actually executed this turn (0 + a success claim = fabrication)
 _turn_generation = 0          # bumped on every new dispatch; lets a barged-in tool
                                # thread (which asyncio.to_thread cannot forcibly stop)
                                # notice it's stale and quiet down instead of surfacing
@@ -1409,6 +1412,35 @@ TOOLS: list[dict] = [
                     },
                 },
                 "required": ["app"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "files",
+            "description": (
+                "Create/open/inspect files and folders on the user's PC, VERIFIED (each op "
+                "confirms the real filesystem state before reporting). Use for 'make a folder "
+                "called X', 'create a notes file', 'open my project folder'. For a multi-step "
+                "request (e.g. make a folder, open it, put a file inside) call this ONE action "
+                "at a time and STOP if a step reports it failed — do not claim later steps "
+                "succeeded. actions: create_folder(path) · create_file(path, content?) · "
+                "open(path) · exists(path) · list(path) · delete(path, confirm) — delete needs "
+                "confirm=true (confirm=false is a dry-run). Relative paths resolve under the "
+                "user's home."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string",
+                               "enum": ["create_folder", "create_file", "open", "exists",
+                                        "list", "delete"]},
+                    "path": {"type": "string", "description": "File/folder path (~ and env vars ok)"},
+                    "content": {"type": "string", "description": "For create_file: initial text content"},
+                    "confirm": {"type": "boolean", "description": "For delete: must be true to actually delete"},
+                },
+                "required": ["action", "path"],
             },
         },
     },
@@ -2734,6 +2766,9 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             return f"Unknown app '{raw}'. Supported: {supported}"
         return _launch_resolved(raw, cmd)
 
+    if name == "files":
+        return filesystem.run(str(args.get("action") or ""), args)
+
     if name == "close_app":
         raw = str(args.get("app", "")).lower().strip()
         out = _close_app(raw)
@@ -3461,6 +3496,8 @@ This applies just as hard to opening/closing apps and desktop control. NEVER say
 
 Capability honesty: you do NOT have tools to send email, send SMS/texts, make phone calls, or move money. If asked for one of these, say you can't do that yet — don't pretend you did it, and don't claim a capability you weren't given.
 
+Multi-step tasks: do them ONE verified step at a time. After each tool result, check it actually succeeded before the next step. If a step fails, STOP the dependent steps, say which step failed and why, and do NOT claim the overall task is done. E.g. "create a folder, open it, add a file": if the folder couldn't be created, don't go on to open it or claim a file was made.
+
 Do NOT pre-judge authorization or scope in your head and refuse. Always CALL the security tool — it enforces scope itself and tells you (and you relay) if a target is out of scope. `recon` (passive) and `report` (reads memory) never need scope, so never refuse those for scope reasons; just call them.
 
 Security tool routing — pick the tool, don't just talk about it: "recon/look up <target>" → recon. "bugbounty/sweep/enumerate/recon a domain" → bugbounty (full sweep). "pentest/scan/port scan/nuclei/dirs/xss/sqli/subdomain takeover <target>" → pentest with the matching task. "report/write-up on <target>" → report. "add/list/remove scope" → scope. Any of these is a request to RUN the tool on that target, not to explain the concept.
@@ -3659,7 +3696,8 @@ def _approval_summary(name: str, args: dict) -> str:
 
 
 async def _run_tool(name: str, args: dict) -> str:
-    global _filler_sent, _pending_content_panel
+    global _filler_sent, _pending_content_panel, _turn_tool_calls
+    _turn_tool_calls += 1
     # A slow tool means a real wait — bridge the dead air with a quick spoken
     # acknowledgment, once per turn. Fast tools answer too quickly to bother.
     if not _filler_sent and name in SLOW_TOOLS:
@@ -3728,7 +3766,7 @@ async def _emit_final(text: str) -> None:
 _CORE_TOOLS = {
     "remember", "recall_memory", "search_web", "calculate", "get_weather",
     "get_system_info", "add_task", "complete_task", "cancel_task", "run_command", "launch_app",
-    "close_app", "capture_screen", "use_skill", "create_skill",
+    "close_app", "files", "capture_screen", "use_skill", "create_skill",
 }
 _TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
     (re.compile(r"\b(desktop|click|type this|keyboard|mouse|window|gui|automate|drag|scroll)\b", re.I),
@@ -4372,6 +4410,36 @@ def _needs_tools(text: str) -> bool:
     return bool(_TOOL_INTENT_RE.search(text or ""))
 
 
+# A request that plainly asks JARVIS to DO something on the PC (verb + concrete OS object) —
+# the class where claiming success without a tool is a lie. Kept tight (needs both a verb and
+# a matching object) so it never fires on "create a haiku" or "open up about yourself".
+_ACTION_VERB = r"(?:open|launch|start|run|close|quit|kill|create|make|new|delete|remove|rename|move|write|save|install|uninstall)"
+_ACTION_OBJ = (r"(?:file|folder|directory|document|note|app|application|program|window|shortcut|"
+               r"notepad|chrome|firefox|edge|spotify|discord|calculator|calc|explorer|terminal|"
+               r"powershell|paint|word|excel)")
+_ACTION_RE = re.compile(rf"\b{_ACTION_VERB}\b.*\b{_ACTION_OBJ}\b", re.I | re.S)
+_CLAIM_RE = re.compile(
+    r"\b(done|created?|made|opened?|launched?|closed?|deleted?|removed|renamed|moved|wrote|saved|"
+    r"installed|set up|all set|taken care of|i'?ve|i have)\b", re.I)
+
+
+def _is_action_request(text: str) -> bool:
+    t = (text or "").strip()
+    if not t or t.endswith("?"):
+        return False
+    return bool(_ACTION_RE.search(t))
+
+
+def _claims_done(reply: str) -> bool:
+    r = (reply or "").strip()
+    if not r:
+        return False
+    # A reply that admits it couldn't is NOT a false success claim — don't flag it.
+    if re.search(r"\b(can'?t|cannot|couldn'?t|unable|not able|didn'?t|did not|no tool|don'?t have)\b", r, re.I):
+        return False
+    return bool(_CLAIM_RE.search(r))
+
+
 async def _run_agent(text: str) -> None:
     """Route the request through the Governor, then run the chosen rung. The Governor
     picks the cheapest brain that clears the difficulty bar within the current
@@ -4520,6 +4588,15 @@ async def _run_agent(text: str) -> None:
             pass
         _session.workflow = WorkflowPhase.IDLE
         return
+
+    # Anti-fabrication guard: if this was clearly a PC ACTION request, the model claims it did
+    # it, yet NO tool actually ran this turn, the "success" is fabricated. Never let that reach
+    # the user — replace it with the truth. (Verified tools already report honestly; this
+    # catches the case where the model skipped the tool entirely and just asserted completion.)
+    if _is_action_request(text) and _turn_tool_calls == 0 and _claims_done(answer):
+        log.warning("fabrication guard: action request answered with no tool call — %r", answer[:120])
+        answer = ("I didn't actually carry that out — no action ran, so I won't say it's done. "
+                  "Let me try again if you'll repeat it.")
 
     await _emit_final(answer)
     _record_turn(text, answer)
@@ -4961,6 +5038,25 @@ def _save_screenshot() -> str:
         return f"Screenshot failed: {exc}"
 
 
+_KNOWN_DIRS = {"documents": "Documents", "desktop": "Desktop", "downloads": "Downloads",
+               "pictures": "Pictures", "music": "Music", "videos": "Videos"}
+
+
+def _fs_path(location: str, *parts: str) -> str:
+    """Resolve a spoken location ('my documents', 'desktop', a literal path, or nothing) to a
+    base dir under the user's home, then join the name parts onto it."""
+    loc = (location or "").strip().lower().replace(" folder", "").strip()
+    if loc in _KNOWN_DIRS:
+        base = os.path.join(os.path.expanduser("~"), _KNOWN_DIRS[loc])
+    elif loc in ("", "home"):
+        base = os.path.expanduser("~")
+    else:
+        base = os.path.expanduser(os.path.expandvars(location.strip()))
+        if not os.path.isabs(base):
+            base = os.path.join(os.path.expanduser("~"), base)
+    return os.path.join(base, *parts)
+
+
 def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
     """Run a fast-path intent and return (spoken_reply, handled). handled=False means we
     couldn't honour it deterministically (e.g. an unknown app) and the caller should fall
@@ -5042,6 +5138,27 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
     if kind == "SCREENSHOT":
         return _save_screenshot(), True
 
+    if kind == "FS_FOLDER":
+        return filesystem.create_folder(_fs_path(p.get("location", ""), p["name"])), True
+
+    if kind == "FS_FILE":
+        return filesystem.create_file(_fs_path(p.get("location", ""), p["name"]),
+                                      p.get("content", "")), True
+
+    if kind == "FS_FOLDER_FILE":
+        folder = _fs_path(p.get("location", ""), p["folder"])
+        r1 = filesystem.create_folder(folder)
+        if not r1.startswith("Created folder"):
+            # Step 1 failed → STOP, don't claim the file was made. Verified multi-step.
+            return r1, True
+        r2 = filesystem.create_file(os.path.join(folder, p["file"]), p.get("content", ""))
+        if r2.startswith("Created file"):
+            return f"Done — created the folder {p['folder']} and {p['file']} inside it.", True
+        return f"I made the folder, but couldn't create the file: {r2}", True
+
+    if kind == "FS_OPEN":
+        return filesystem.open_path(_fs_path(p.get("location", ""))), True
+
     if kind == "TASK_ADD":
         task = _tasks.create(p["text"])
         return f"Added it — that's {task['tid']}.", True
@@ -5093,7 +5210,7 @@ async def dispatch_command(text: str, *, source: str = "typed",
                            wake_ms: float | None = None, stt_ms: float | None = None) -> None:
     """Entry point for every command (voice or typed). Barges in on whatever is
     currently running — thinking OR speaking — so a new directive takes over."""
-    global _current_task, _turn_generation, _turn_trace
+    global _current_task, _turn_generation, _turn_trace, _turn_tool_calls
     busy = (
         (_current_task and not _current_task.done())
         or (_speak_task and not _speak_task.done())
@@ -5102,6 +5219,7 @@ async def dispatch_command(text: str, *, source: str = "typed",
     if busy:
         await _stop_speaking()
     _turn_generation += 1
+    _turn_tool_calls = 0
     _turn_trace = TurnTrace(text, source, wake_ms=wake_ms, stt_ms=stt_ms)
     _current_task = asyncio.create_task(handle_command(text))
 
@@ -5478,10 +5596,11 @@ async def _speak(text: str) -> None:
 
 # ── STT ────────────────────────────────────────────────────────────────────────
 async def _start_voice() -> None:
-    global _listening, _listen_thread, _tts_playing, _speaking_text
+    global _listening, _listen_thread, _tts_playing, _speaking_text, _user_stopped_voice
     with _voice_lock:
         if _listening:
             return
+        _user_stopped_voice = False   # fresh start — recovery is allowed again
         # If a previous worker is still winding down (it exits ~0.3s after _listening went
         # False), wait for it to fully release the mic device before opening a new stream —
         # otherwise a quick stop→start races two InputStreams onto one device ("device busy").
@@ -5501,8 +5620,9 @@ async def _start_voice() -> None:
 
 
 def _stop_voice() -> None:
-    global _listening
+    global _listening, _user_stopped_voice
     with _voice_lock:
+        _user_stopped_voice = True   # explicit stop — supervisor must not auto-recover
         _listening = False
     broadcast_from_thread({"type": "state", "status": "idle", "text": "Mic off."})
     broadcast_from_thread({"type": "mic", "listening": False})
@@ -5893,7 +6013,14 @@ def _pick_input_device(sd):
     return None, None, None
 
 
-def _voice_worker() -> None:
+def _voice_session() -> str:
+    """One microphone session. Returns a reason the supervisor (`_voice_worker`) uses to
+    decide whether to recover:
+      "user"      — _listening went False (explicit stop / last client left): don't restart
+      "mic_error" — the audio stream raised mid-session: recoverable, re-probe + restart
+      "no_mic"    — no usable device right now: retry later (it may get unblocked/plugged in)
+      "fatal"     — missing deps / no STT backend at all: pointless to retry
+    """
     import queue as Q
     import wave
 
@@ -5905,28 +6032,26 @@ def _voice_worker() -> None:
             "type": "system",
             "text": f"Voice deps missing: {exc}. Run: pip install sounddevice numpy",
         })
-        _voice_stopped()
-        return
+        return "fatal"
 
     if not _stt_available():
         broadcast_from_thread({"type": "system", "text":
             "Voice input needs either the local STT model (pip install faster-whisper) or a "
             "GROQ_API_KEY for cloud Whisper."})
-        _voice_stopped()
-        return
+        return "fatal"
 
     CHUNK = 1024            # ~64ms per callback at 16kHz
     # Pick a mic that actually opens here — the default MME device fails on many Windows
     # machines (Intel Smart Sound arrays) with a -9999 host error. RATE is whatever that
     # device accepts (16 kHz if possible, else its native rate; Groq Whisper resamples).
+    # Re-probed every session, so recovery picks up a device that changed index/was replugged.
     input_device, RATE, CHANS = _pick_input_device(sd)
     if input_device is None or RATE is None or CHANS is None:
         broadcast_from_thread({"type": "system", "text":
             "No usable microphone. Check Windows mic access (Settings → Privacy & security → "
             "Microphone → let desktop apps use the mic), that a mic is enabled, and that no "
             "other app is holding it exclusively."})
-        _voice_stopped()
-        return
+        return "no_mic"
     sample_rate = int(RATE)
     audio_q: Q.Queue = Q.Queue()
 
@@ -6233,14 +6358,56 @@ def _voice_worker() -> None:
             if triggered and voiced and not _tts_muted():   # flush an in-progress utterance on mic-off
                 _flush_async(np.concatenate(voiced))
 
+        # Loop exited because _listening went False → an intentional stop.
+        reason = "user"
     except Exception as exc:
-        broadcast_from_thread({"type": "system", "text": f"Voice error: {exc}"})
+        # The audio stream dropped mid-session (device unplugged, exclusive-mode grab, driver
+        # glitch). Recoverable — the supervisor re-probes and restarts.
+        broadcast_from_thread({"type": "system", "text": f"Microphone stream dropped: {exc}"})
+        reason = "mic_error"
 
     stt_q.put(None)   # release the STT worker so it exits cleanly with the capture loop
+    return reason
 
-    # Any exit — normal stop, mic/stream error, or GROQ hiccup — resets the flag so the mic
-    # can always be restarted (and so ALWAYS_LISTEN's auto-restart isn't permanently blocked).
-    _voice_stopped()
+
+# How many times to retry a dropped mic before giving up, and the backoff ceiling.
+_VOICE_MAX_RECONNECT = int(os.environ.get("JARVIS_VOICE_MAX_RECONNECT", "6"))
+
+
+def _voice_worker() -> None:
+    """Supervises mic sessions so a transient audio failure recovers WITHOUT restarting the
+    app or needing a reconnect. Runs one `_voice_session()`; on a recoverable drop it re-probes
+    the device and restarts with backoff, resetting the attempt budget after any session that
+    ran a while (so an occasional glitch never exhausts the budget). A clean user stop, or a
+    fatal/no-backend condition, ends it. Always leaves the mic state authoritatively OFF."""
+    attempts = 0
+    try:
+        while _listening:
+            t0 = time.time()
+            reason = _voice_session()
+            ran_for = time.time() - t0
+            if reason == "user" or not _listening or _user_stopped_voice:
+                break
+            if reason == "fatal":
+                break            # missing deps / no STT — retrying can't help
+            if ran_for > 30.0:
+                attempts = 0     # it worked for a while; treat this as a fresh, isolated drop
+            attempts += 1
+            if attempts > _VOICE_MAX_RECONNECT:
+                broadcast_from_thread({"type": "system", "text":
+                    "I couldn't recover the microphone after several tries. Toggle the mic to "
+                    "retry, or check Windows microphone access."})
+                break
+            backoff = min(1.5 * attempts, 6.0)   # longer waits for a missing device
+            broadcast_from_thread({"type": "system",
+                                   "text": f"Reconnecting the microphone (attempt {attempts})…"})
+            # Interruptible sleep so an explicit stop during backoff is honoured promptly.
+            slept = 0.0
+            while slept < backoff and _listening and not _user_stopped_voice:
+                time.sleep(0.1)
+                slept += 0.1
+    finally:
+        _voice_stopped()
 
 
 

@@ -67,6 +67,49 @@ class FastPathRouter(unittest.TestCase):
         # "remind me to ..." is a scheduled reminder, NOT a queue task — don't fast-path it.
         self.assertIsNone(self.fp.match("remind me to call mom at 6pm"))
 
+    def test_filesystem_intents(self):
+        a = self.fp.match("create a folder called JarvisDemo in my documents")
+        self.assertEqual((a.kind, a.params["name"], a.params["location"]),
+                         ("FS_FOLDER", "JarvisDemo", "documents"))
+        b = self.fp.match("make a file notes.txt in Reports with hello world")
+        self.assertEqual((b.kind, b.params["name"], b.params["content"]),
+                         ("FS_FILE", "notes.txt", "hello world"))
+        c = self.fp.match("create a folder called ProjectX and a file readme.txt in it with hi")
+        self.assertEqual((c.kind, c.params["folder"], c.params["file"], c.params["content"]),
+                         ("FS_FOLDER_FILE", "ProjectX", "readme.txt", "hi"))
+        self.assertEqual(self.fp.match("open my downloads").kind, "FS_OPEN")
+        # Non-filesystem "create" must not be hijacked.
+        self.assertIsNone(self.fp.match("create a haiku about the sea"))
+        self.assertIsNone(self.fp.match("make me laugh"))
+
+
+class FabricationGuard(unittest.TestCase):
+    """The agent must never claim a PC action succeeded when no tool ran. The guard fires only
+    on (action request) AND (no tool call) AND (a success claim), and never on questions,
+    honest failures, or non-OS 'create' (a haiku)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import api
+        cls.api = api
+
+    def _fab(self, text, reply, tool_calls):
+        return (self.api._is_action_request(text) and tool_calls == 0
+                and self.api._claims_done(reply))
+
+    def test_flags_fabricated_completion(self):
+        self.assertTrue(self._fab("make a folder called X and add a file", "Done — created both.", 0))
+        self.assertTrue(self._fab("delete the file report.txt", "Deleted it.", 0))
+        self.assertTrue(self._fab("open notepad", "Opened Notepad for you.", 0))
+
+    def test_does_not_flag_when_a_tool_ran(self):
+        self.assertFalse(self._fab("make a folder called X", "Created folder C:/x.", 1))
+
+    def test_does_not_flag_honest_failure_or_questions_or_prose(self):
+        self.assertFalse(self._fab("open notepad", "I couldn't open notepad — not installed.", 0))
+        self.assertFalse(self._fab("what can you do?", "Lots of things.", 0))
+        self.assertFalse(self._fab("write a haiku about the sea", "Here is a haiku ...", 0))
+
 
 class VerifyHelpers(unittest.TestCase):
     def setUp(self):

@@ -105,6 +105,27 @@ _MEDIA = [
     (re.compile(r"^(?:previous|prev|last)(?:\s+(?:track|song))?$", re.I), "prevtrack"),
 ]
 
+# ── filesystem (verified, deterministic) ───────────────────────────────────────────
+# "create a folder called X [in my documents]", "make a file notes.txt [in X] [with ...]",
+# and the compound "folder X and a file Y in it". Deterministic so it works even when the
+# cloud model is rate-limited — the exact case where trusting the LLM to call a tool is fragile.
+_FS_LOC = r"(?:\s+(?:in|on|under|inside|into)\s+(?:my\s+|the\s+)?(?P<loc>[^\"']+?))?"
+_FS_FOLDER = re.compile(
+    rf"^(?:create|make|new|add)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:folder|directory|dir)\s+"
+    rf"(?:called\s+|named\s+|titled\s+)?[\"']?(?P<name>[^\"']+?)[\"']?{_FS_LOC}$", re.I)
+_FS_FILE = re.compile(
+    rf"^(?:create|make|new|add)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:file|text\s*file|document|note)\s+"
+    rf"(?:called\s+|named\s+|titled\s+)?[\"']?(?P<name>[^\"']+?)[\"']?{_FS_LOC}"
+    rf"(?:\s+(?:with|containing|that\s+says|saying|with\s+the\s+text)\s+[\"']?(?P<content>.+?)[\"']?)?$", re.I)
+# Compound: a folder AND a file (usually "inside it"). The file's content is optional.
+_FS_COMPOUND = re.compile(
+    rf"^(?:create|make|new)\s+(?:a\s+)?(?:new\s+)?folder\s+(?:called\s+|named\s+)?[\"']?(?P<folder>[^\"']+?)[\"']?{_FS_LOC}"
+    rf"\s*(?:,|and|then|&)\s*(?:create|make|add|put|drop|place)?\s*(?:a\s+)?(?:new\s+)?(?:file|text\s*file|document|note)\s+"
+    rf"(?:called\s+|named\s+)?[\"']?(?P<file>[^\"']+?)[\"']?(?:\s+(?:in\s+it|inside|inside\s+it|there|within))?"
+    rf"(?:\s+(?:with|containing|that\s+says|saying)\s+[\"']?(?P<content>.+?)[\"']?)?$", re.I)
+_FS_OPEN = re.compile(
+    r"^open\s+(?:my\s+|the\s+)?(documents|desktop|downloads|pictures|music|videos|home\s+folder|downloads\s+folder)$", re.I)
+
 # ── task queue ────────────────────────────────────────────────────────────────────
 # Explicit "add a task ..." only — unambiguous queue intent. NOT "remind me to ..." (that's
 # a scheduled reminder, a different tool). Fast-pathing this guarantees the task is really
@@ -151,6 +172,26 @@ def match(text: str) -> FastIntent | None:
     for rx, key in _MEDIA:
         if rx.match(t):
             return FastIntent("MEDIA", {"key": key})
+
+    # Filesystem — match against the ORIGINAL text to keep names/content casing. Compound first.
+    raw0 = (text or "").strip().strip(".!?")
+    m = _FS_COMPOUND.match(raw0)
+    if m:
+        return FastIntent("FS_FOLDER_FILE", {
+            "folder": m.group("folder").strip(), "location": (m.group("loc") or "").strip(),
+            "file": m.group("file").strip(), "content": (m.group("content") or "").strip()})
+    m = _FS_FILE.match(raw0)
+    if m:
+        return FastIntent("FS_FILE", {"name": m.group("name").strip(),
+                                      "location": (m.group("loc") or "").strip(),
+                                      "content": (m.group("content") or "").strip()})
+    m = _FS_FOLDER.match(raw0)
+    if m:
+        return FastIntent("FS_FOLDER", {"name": m.group("name").strip(),
+                                        "location": (m.group("loc") or "").strip()})
+    m = _FS_OPEN.match(t)
+    if m:
+        return FastIntent("FS_OPEN", {"location": m.group(1).split()[0]})
 
     m = _TASK_DONE.match(t)
     if m:
