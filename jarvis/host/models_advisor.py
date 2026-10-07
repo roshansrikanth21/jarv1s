@@ -728,6 +728,203 @@ def installed(with_caps: bool = True, *, use_cache: bool = True) -> list[dict]:
     return out
 
 
+_GGUF_EXT = ".gguf"
+_FAMILIES = ("qwen", "llama", "mistral", "mixtral", "phi", "gemma", "gpt-oss",
+             "deepseek", "hermes", "command-r", "yi", "codellama", "starcoder")
+
+
+def _guess_family(name: str) -> str:
+    low = name.lower()
+    for fam in _FAMILIES:
+        if fam in low:
+            return fam
+    return "unknown"
+
+
+def common_model_dirs() -> list[Path]:
+    """Likely folders where already-downloaded GGUF models live, across setups. The
+    user can add more with JARVIS_MODEL_DIRS (os.pathsep-separated). Ollama's own
+    blob store is intentionally excluded here - those models are covered by
+    installed()/ollama.list(), and its blobs aren't .gguf-named anyway."""
+    home = Path.home()
+    cands = [
+        home / ".lmstudio" / "models",                 # LM Studio (current)
+        home / ".cache" / "lm-studio" / "models",      # LM Studio (older)
+        home / "Downloads",
+        home / "models",
+        home / ".cache" / "huggingface" / "hub",       # HF hub cache
+        home / "AppData" / "Local" / "nomic.ai" / "GPT4All",  # GPT4All (Windows)
+        home / ".local" / "share" / "nomic.ai" / "GPT4All",   # GPT4All (Linux/mac)
+    ]
+    for p in (os.environ.get("JARVIS_MODEL_DIRS", "") or "").split(os.pathsep):
+        p = p.strip()
+        if p:
+            cands.append(Path(p))
+    seen: set[str] = set()
+    out: list[Path] = []
+    for c in cands:
+        try:
+            rc = c.expanduser()
+        except Exception:
+            continue
+        key = str(rc)
+        if key not in seen:
+            seen.add(key)
+            out.append(rc)
+    return out
+
+
+def scan_disk_models(dirs: list[Path] | None = None, *, max_depth: int = 4,
+                     limit: int = 300) -> list[dict]:
+    """Find .gguf model files in the given (or common) folders via a bounded walk.
+    Pure filesystem - no Ollama, no network. Returns
+    [{name, path, gb, source:'gguf', family}], de-duplicated by absolute path."""
+    dirs = dirs if dirs is not None else common_model_dirs()
+    found: list[dict] = []
+    seen: set[str] = set()
+    for base in dirs:
+        try:
+            if not base.exists() or not base.is_dir():
+                continue
+            base_depth = len(base.parts)
+            for root, subdirs, files in os.walk(base):
+                if len(Path(root).parts) - base_depth > max_depth:
+                    subdirs[:] = []           # prune deeper than max_depth
+                    continue
+                for fn in files:
+                    if not fn.lower().endswith(_GGUF_EXT):
+                        continue
+                    fp = Path(root) / fn
+                    key = str(fp)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        gb = round(fp.stat().st_size / 1024 ** 3, 2)
+                    except OSError:
+                        gb = None
+                    found.append({
+                        "name": fn[: -len(_GGUF_EXT)],
+                        "path": key,
+                        "gb": gb,
+                        "source": "gguf",
+                        "family": _guess_family(fn),
+                    })
+                    if len(found) >= limit:
+                        return found
+        except Exception:
+            continue
+    return found
+
+
+def annotate_disk_models(device: dict, disk: list[dict],
+                         installed_names: set[str] | None = None) -> list[dict]:
+    """Tag each scanned GGUF with RAM fit + whether it's already in Ollama. A raw GGUF
+    cannot be run until imported into Ollama (import_gguf), and its tool-calling
+    support is unknown until then - both flagged so the UI can tell the truth."""
+    budget = _budget_ctx(device)
+    inst_norm = {_norm(n) for n in (installed_names or set())}
+    live = float(budget.get("live_gb") or 0)
+    out = []
+    for m in disk:
+        gb = float(m.get("gb") or 0)
+        need = round(_required_gb(gb), 1) if gb else None
+        fits_now = bool(need) and need <= live
+        out.append({
+            **m,
+            "in_ollama": _norm(m.get("name", "")) in inst_norm,
+            "needs_gb": need,
+            "runnable_now": fits_now,
+            "note": (None if fits_now else
+                     f"needs ~{need}GB RAM, ~{live:.1f}GB free" if need else "size unknown"),
+            "importable": True,
+            "tools": None,     # unknown until imported + probed
+        })
+    return out
+
+
+def suggest_local(device: dict, installed: list[dict] | None = None,
+                  disk: list[dict] | None = None) -> dict:
+    """One honest recommendation across Ollama-installed and on-disk GGUF models:
+    prefer an installed, tool-capable model that runs now (JARVIS can use it
+    immediately); else the biggest on-disk GGUF that fits, flagged 'import first'."""
+    budget = _budget_ctx(device)
+    live = float(budget.get("live_gb") or 0)
+    installed = installed or []
+    disk = disk or []
+
+    ready = []
+    for m in installed:
+        if not m.get("tools"):
+            continue
+        rec = catalog_entry(m["name"]) or _rec_from_installed(m)
+        if _fits_now(rec, budget):
+            ready.append(m)
+    if ready:
+        ready.sort(key=lambda m: float(m.get("gb") or 0), reverse=True)
+        pick = ready[0]
+        return {"kind": "ollama", "name": pick["name"], "gb": pick.get("gb"),
+                "ready": True,
+                "why": f"Installed, tool-capable, and fits ~{live:.1f}GB free RAM - usable now."}
+
+    disk_fit = [m for m in disk if m.get("gb") and _required_gb(float(m["gb"])) <= live]
+    if disk_fit:
+        disk_fit.sort(key=lambda m: float(m.get("gb") or 0), reverse=True)
+        pick = disk_fit[0]
+        return {"kind": "gguf", "name": pick["name"], "path": pick.get("path"),
+                "gb": pick.get("gb"), "ready": False,
+                "why": ("On disk and fits RAM. Import it into Ollama first "
+                        "(it must support tool-calling to be JARVIS's brain).")}
+
+    return {"kind": "none", "ready": False,
+            "why": ("No local model fits free RAM right now. Pull a small tool-capable "
+                    "model (e.g. qwen3:4b) or free up RAM; JARVIS will use the cloud brain meanwhile.")}
+
+
+def import_gguf(path: str, name: str | None = None) -> dict:
+    """Register a local .gguf with Ollama so JARVIS can run it, via `ollama create`
+    with a one-line Modelfile (FROM <path>). Returns {ok, model|error, manual}. Uses
+    the ollama CLI (the stable, documented path); if it's absent, returns the exact
+    manual command so the user can run it themselves."""
+    import subprocess
+    import tempfile
+
+    p = Path(path).expanduser()
+    if not p.exists():
+        return {"ok": False, "error": f"file not found: {path}"}
+    if p.suffix.lower() != _GGUF_EXT:
+        return {"ok": False, "error": "not a .gguf file"}
+    model = (name or p.stem).strip().lower().replace(" ", "-")
+    if not _OLLAMA_TAG_RE.match(model.split(":")[0]):
+        return {"ok": False, "error": f"invalid model name derived from file: {model!r}"}
+
+    modelfile = f"FROM {p}\n"
+    manual = f'ollama create {model} -f Modelfile   # Modelfile: FROM "{p}"'
+    if shutil.which("ollama") is None:
+        return {"ok": False, "error": "ollama CLI not on PATH", "manual": manual}
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".modelfile", delete=False,
+                                         encoding="utf-8") as fh:
+            fh.write(modelfile)
+            tmp = fh.name
+        r = subprocess.run(["ollama", "create", model, "-f", tmp],
+                           capture_output=True, text=True, timeout=1800)
+        if r.returncode != 0:
+            return {"ok": False, "error": (r.stderr or r.stdout or "ollama create failed").strip(),
+                    "manual": manual}
+        invalidate_install_cache()
+        return {"ok": True, "model": model}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "manual": manual}
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
 def running() -> list[dict]:
     """Models currently loaded in memory (and whether on GPU)."""
     if not _HAS_OLLAMA:
