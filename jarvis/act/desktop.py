@@ -825,6 +825,28 @@ _ACTIONS = {
 }
 
 
+def _direction(args: dict, kind: str) -> str:
+    """Resolve the up|down|mute|set direction for system_volume / brightness.
+
+    The desktop tool's `action` field carries the SUB-ACTION name ('system_volume'), so the
+    direction cannot also live there — reading it from `action` (as the old code did) always
+    yielded the literal 'system_volume' and the call failed with 'action must be up|down…'.
+    The direction now comes from a dedicated key; a bare `level` with no direction implies
+    'set', which is what "set volume to 30" means."""
+    for key in ("direction", f"{kind}_action", "value", "sub_action"):
+        v = str(args.get(key) or "").strip().lower()
+        if v in ("up", "down", "mute", "unmute", "set"):
+            return "mute" if v == "unmute" else v
+    # A combined form like "volume_up" / "brightness-down" occasionally arrives in `action`.
+    combined = str(args.get("action") or "").strip().lower()
+    for d in ("up", "down", "mute", "set"):
+        if combined.endswith(d):
+            return d
+    if args.get("level") is not None:
+        return "set"
+    return ""
+
+
 def run(action: str, args: dict) -> str:
     """Dispatch a `desktop` tool call. Never raises — every failure returns a string."""
     act = (action or "").strip().lower()
@@ -847,11 +869,9 @@ def run(action: str, args: dict) -> str:
         return uninstall_app(str(args.get("app") or ""), bool(args.get("confirm")))
     # new dispatch (Mark-XLVIII parity)
     if act == "system_volume":
-        return system_volume(str(args.get("action") or args.get("volume_action") or ""),
-                             args.get("level"))
+        return system_volume(_direction(args, "volume"), args.get("level"))
     if act == "brightness":
-        return brightness(str(args.get("action") or args.get("brightness_action") or ""),
-                          args.get("level"))
+        return brightness(_direction(args, "brightness"), args.get("level"))
     if act == "toggle_wifi":
         return toggle_wifi(str(args.get("state") or ""),
                            str(args.get("adapter") or "Wi-Fi"))

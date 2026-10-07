@@ -63,6 +63,14 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // TTS now arrives sentence-by-sentence so playback starts on the first sentence. Chunks of
+  // one utterance play gaplessly from this queue; a new utterance (seq 0) or tts_stop clears
+  // it. `ttsFinalRef` marks that the last chunk has arrived, so we only report the turn done
+  // (tts_end, speaking=false) once the queue has fully drained.
+  const ttsQueueRef = useRef<string[]>([]);
+  const ttsPlayingRef = useRef(false);
+  const ttsFinalRef = useRef(false);
+  const ttsStartSentRef = useRef(false);
   const addRef = useRef<(r: Role, t: string) => void>(null!);
   const connRef = useRef<() => void>(null!);
   const tapsRef = useRef<Set<(msg: Record<string, unknown>) => void>>(new Set());
@@ -142,36 +150,78 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   }, []);
   addRef.current = add;
 
-  const playTts = useCallback((b64: string) => {
+  // Stop any audio, empty the chunk queue, and reset the per-utterance flags. `notifyEnd`
+  // sends tts_end so the backend un-mutes the mic (skip it when the caller already did).
+  const stopTts = useCallback((notifyEnd: boolean) => {
     if (audioRef.current) {
-      audioRef.current.pause();
+      try {
+        audioRef.current.pause();
+      } catch {
+        /* already gone */
+      }
       audioRef.current = null;
     }
-    const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], {
-      type: "audio/mpeg",
-    });
-    const url = URL.createObjectURL(blob);
+    ttsQueueRef.current = [];
+    ttsPlayingRef.current = false;
+    ttsFinalRef.current = false;
+    ttsStartSentRef.current = false;
+    setSpeaking(false);
+    if (notifyEnd) wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+  }, []);
+
+  const playNextTts = useCallback(() => {
+    const url = ttsQueueRef.current.shift();
+    if (!url) {
+      // Queue drained. If the final chunk has arrived, the utterance is complete.
+      ttsPlayingRef.current = false;
+      if (ttsFinalRef.current) {
+        ttsFinalRef.current = false;
+        ttsStartSentRef.current = false;
+        setSpeaking(false);
+        wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+      }
+      return;
+    }
+    ttsPlayingRef.current = true;
     const a = new Audio(url);
     audioRef.current = a;
     setSpeaking(true);
-    const end = () => {
-      setSpeaking(false);
+    const advance = () => {
       URL.revokeObjectURL(url);
-      audioRef.current = null;
-      wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+      if (audioRef.current === a) audioRef.current = null;
+      playNextTts();
     };
-    a.onended = end;
-    a.onerror = end;
+    a.onended = advance;
+    a.onerror = advance;
     a.play()
-      .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
+      .then(() => {
+        if (!ttsStartSentRef.current) {
+          ttsStartSentRef.current = true;
+          wsRef.current?.send(JSON.stringify({ action: "tts_start" }));
+        }
+      })
       .catch(() => {
         addRef.current(
           "system",
           "Audio blocked by the browser — click the orb or send a message first, then try again.",
         );
-        end();
+        stopTts(true);
       });
-  }, []);
+  }, [stopTts]);
+
+  const playTts = useCallback(
+    (b64: string, seq: number, final: boolean) => {
+      // seq 0 starts a fresh utterance — clear anything still queued/playing from before.
+      if (seq === 0) stopTts(false);
+      const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], {
+        type: "audio/mpeg",
+      });
+      ttsQueueRef.current.push(URL.createObjectURL(blob));
+      if (final) ttsFinalRef.current = true;
+      if (!ttsPlayingRef.current) playNextTts();
+    },
+    [stopTts, playNextTts],
+  );
 
   const connect = useCallback(() => {
     const cur = wsRef.current;
@@ -235,6 +285,25 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
           else if (!audioRef.current) setSpeaking(false);
         }
         if (d.type === "emotion" && d.emotion) setMood(d.emotion);
+        if (d.type === "history" && Array.isArray(d.turns)) {
+          // Replayed on (re)connect so a deck switch doesn't blank the conversation. Seed the
+          // view with the recent turns the backend still holds, replacing the lone greeting.
+          const turns = (d.turns as { role: Role; text: string }[])
+            .filter((t) => t && t.text && t.text.trim())
+            .slice(-24)
+            .map(
+              (t) =>
+                ({ id: uid(), role: t.role === "user" ? "user" : "agent", text: t.text }) as Line,
+            );
+          if (turns.length) {
+            setLines((prev) => {
+              // Only seed if the view is still just the initial greeting — never clobber a
+              // conversation the user is already looking at.
+              const onlyGreeting = prev.length <= 1 && prev.every((l) => l.role === "system");
+              return onlyGreeting ? turns : prev;
+            });
+          }
+        }
         if (d.type === "transcription" || d.type === "transcript") addRef.current("user", txt);
         if (d.type === "llm_chunk" && d.text) {
           streamBufRef.current += d.text as string;
@@ -245,18 +314,15 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
           resetStream();
           addRef.current("agent", txt);
         }
-        if (d.type === "tts_audio" && d.data) playTts(d.data as string);
+        if (d.type === "tts_audio" && d.data) {
+          playTts(d.data as string, Number(d.seq) || 0, Boolean(d.final ?? true));
+        }
         if ((d.type === "system" || d.type === "tts_error") && txt.trim()) {
           addRef.current("system", txt);
         }
         if (d.type === "tts_stop") {
-          if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current = null;
-          }
-          setSpeaking(false);
+          stopTts(true);
           resetStream();
-          wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
         }
         if (d.type === "open_trading") {
           if (!window.electronAPI?.openTrading) {
@@ -305,7 +371,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         /* ignore malformed packet */
       }
     };
-  }, [playTts, scheduleReconnect, flushPendingActions, resetStream, scheduleFlush]);
+  }, [playTts, stopTts, scheduleReconnect, flushPendingActions, resetStream, scheduleFlush]);
   connRef.current = connect;
 
   useEffect(() => {

@@ -13,8 +13,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _fake_dispatch(api, turn):
-    """A stand-in for dispatch_command that starts `turn()` as the current task."""
-    async def dispatch(text):
+    """A stand-in for dispatch_command that starts `turn()` as the current task. Accepts the
+    same keyword args as the real one (source/wake_ms/stt_ms) and ignores them."""
+    async def dispatch(text, **_kw):
         api._current_task = asyncio.create_task(turn())
     return dispatch
 

@@ -278,6 +278,20 @@ Without any cloud key **and** without Ollama models, the process can still boot,
 
 ---
 
+## Command execution (fast path + verification)
+
+Simple OS commands skip the reasoning model entirely. A deterministic router (`jarvis/act/fastpath.py`) turns phrases like *open notepad*, *close chrome*, *volume up*, *set brightness to 60*, *mute*, *next track*, *lock my pc*, *take a screenshot*, *turn wifi off* into a concrete action that is executed and then **verified** before JARVIS replies:
+
+- **Launching** polls for the real process (`jarvis/act/verify.py`) and only says *“Opened Notepad.”* once it's actually running — otherwise it says it couldn't confirm, or that the app isn't installed. It never claims success on a bare `Popen`.
+- **Closing** (`close_app` tool) terminates the process and confirms it's gone before saying *“Closed Chrome.”*; if nothing was running it says so.
+- Anything the fast path can't do honestly (an app that isn't installed, a website, a real question) either gets a truthful *“I couldn't find …”* or falls through to the full agent. The model is instructed never to report an action as done unless a tool returned success, and that it has no email/SMS/call/payment tools.
+
+This is both the latency win (simple commands finish in well under a second instead of a multi-second model round-trip) and the anti-fabrication win (the reply is built from a verified result). Set `JARVIS_FASTPATH=0` to route everything through the agent.
+
+**Debug mode.** With `JARVIS_DEBUG=1` (or the UI toggle) every turn emits a `debug_trace` with per-stage timings — `stt`, `route`, `exec`, `verify`, `respond`, `total` — to the ops console, and the same breakdown is logged at INFO (`[trace] …`). Use it to find the real bottleneck before optimizing.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
@@ -307,6 +321,9 @@ Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example
 | `JARVIS_TTS_VOICE` / voice via Settings | Edge neural voices |
 | `JARVIS_WAKE_WORDS` / `JARVIS_WAKE_REQUIRED` | Wake gate |
 | `JARVIS_ALWAYS_LISTEN` | Start mic when a client connects |
+| `JARVIS_FASTPATH` | Deterministic fast path for simple OS commands (default on; `0` forces everything through the agent) |
+| `JARVIS_DEBUG` | Emit a per-turn latency trace (`debug_trace`) to the ops console; also toggleable live from the UI |
+| `JARVIS_CLIENT_GRACE_SEC` | Seconds to keep the mic/tasks alive after the last client drops, so a deck switch doesn't kill them (default 3) |
 | `JARVIS_EMOTION` / `JARVIS_SARCASM` | Affect layer (`0` disables emotion) |
 | `JARVIS_HOME_CITY` | Pin ambient location |
 | `JARVIS_SHELL_APPROVAL` / `JARVIS_APPROVAL_TOOLS` | UI confirm before privileged tools (default includes `run_command`) |

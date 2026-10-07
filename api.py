@@ -70,6 +70,8 @@ import jarvis.presence.persona as persona_mod
 import jarvis.agents.subagents as subagents
 import jarvis.act.desktop as desktop
 import jarvis.act.web_search as websearch_mod
+import jarvis.act.fastpath as fastpath
+import jarvis.act.verify as verify
 
 import cortex
 from jarvis.memory.dialogue import DialogueStore
@@ -312,6 +314,15 @@ STOP_WORDS = {"stop", "stop talking", "shut up", "be quiet", "quiet", "cancel",
               "enough", "shut up jarvis", "nevermind", "never mind"}
 RESET_PHRASES = {"new conversation", "start over", "start fresh", "reset",
                  "forget that", "forget all that", "clear context", "let's start over"}
+# Observability: when on, every turn emits a stage-by-stage timing trace (route→exec→verify
+# →respond, plus STT/TTS latencies) to the UI ops console as a `debug_trace` event. Timings
+# are always logged at INFO regardless; this only gates the extra WS broadcast. Toggle live
+# from the UI (set_debug) or with JARVIS_DEBUG=1.
+JARVIS_DEBUG = os.environ.get("JARVIS_DEBUG", "0") == "1"
+# Fast path: deterministic execution of simple OS commands (open/close app, volume,
+# brightness, media keys, wifi, lock, screenshot) WITHOUT the reasoning model. Set
+# JARVIS_FASTPATH=0 to force everything through the full agent.
+FASTPATH_ENABLED = os.environ.get("JARVIS_FASTPATH", "1") != "0"
 
 # Voice (Microsoft Edge neural TTS). Default is the newest "Multilingual" conversation
 # voice — markedly more natural/human than the older neural voices. Andrew is warm and
@@ -555,6 +566,69 @@ _LOCAL_OK = False             # Ollama up + a tool-capable local model installed
 LOCAL_FAST = ""               # set by _detect_local_models()
 LOCAL_DEEP = ""               # set by _detect_local_models()
 IDLE_SLEEP_MIN = int(os.environ.get("JARVIS_SLEEP_IDLE_MIN", "3"))
+
+# ── Observability: per-turn latency trace ────────────────────────────────────────
+_turn_trace: "TurnTrace | None" = None
+
+
+def _debug_on() -> bool:
+    return JARVIS_DEBUG or bool(_settings.get("debug"))
+
+
+class TurnTrace:
+    """Stage-by-stage stopwatch for one command, start (wake/recv) → spoken reply. Each
+    `mark()` records milliseconds since the turn began; `emit()` logs the breakdown and, when
+    debug is on, broadcasts it as `debug_trace` for the UI ops console. One per turn; replaced
+    on the next dispatch. Keeps the latency profile (spec §13/§16) real instead of guessed."""
+    __slots__ = ("text", "source", "t0", "marks", "path", "_wake_ms", "_stt_ms", "_done")
+
+    def __init__(self, text: str, source: str, *, wake_ms: float | None = None,
+                 stt_ms: float | None = None):
+        self.text = (text or "")[:120]
+        self.source = source                    # voice | typed | remote
+        self.t0 = time.perf_counter()
+        self.marks: list[tuple[str, int]] = []
+        self.path: str | None = None            # fast | agent
+        self._wake_ms = wake_ms
+        self._stt_ms = stt_ms
+        self._done = False
+
+    def mark(self, stage: str) -> None:
+        self.marks.append((stage, int((time.perf_counter() - self.t0) * 1000)))
+
+    def total_ms(self) -> int:
+        return int((time.perf_counter() - self.t0) * 1000)
+
+    async def emit(self, status: str, *, extra: dict | None = None) -> None:
+        if self._done:
+            return
+        self._done = True
+        payload = {
+            "type": "debug_trace",
+            "source": self.source,
+            "path": self.path,
+            "text": self.text,
+            "status": status,
+            "wake_ms": round(self._wake_ms) if self._wake_ms is not None else None,
+            "stt_ms": round(self._stt_ms) if self._stt_ms is not None else None,
+            "stages": [{"stage": s, "ms": ms} for s, ms in self.marks],
+            "total_ms": self.total_ms(),
+        }
+        if extra:
+            payload.update(extra)
+        stage_str = " ".join(f"{s}={ms}ms" for s, ms in self.marks)
+        pre = []
+        if self._wake_ms is not None:
+            pre.append(f"wake={round(self._wake_ms)}ms")
+        if self._stt_ms is not None:
+            pre.append(f"stt={round(self._stt_ms)}ms")
+        log.info("[trace] %s path=%s %s %s total=%dms (%s)",
+                 self.source, self.path, " ".join(pre), stage_str, self.total_ms(), status)
+        if _debug_on():
+            try:
+                await broadcast(payload)
+            except Exception:
+                pass
 
 # ── Affect / ambient state ──────────────────────────────────────────────────────
 _audio_arousal: float | None = None   # mic-loudness arousal hint (voice turns only)
@@ -937,6 +1011,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # Tell this client the real mic state up front so its UI doesn't guess (a fresh client
     # showing "tap to speak" while the mic is already hot under ALWAYS_LISTEN was the desync).
     await websocket.send_json({"type": "mic", "listening": _listening})
+    # Snapshot: the backend is the source of truth, the UI is a view. A client that just
+    # mounted (first load OR a deck/preset switch that remounted the socket) gets the live
+    # task list and recent conversation replayed so nothing *looks* lost on a UI change —
+    # the tasks and the turn that ran while the old view was torn down are both still here.
+    try:
+        await websocket.send_json({"type": "tasks", "tasks": task_list})
+        _recent_turns = _history_messages()[-16:]
+        if _recent_turns:
+            await websocket.send_json({
+                "type": "history",
+                "turns": [{"role": ("user" if m.get("role") == "user" else "agent"),
+                           "text": m.get("content", "")}
+                          for m in _recent_turns if m.get("content")],
+            })
+    except Exception as _exc:
+        log.debug("connect snapshot failed: %s", _exc)
     if _groq_key_alert:
         await websocket.send_json({"type": "system", "text": _groq_key_alert})
     _maybe_run_briefing()
@@ -950,7 +1040,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             action = data.get("action", "")
             if action == "command":
                 # Typed command — also barges in on anything in flight.
-                asyncio.create_task(dispatch_command(data.get("text", "")))
+                asyncio.create_task(dispatch_command(data.get("text", ""), source="typed"))
+            elif action == "set_debug":
+                _settings["debug"] = bool(data.get("on"))
+                _save_settings()
+                await broadcast({"type": "debug_mode", "on": _settings["debug"]})
             elif action == "start_listening":
                 asyncio.create_task(_start_voice())
             elif action == "stop_listening":
@@ -1026,15 +1120,29 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         if not active_connections:
             _tts_playing = False
             _tts_ended_at = time.time()
-        # The mic/watch loops are single global resources, not per-connection. If
-        # the last client just disconnected without sending stop_listening (e.g.
-        # the window was simply closed), stop them — otherwise the daemon thread
-        # keeps recording/transcribing indefinitely with nothing to broadcast to.
-        if not active_connections:
-            if _listening:
-                _stop_voice()
-            if _watching:
-                await _stop_watch()
+            # The mic/watch loops are single global resources, not per-connection. Don't stop
+            # them the instant the last client drops: switching deck/preset remounts the socket,
+            # so there's a sub-second window with zero clients that must NOT kill the hot mic or
+            # cancel the running turn (that was the "tasks lost on UI switch" bug). Wait a short
+            # grace; only stop if STILL no client has reconnected. A running agent turn
+            # (_current_task) is never cancelled here — it finishes and its result is replayed
+            # to whichever client is connected by then.
+            asyncio.create_task(_cleanup_if_still_idle())
+
+
+_CLIENT_GRACE_SEC = float(os.environ.get("JARVIS_CLIENT_GRACE_SEC", "3.0"))
+
+
+async def _cleanup_if_still_idle() -> None:
+    """After the last client drops, wait a grace period and stop the mic/watch only if no
+    client has reconnected (a deck switch reconnects well within it)."""
+    await asyncio.sleep(_CLIENT_GRACE_SEC)
+    if active_connections:
+        return   # a client (e.g. the new deck) reconnected — keep everything running
+    if _listening:
+        _stop_voice()
+    if _watching:
+        await _stop_watch()
 
 
 # ── Tool definitions (OpenAI / Ollama format) ──────────────────────────────────
@@ -1292,6 +1400,29 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "close_app",
+            "description": (
+                "Close / quit an application on the user's Windows PC by terminating its "
+                "process, then verify it actually closed. Use for 'close chrome', 'quit "
+                "spotify', 'kill notepad'. Reports honestly whether it closed, wasn't running, "
+                "or couldn't be closed. For closing a specific WINDOW by its title (not the "
+                "whole app) use desktop window_close instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "description": "App name, e.g. chrome, spotify, notepad, code, discord, calc",
+                    },
+                },
+                "required": ["app"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "desktop",
             "description": (
                 "Control the Windows desktop — use instead of `launch_app` for anything "
@@ -1301,8 +1432,8 @@ TOOLS: list[dict] = [
                 "open_registry(key?) · open_component(component: task_manager/device_manager/"
                 "services/event_viewer/cmd/powershell/notepad/calc/…) · list_apps(filter?) · "
                 "uninstall_app(app, confirm) — confirm=false is a dry-run; needs confirm=true "
-                "to run · system_volume(action up/down/mute/set, level) · brightness(action, "
-                "level) · toggle_wifi(state on/off) · mouse_click(x,y,button,clicks) · "
+                "to run · system_volume(direction up/down/mute/set, level) · brightness(direction "
+                "up/down/set, level) · toggle_wifi(state on/off) · mouse_click(x,y,button,clicks) · "
                 "mouse_move(x,y,duration) · mouse_scroll(clicks ±20) · type_text(text, confirm "
                 "— confirm=true if >60 chars) · key_press(keys e.g. 'enter'/'ctrl+c'; media "
                 "keys playpause/nexttrack/volumeup control any player) · notify(title,message,"
@@ -1334,6 +1465,8 @@ TOOLS: list[dict] = [
                     "filter":    {"type": "string"},
                     "confirm":   {"type": "boolean"},
                     "level":     {"type": "integer"},
+                    "direction": {"type": "string",
+                                  "description": "For system_volume / brightness: up | down | mute | set. With 'set', also pass level (0-100)."},
                     "state":     {"type": "string"},
                     "adapter":   {"type": "string"},
                     "x":         {"type": "integer"},
@@ -1624,6 +1757,19 @@ _LAUNCH_ALLOWLIST = {
     "obs": "obs64.exe", "steam": "steam.exe",
 }
 
+# Process NAME to look for / terminate when closing an app. Mostly the launch exe, but a few
+# differ: `code` launches a shim but the process is "Code.exe"; `calc` is a Store app whose
+# real process is "CalculatorApp.exe"; `terminal` (wt.exe) hosts "WindowsTerminal.exe".
+_CLOSE_PROCESS = {
+    "chrome": "chrome.exe", "firefox": "firefox.exe", "edge": "msedge.exe",
+    "code": "Code.exe", "vscode": "Code.exe", "spotify": "Spotify.exe",
+    "discord": "Discord.exe", "notepad": "notepad.exe",
+    "terminal": "WindowsTerminal.exe", "powershell": "powershell.exe",
+    "calc": "CalculatorApp.exe", "calculator": "CalculatorApp.exe",
+    "paint": "mspaint.exe", "obs": "obs64.exe", "steam": "steam.exe",
+    "explorer": "explorer.exe",
+}
+
 
 def _resolve_launch_target(cmd: str) -> str | None:
     """Resolve an allowlisted exe to a launchable full path. A bare `Popen("spotify.exe")` only
@@ -1667,30 +1813,126 @@ def _resolve_launch_target(cmd: str) -> str | None:
 
 
 def _launch_resolved(raw: str, cmd: str) -> str:
-    """Launch an allowlisted app, resolving per-user install paths first. Reports honestly:
-    only claims success when a process was actually started. Always an argv list with
-    shell=False — `cmd` only ever comes from _LAUNCH_ALLOWLIST, but there's no reason to
-    hand it to a shell."""
+    """Launch an allowlisted app, resolving per-user install paths first, then VERIFY it is
+    actually running before claiming success. Popen not raising only means a process was
+    spawned — not that it survived (a bad path, crash-on-start, or an installer stub that
+    exits immediately all 'succeed' at Popen). We poll for the real process and report
+    honestly: 'Opened X.' only when observed running; a clear hedge when we can't confirm;
+    a plain failure otherwise. Always an argv list with shell=False — `cmd` only ever comes
+    from _LAUNCH_ALLOWLIST."""
     target = _resolve_launch_target(cmd)
+    proc_name = _CLOSE_PROCESS.get(raw) or os.path.basename(target or cmd)
     # A console app (PowerShell) needs its OWN visible console; GUI apps need no flag. Never
     # CREATE_NO_WINDOW here — it would launch an invisible terminal.
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if cmd.lower() == "powershell.exe" else 0
     quiet = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                  shell=False, creationflags=flags)
+    # Already running? Don't spawn a duplicate — report the truth instead. (explorer is the
+    # exception: it's always "running" as the shell, so a fresh window is the intent.)
+    if raw != "explorer" and verify.is_running(proc_name) is True:
+        return f"{raw} is already open."
     try:
         if target:
             subprocess.Popen([target], **quiet)
-            return f"Launched {raw}."
-        # Last resort: `start` uses ShellExecute, which is App-Paths-aware where a bare exec isn't.
-        if os.name == "nt":
+        elif os.name == "nt":
+            # Last resort: `start` uses ShellExecute, which is App-Paths-aware where a bare exec isn't.
             rc = subprocess.run(["cmd", "/c", "start", "", cmd], capture_output=True, text=True)
-            if rc.returncode == 0:
-                return f"Launched {raw}."
-            return f"Couldn't find {raw} on this machine — it may not be installed."
-        subprocess.Popen([cmd], **quiet)
-        return f"Launched {raw}."
+            if rc.returncode != 0:
+                return f"Couldn't find {raw} on this machine — it may not be installed."
+        else:
+            subprocess.Popen([cmd], **quiet)
+    except FileNotFoundError:
+        return f"Couldn't find {raw} on this machine — it may not be installed."
     except Exception as exc:
         return f"Failed to launch {raw}: {exc}"
+
+    res = verify.wait_until_running(proc_name, timeout=3.0)
+    if res.verified is True:
+        return f"Opened {raw}."
+    if res.verified is None:
+        return f"Launched {raw} (couldn't confirm it's running)."
+    # Spawned but the process never appeared — don't lie. Some apps re-parent into an existing
+    # broker process (so verification by name legitimately misses); say what we actually know.
+    return (f"I started {raw} but couldn't confirm a window opened — it may have failed to "
+            f"launch or merged into a running instance.")
+
+
+def _close_app(raw: str) -> str:
+    """Close an app by terminating its process(es), then VERIFY it's gone. Honest by
+    construction: it reports 'Closed X.' only after the process is observed gone, 'wasn't
+    running' when there was nothing to close, and the real reason on failure."""
+    proc_name = _CLOSE_PROCESS.get(raw)
+    if not proc_name:
+        return ""   # unknown app → caller falls through to the full agent
+    res = verify.terminate(proc_name, timeout=5.0)
+    if res.verified is True and "was not running" in res.detail:
+        return f"{raw} wasn't running."
+    if res.ok and res.verified in (True, None):
+        return f"Closed {raw}."
+    return f"I couldn't close {raw} — {res.detail}."
+
+
+def _match_running_process(token: str) -> str | None:
+    """Best-effort: a running process whose name contains `token` (for closing an app that
+    isn't in the close map). Returns the process name, or None. Skips a short list of
+    system-critical processes so a careless 'close explorer' or 'close system' can't be used
+    to take down the shell by accident through the fuzzy path."""
+    token = re.sub(r"[^a-z0-9]", "", (token or "").lower())
+    if len(token) < 3:
+        return None
+    try:
+        import psutil
+    except Exception:
+        return None
+    protected = {"system", "svchost", "csrss", "wininit", "winlogon", "services",
+                 "lsass", "smss", "dwm", "registry"}
+    best = None
+    for p in psutil.process_iter(["name"]):
+        try:
+            nm = (p.info.get("name") or "")
+        except Exception:
+            continue
+        stem = re.sub(r"[^a-z0-9]", "", nm.lower().replace(".exe", ""))
+        if not stem or stem in protected:
+            continue
+        if token in stem:
+            # Prefer an exact stem match; otherwise keep the first containing one.
+            if stem == token:
+                return nm
+            best = best or nm
+    return best
+
+
+_KNOWN_SITES = {
+    "gmail", "google", "youtube", "maps", "whatsapp", "twitter", "x", "reddit", "amazon",
+    "netflix", "github", "chatgpt", "notion", "slack", "instagram", "facebook", "linkedin",
+    "outlook", "yahoo", "bing", "wikipedia", "stackoverflow", "twitch", "spotify",
+}
+
+
+def _looks_like_site(token: str) -> bool:
+    """True if an 'open X' target is better handled as a WEBSITE (agent `browse`) than as a
+    local app — a domain-looking token, or a well-known site name. Keeps 'open gmail' /
+    'open nytimes.com' working while still answering honestly for a made-up app name."""
+    t = (token or "").strip().lower()
+    if "." in t or "/" in t:
+        return True
+    return t in _KNOWN_SITES
+
+
+def _resolve_any_app(name: str) -> tuple[str, str] | None:
+    """For the fast path's 'open <anything>': try to resolve an arbitrary (non-allowlisted)
+    app the user named to a launchable exe via PATH / App Paths. Returns (display_name, exe)
+    or None when nothing is found — the caller then falls through to the full agent rather
+    than guessing. Only resolves real executables, so it can't be coerced into running junk."""
+    nm = (name or "").strip().lower()
+    if not nm or not re.fullmatch(r"[a-z0-9 ._+-]{2,40}", nm):
+        return None
+    cand = nm if nm.endswith(".exe") else nm + ".exe"
+    cand = cand.replace(" ", "")
+    if _resolve_launch_target(cand):
+        return nm, cand
+    return None
 
 
 def _next_id(items: list[dict]) -> int:
@@ -2463,6 +2705,20 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             return f"Unknown app '{raw}'. Supported: {supported}"
         return _launch_resolved(raw, cmd)
 
+    if name == "close_app":
+        raw = str(args.get("app", "")).lower().strip()
+        out = _close_app(raw)
+        if out:
+            return out
+        # Unknown to the close map — try any running process whose name matches the token.
+        proc = _match_running_process(raw)
+        if proc:
+            res = verify.terminate(proc, timeout=5.0)
+            if res.ok:
+                return f"Closed {raw}."
+            return f"I couldn't close {raw} — {res.detail}."
+        return f"{raw} doesn't appear to be running, so there's nothing to close."
+
     if name == "desktop":
         # Windows-system-shaped ops: Explorer paths, Settings pages, Control Panel,
         # regedit, system components, and winget list/uninstall (confirm-gated).
@@ -3180,6 +3436,10 @@ Grounding: when a tool returns data, your answer MUST be built from that exact d
 
 NEVER FABRICATE ACTIONS OR RESULTS. This is absolute. You have not done something unless a tool actually returned the result to you in this conversation. Do not claim to have run a scan, launched an attack, created or read a file, or found ports/vulns/paths unless the matching tool call produced that output. Do not invent progress updates, log files, log contents, or findings. If a task needs a tool, CALL THE TOOL — do not describe what it would output. If you were asked to recon or pentest a target, you MUST call the `recon` or `pentest` tool; narrating scan results you didn't get from the tool is a serious failure. If you haven't run it yet, say "running it now" and actually call the tool — never pretend it's done.
 
+This applies just as hard to opening/closing apps and desktop control. NEVER say "Done", "Opened", "Closed", or "I've launched it" unless the `launch_app` / `close_app` / `desktop` tool returned a success to you. Those tools VERIFY the real OS state and tell you exactly what happened — relay that verbatim in spirit. If a tool says it couldn't confirm, couldn't find the app, or failed, say that plainly ("I couldn't open X — it may not be installed") and do NOT dress it up as success. A wrong "done" is worse than an honest "that didn't work."
+
+Capability honesty: you do NOT have tools to send email, send SMS/texts, make phone calls, or move money. If asked for one of these, say you can't do that yet — don't pretend you did it, and don't claim a capability you weren't given.
+
 Do NOT pre-judge authorization or scope in your head and refuse. Always CALL the security tool — it enforces scope itself and tells you (and you relay) if a target is out of scope. `recon` (passive) and `report` (reads memory) never need scope, so never refuse those for scope reasons; just call them.
 
 Security tool routing — pick the tool, don't just talk about it: "recon/look up <target>" → recon. "bugbounty/sweep/enumerate/recon a domain" → bugbounty (full sweep). "pentest/scan/port scan/nuclei/dirs/xss/sqli/subdomain takeover <target>" → pentest with the matching task. "report/write-up on <target>" → report. "add/list/remove scope" → scope. Any of these is a request to RUN the tool on that target, not to explain the concept.
@@ -3447,7 +3707,7 @@ async def _emit_final(text: str) -> None:
 _CORE_TOOLS = {
     "remember", "recall_memory", "search_web", "calculate", "get_weather",
     "get_system_info", "add_task", "complete_task", "run_command", "launch_app",
-    "capture_screen", "use_skill", "create_skill",
+    "close_app", "capture_screen", "use_skill", "create_skill",
 }
 _TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
     (re.compile(r"\b(desktop|click|type this|keyboard|mouse|window|gui|automate|drag|scroll)\b", re.I),
@@ -4601,7 +4861,7 @@ async def _wake_ack() -> None:
         await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
         _tts_playing = True                         # mute the mic through the ack (base64 ≈ bytes×0.75)
         _arm_tts_failsafe(len(cached) * 0.75 / 6000.0)
-        await broadcast({"type": "tts_audio", "data": cached})
+        await broadcast({"type": "tts_audio", "data": cached, "seq": 0, "final": True})
         await broadcast({"type": "state", "status": "idle"})
     else:
         await _schedule_speak(phrase)
@@ -4630,10 +4890,162 @@ async def _stop_speaking() -> None:
     await broadcast({"type": "state", "status": "idle"})
 
 
-async def dispatch_command(text: str) -> None:
+# ── Fast path: deterministic simple-command execution (no reasoning model) ────────
+def _lock_workstation() -> str:
+    """Lock the session. No admin needed; nothing to verify afterwards (we can't read the
+    lock state), so we report the action honestly as issued, not as confirmed."""
+    if os.name != "nt":
+        return "Locking the screen is only supported on Windows."
+    try:
+        rc = subprocess.run(["rundll32.exe", "user32.dll,LockWorkStation"]).returncode
+        return "Locking now." if rc == 0 else "I tried to lock the screen but the command failed."
+    except Exception as exc:
+        return f"I couldn't lock the screen: {exc}"
+
+
+def _save_screenshot() -> str:
+    """Capture the primary screen to a PNG and verify the file was written. Deterministic —
+    no vision model (that's `capture_screen`); this just saves the image and proves it exists."""
+    try:
+        import mss
+        from PIL import Image
+    except ImportError:
+        return "Screenshot needs the vision extras — run: pip install mss Pillow."
+    try:
+        out_dir = Path(os.path.expanduser("~")) / "Pictures" / "JARVIS"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path = out_dir / f"screenshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        with mss.mss() as sct:
+            raw = sct.grab(sct.monitors[1])
+            Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX").save(str(path))
+        if path.exists() and path.stat().st_size > 0:
+            return f"Screenshot saved to {path}."
+        return "I took the screenshot but couldn't confirm the file was written."
+    except Exception as exc:
+        return f"Screenshot failed: {exc}"
+
+
+def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
+    """Run a fast-path intent and return (spoken_reply, handled). handled=False means we
+    couldn't honour it deterministically (e.g. an unknown app) and the caller should fall
+    through to the full agent. Runs in a worker thread (every call here is blocking I/O).
+    Every reply is built from what actually happened — never an assumed success."""
+    kind = intent.kind
+    p = intent.params
+
+    if kind == "OPEN_APP":
+        app = p["app"]
+        cmd = _LAUNCH_ALLOWLIST.get(app)
+        if cmd:
+            return _launch_resolved(app, cmd), True
+        resolved = _resolve_any_app(app)
+        if resolved:
+            name, exe = resolved
+            return _launch_resolved(name, exe), True
+        if _looks_like_site(app):
+            return "", False   # "open gmail" / "open nytimes.com" → let the agent browse to it
+        # Not an installed app and not a site — answer HONESTLY rather than falling through to
+        # the model, which may fabricate "it's open" for an app that doesn't exist.
+        return (f"I couldn't find an app called {app} on this PC — it may not be installed. "
+                f"If it's a website, say \"open {app} dot com\"."), True
+
+    if kind == "CLOSE_APP":
+        app = p["app"]
+        if app in _CLOSE_PROCESS:
+            return _close_app(app), True
+        proc = _match_running_process(app)
+        if proc:
+            res = verify.terminate(proc, timeout=5.0)
+            return (f"Closed {app}." if res.ok else f"I couldn't close {app} — {res.detail}."), True
+        return f"{app} doesn't appear to be running, so there's nothing to close.", True
+
+    if kind == "VOLUME":
+        d = p["direction"]
+        r = desktop.run("system_volume", {"action": "system_volume", "direction": d,
+                                          "level": p.get("level")})
+        if "fail" in r.lower():
+            return f"I couldn't change the volume — {r}", True
+        if d == "mute":
+            return "Muted.", True
+        if d == "unmute":
+            return "Unmuted.", True
+        if d == "set":
+            return f"Volume set to {p.get('level')}%.", True
+        return (f"Volume {d}."), True
+
+    if kind == "BRIGHTNESS":
+        d = p["direction"]
+        r = desktop.run("brightness", {"action": "brightness", "direction": d,
+                                       "level": p.get("level")})
+        if "fail" in r.lower():
+            return (f"I couldn't change the brightness — this usually only works on a laptop's "
+                    f"built-in display."), True
+        if d == "set":
+            return f"Brightness set to {p.get('level')}%.", True
+        return f"Brightness {d}.", True
+
+    if kind == "MEDIA":
+        key = p["key"]
+        r = desktop.key_press(key)
+        if "fail" in r.lower() or "unknown" in r.lower() or "unavailable" in r.lower():
+            return f"I couldn't send the media key — {r}", True
+        label = {"playpause": "Play/pause.", "nexttrack": "Next track.",
+                 "prevtrack": "Previous track."}.get(key, "Done.")
+        return label, True
+
+    if kind == "WIFI":
+        state = p["state"]
+        r = desktop.run("toggle_wifi", {"action": "toggle_wifi", "state": state})
+        if "fail" in r.lower() or "error" in r.lower() or "admin" in r.lower():
+            return f"I couldn't turn Wi-Fi {state} — {r}", True
+        return f"Wi-Fi {state}.", True
+
+    if kind == "LOCK":
+        return _lock_workstation(), True
+
+    if kind == "SCREENSHOT":
+        return _save_screenshot(), True
+
+    return "", False
+
+
+async def _run_fastpath(user_text: str, intent: "fastpath.FastIntent",
+                        trace: "TurnTrace | None") -> bool:
+    """Execute a fast-path intent off the reasoning model: verify, then speak a concise,
+    honest reply. Returns True if it handled the command, False to fall through to the agent.
+    Cancellable like any turn — a barge-in cancels the awaited thread call."""
+    if trace:
+        trace.path = "fast"
+        trace.mark("route")
+    await broadcast({"type": "state", "status": "thinking", "text": "On it…"})
+    try:
+        reply, handled = await asyncio.to_thread(_fast_execute, intent)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        log.warning("fastpath %s failed: %s", intent.kind, exc)
+        return False   # fall through; let the agent try
+    if trace:
+        trace.mark("exec")
+    if not handled:
+        return False
+    # Announce the tool only now that we know we handled it (so a fall-through to the agent
+    # doesn't leave a phantom fastpath step in the turn's tool list).
+    await broadcast({"type": "agent_tool", "step": {"action": f"fastpath:{intent.kind.lower()}"}})
+    await _emit_final(reply)
+    _record_turn(user_text, reply)
+    if trace:
+        trace.mark("respond")
+        await trace.emit("ok", extra={"intent": intent.kind, "reply": reply})
+    await broadcast({"type": "state", "status": "idle"})
+    return True
+
+
+async def dispatch_command(text: str, *, source: str = "typed",
+                           wake_ms: float | None = None, stt_ms: float | None = None) -> None:
     """Entry point for every command (voice or typed). Barges in on whatever is
     currently running — thinking OR speaking — so a new directive takes over."""
-    global _current_task, _turn_generation
+    global _current_task, _turn_generation, _turn_trace
     busy = (
         (_current_task and not _current_task.done())
         or (_speak_task and not _speak_task.done())
@@ -4642,6 +5054,7 @@ async def dispatch_command(text: str) -> None:
     if busy:
         await _stop_speaking()
     _turn_generation += 1
+    _turn_trace = TurnTrace(text, source, wake_ms=wake_ms, stt_ms=stt_ms)
     _current_task = asyncio.create_task(handle_command(text))
 
 
@@ -4662,7 +5075,7 @@ async def ask_and_wait(text: str, *, speak: bool = True, timeout: float = 120.0)
     t0 = time.time()
     status = "ok"
     try:
-        await dispatch_command(text)
+        await dispatch_command(text, source="remote")
         task = _current_task      # the turn dispatch_command just started
         if task is not None:
             try:
@@ -4818,9 +5231,31 @@ async def handle_command(text: str) -> None:
 
     _last_activity = time.time()
     _filler_sent = False   # reset the slow-tool filler gate for this turn
+
+    # Fast path FIRST — a simple OS command ("open notepad", "volume up") is executed and
+    # verified deterministically, with no reasoning model and none of the per-turn affect
+    # work below. This is both the latency win and the anti-fabrication win: the reply is
+    # built from a verified result, so JARVIS can't "say done" without having done it.
+    if FASTPATH_ENABLED:
+        try:
+            intent = fastpath.match(text)
+        except Exception:
+            intent = None
+        if intent is not None:
+            try:
+                if await _run_fastpath(text, intent, _turn_trace):
+                    await broadcast({"type": "state", "status": "idle"})
+                    return
+            except asyncio.CancelledError:
+                raise
+            # fell through (unknown app / execution error) → full agent below
+
     await _update_affect(text)
     await broadcast({"type": "state", "status": "thinking", "text": "Thinking…"})
 
+    if _turn_trace:
+        _turn_trace.path = "agent"
+        _turn_trace.mark("route")
     try:
         question = _deliberation_target(text)
         # The council is a toolless panel — never send it a request that needs a tool/action,
@@ -4834,6 +5269,9 @@ async def handle_command(text: str) -> None:
     except Exception as exc:
         await broadcast({"type": "llm_response", "text": f"Agent error: {exc}"})
 
+    if _turn_trace:
+        _turn_trace.mark("respond")
+        await _turn_trace.emit("ok")
     await broadcast({"type": "state", "status": "idle"})
 
 
@@ -4897,10 +5335,49 @@ def _arm_tts_failsafe(est_seconds: float) -> None:
         pass   # no running loop (shouldn't happen here) — frontend tts_end will still clear it
 
 
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])|(?<=[.!?])$|\n+")
+
+
+def _sentence_chunks(text: str, *, min_len: int = 18, max_chunks: int = 24) -> list[str]:
+    """Split a reply into speakable chunks — roughly one sentence each — so TTS can start on
+    the FIRST sentence instead of waiting for the whole reply to synthesize. Very short
+    fragments ("Done.", "Okay.") are merged forward so we don't emit a dozen sub-second clips;
+    a reply with no sentence punctuation comes back as a single chunk (unchanged behaviour)."""
+    parts = [p.strip() for p in _SENT_SPLIT.split(text) if p and p.strip()]
+    if not parts:
+        return [text.strip()] if text.strip() else []
+    chunks: list[str] = []
+    buf = ""
+    for part in parts:
+        buf = (buf + " " + part).strip() if buf else part
+        if len(buf) >= min_len:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        if chunks:
+            chunks[-1] = (chunks[-1] + " " + buf).strip()
+        else:
+            chunks.append(buf)
+    return chunks[:max_chunks] if len(chunks) <= max_chunks else (
+        chunks[:max_chunks - 1] + [" ".join(chunks[max_chunks - 1:])])
+
+
+async def _synth(clean: str, rate: str, pitch: str) -> bytes:
+    import edge_tts
+    audio_bytes = b""
+    communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            data = chunk.get("data")
+            if isinstance(data, (bytes, bytearray)):
+                audio_bytes += bytes(data)
+    return audio_bytes
+
+
 async def _speak(text: str) -> None:
-    global _speaking_text, _tts_playing
+    global _speaking_text, _tts_playing, _tts_ended_at
     try:
-        import edge_tts
+        import edge_tts  # noqa: F401
     except ImportError:
         await broadcast({"type": "tts_error",
                          "text": "Speech unavailable — run: pip install edge-tts"})
@@ -4912,37 +5389,42 @@ async def _speak(text: str) -> None:
 
     _speaking_text = clean.lower()
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+    base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
+    rate, pitch = _voice_params(base_rate)
+
+    chunks = _sentence_chunks(clean)
+    # Arm the mic-mute + failsafe once, up front, for the WHOLE utterance — mute begins before
+    # the first audio reaches the speakers (so no echo leading-edge leaks) and the frontend's
+    # tts_end (queue drained) clears it; the failsafe clears it if that message is ever lost.
+    # ~14 chars/sec of speech is a safe lower bound for the duration estimate.
+    _tts_playing = True
+    _arm_tts_failsafe(max(2.0, len(clean) / 14.0))
     try:
-        audio_bytes = b""
-        base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
-        rate, pitch = _voice_params(base_rate)
-        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                data = chunk.get("data")
-                if isinstance(data, (bytes, bytearray)):
-                    audio_bytes += bytes(data)
-        if not audio_bytes:
+        sent_any = False
+        for i, piece in enumerate(chunks):
+            audio_bytes = await _synth(piece, rate, pitch)
+            if not audio_bytes:
+                continue
+            b64 = base64.b64encode(audio_bytes).decode()
+            # seq lets the frontend QUEUE chunks (seq 0 starts a fresh utterance, later chunks
+            # append and play gaplessly); final marks the last so it knows when to send tts_end.
+            await broadcast({"type": "tts_audio", "data": b64,
+                             "seq": i, "final": i == len(chunks) - 1})
+            sent_any = True
+        if not sent_any:
+            _tts_playing = False
+            _tts_ended_at = time.time()
             await broadcast({"type": "tts_error",
                              "text": "Speech failed — Edge TTS returned no audio. Check internet."})
             _speaking_text = ""
             await broadcast({"type": "state", "status": "idle"})
             return
-        b64 = base64.b64encode(audio_bytes).decode()
-        # Mute the mic BEFORE the audio reaches the speakers — closes the ~100 ms gap between
-        # sending the clip and the frontend confirming tts_start, so no echo leading-edge leaks.
-        # The frontend's tts_end clears this normally; the failsafe clears it if that's lost.
-        # edge-tts mp3 ≈ 48 kbit/s → bytes / 6000 ≈ seconds of audio.
-        _tts_playing = True
-        _arm_tts_failsafe(len(audio_bytes) / 6000.0)
-        await broadcast({"type": "tts_audio", "data": b64})
     except asyncio.CancelledError:
         _speaking_text = ""
         raise
     except Exception as exc:
         _speaking_text = ""
-        await broadcast({"type": "tts_error",
-                         "text": f"Speech failed: {exc}"})
+        await broadcast({"type": "tts_error", "text": f"Speech failed: {exc}"})
     await broadcast({"type": "state", "status": "idle"})
 
 
@@ -5435,7 +5917,9 @@ def _voice_worker() -> None:
         peak = float(np.abs(audio).max())
         if 0.0 < peak < 26000.0:
             audio = np.clip(audio * (26000.0 / peak), -32768.0, 32767.0)
+        _t_stt = time.perf_counter()
         text = _transcribe(audio.astype(np.int16), 16000)
+        stt_ms = (time.perf_counter() - _t_stt) * 1000.0
         if not text:
             return
 
@@ -5449,7 +5933,7 @@ def _voice_worker() -> None:
             global _awake_until
             _awake_until = 0.0
             broadcast_from_thread({"type": "transcription", "text": command})
-            _run(dispatch_command(command))
+            _run(dispatch_command(command, source="voice", stt_ms=stt_ms))
 
         if not WAKE_REQUIRED:
             if _is_echo(text) or _is_stt_noise(text):
