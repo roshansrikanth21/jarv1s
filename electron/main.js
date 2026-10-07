@@ -247,7 +247,15 @@ async function isBackendReady() {
     // Require a JARVIS marker so we don't "reuse" some other service that happens to
     // answer 200 on /api/agent/status (or a squatting HTTP server on 8000).
     const body = await response.json().catch(() => null);
-    return Boolean(body && body.app === "jarvis");
+    if (!body || body.app !== "jarvis") return false;
+
+    // A backend can be healthy while its SPA was absent when that process started. In that
+    // state /api works but the desktop loads FastAPI's JSON 404 at `/`. Require the UI too;
+    // if it is missing, start a backend from this checkout (which has the built UI) instead
+    // of showing a blank/404 desktop window.
+    const uiUrl = isDev && process.env.JARVIS_USE_VITE === "1" ? devUiUrl : backendUrl;
+    const ui = await fetch(uiUrl, { signal: ctrl.signal });
+    return ui.ok && (ui.headers.get("content-type") || "").includes("text/html");
   } catch {
     return false;
   } finally {

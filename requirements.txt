@@ -11,7 +11,7 @@ websockets
 # Brain / vision / STT — all via Groq's free OpenAI-compatible API
 openai
 
-# Text-to-speech (Microsoft Edge neural voices, free, cloud)
+# Text-to-speech (Microsoft Edge neural voice, online)
 edge-tts
 
 # Voice input capture + VAD
@@ -23,7 +23,7 @@ numpy
 # capture degrades to a simple energy gate rather than breaking.
 webrtcvad-wheels
 
-# Local speech-to-text (CTranslate2 Whisper, tiny.en, CPU int8) — the default STT backend.
+# Local speech-to-text (CTranslate2 Whisper, base.en, CPU int8) — the default STT backend.
 # Runs offline with zero network round-trip, so wake-word detection is instant and doesn't
 # depend on internet/Groq latency. Falls back to Groq cloud Whisper if this is missing.
 faster-whisper

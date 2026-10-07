@@ -21,6 +21,7 @@ import random
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -4897,15 +4898,23 @@ def _arm_tts_failsafe(est_seconds: float) -> None:
         pass   # no running loop (shouldn't happen here) — frontend tts_end will still clear it
 
 
+async def _edge_tts_audio(text: str) -> bytes:
+    import edge_tts
+
+    base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
+    rate, pitch = _voice_params(base_rate)
+    communicate = edge_tts.Communicate(text, _tts_voice, rate=rate, pitch=pitch)
+    chunks = bytearray()
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            data = chunk.get("data")
+            if isinstance(data, (bytes, bytearray)):
+                chunks.extend(data)
+    return bytes(chunks)
+
+
 async def _speak(text: str) -> None:
     global _speaking_text, _tts_playing
-    try:
-        import edge_tts
-    except ImportError:
-        await broadcast({"type": "tts_error",
-                         "text": "Speech unavailable — run: pip install edge-tts"})
-        return
-
     clean = re.sub(r"[*_`#\[\]()]", "", text).strip()
     if not clean:
         return
@@ -4913,27 +4922,15 @@ async def _speak(text: str) -> None:
     _speaking_text = clean.lower()
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
     try:
-        audio_bytes = b""
-        base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
-        rate, pitch = _voice_params(base_rate)
-        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                data = chunk.get("data")
-                if isinstance(data, (bytes, bytearray)):
-                    audio_bytes += bytes(data)
+        audio_bytes = await _edge_tts_audio(clean)
         if not audio_bytes:
-            await broadcast({"type": "tts_error",
-                             "text": "Speech failed — Edge TTS returned no audio. Check internet."})
-            _speaking_text = ""
-            await broadcast({"type": "state", "status": "idle"})
-            return
+            raise RuntimeError("Edge TTS returned no audio")
         b64 = base64.b64encode(audio_bytes).decode()
         # Mute the mic BEFORE the audio reaches the speakers — closes the ~100 ms gap between
         # sending the clip and the frontend confirming tts_start, so no echo leading-edge leaks.
         # The frontend's tts_end clears this normally; the failsafe clears it if that's lost.
-        # edge-tts mp3 ≈ 48 kbit/s → bytes / 6000 ≈ seconds of audio.
         _tts_playing = True
+        # Edge TTS MP3 is approximately 48 kbit/s → bytes / 6000 ≈ seconds of audio.
         _arm_tts_failsafe(len(audio_bytes) / 6000.0)
         await broadcast({"type": "tts_audio", "data": b64})
     except asyncio.CancelledError:
@@ -4942,7 +4939,7 @@ async def _speak(text: str) -> None:
     except Exception as exc:
         _speaking_text = ""
         await broadcast({"type": "tts_error",
-                         "text": f"Speech failed: {exc}"})
+                         "text": f"Speech failed: Edge TTS is unavailable ({exc}). Check your internet connection and try again."})
     await broadcast({"type": "state", "status": "idle"})
 
 
@@ -4999,7 +4996,7 @@ def _is_stt_noise(text: str) -> bool:
     # A single very short word is almost always a noise artifact.
     if len(t.split()) == 1 and len(alnum) <= 2:
         return True
-    # Repetition = hallucination. On noise, tiny.en loops one phrase dozens of times
+    # Repetition = hallucination. Whisper can loop one phrase dozens of times on noise
     # ("take a look at how take a look at how ...", "see you in the next video, see you ...").
     # Real speech has variety; a transcript whose words are mostly the same handful, OR that
     # contains a phrase repeated 3+ times back-to-back, is a hallucination.
@@ -5086,7 +5083,7 @@ def _stt_available() -> bool:
 
 
 def _get_local_whisper():
-    """Process-level singleton faster-whisper model (CPU, int8, tiny.en) — the default STT
+    """Process-level singleton faster-whisper model (CPU, int8, base.en) — the default STT
     backend: offline, free, no per-request quota. Loaded lazily on first use so app boot
     isn't delayed; returns None (and stays None) if it can't load, so callers fall back to
     Groq's cloud Whisper."""
@@ -5102,7 +5099,7 @@ def _get_local_whisper():
             _phys = psutil.cpu_count(logical=False) or 2
             _threads = max(1, min(4, int(os.environ.get("JARVIS_STT_THREADS", str(_phys)))))
             _whisper_model = WhisperModel(
-                os.environ.get("JARVIS_STT_MODEL", "tiny.en"),
+            os.environ.get("JARVIS_STT_MODEL", "base.en"),
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=_threads,
@@ -5126,7 +5123,7 @@ def _transcribe_local(pcm16, sample_rate: int):
     should fall back to Groq).
 
     Heavily hardened against Whisper's #1 failure mode: on background noise or near-silence,
-    tiny.en HALLUCINATES — usually a short phrase looped dozens of times ("thanks for watching,
+    Small Whisper models hallucinate — usually a short phrase looped dozens of times ("thanks for watching,
     see you in the next video, ..." / "take a look at how take a look at how ..."). Three gates
     kill it: (1) faster-whisper's built-in Silero VAD strips non-speech BEFORE decoding; (2)
     per-segment confidence — drop anything the model itself thinks is silence (high
@@ -5559,9 +5556,10 @@ def _voice_worker() -> None:
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
     START_PAD, START_VOICED = 6, 3       # ~3/6 voiced frames (~90–180 ms) opens the segment —
     #                                      sensitive enough to catch a quick/soft "Jarvis"
-    END_PAD, END_UNVOICED = 12, 10       # end only on a clean ~360 ms pause (won't cut a sentence)
+    END_PAD, END_UNVOICED = 30, 24       # require ~720 ms of silence, not ordinary clause pauses
     RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
-    MAX_UTTER_FRAMES = int(14000 / 30)   # ~14 s hard cap
+    MAX_UTTER_SEC = max(15, min(180, int(os.environ.get("JARVIS_MAX_UTTER_SEC", "60"))))
+    MAX_UTTER_FRAMES = int(MAX_UTTER_SEC * 1000 / 30)  # configurable cap; 60 s by default
 
     def _resample16(mono_f32):
         if sample_rate == 16000 or len(mono_f32) < 2:
@@ -5665,7 +5663,7 @@ def _voice_worker() -> None:
                             broadcast_from_thread({"type": "voice", "state": "hearing"})
                     else:
                         voiced.append(frame)
-                        recent = list(ring)[-END_PAD:]             # last ~360 ms
+                        recent = list(ring)[-END_PAD:]             # last ~900 ms
                         ended = len(recent) >= END_PAD and sum(1 for _, s in recent if not s) >= END_UNVOICED
                         if ended or len(voiced) >= MAX_UTTER_FRAMES:
                             triggered = False
@@ -5699,7 +5697,7 @@ async def _broadcast_models_loaded() -> None:
 
 # ── HTTP API (routers/rest.py) ───────────────────────────────────────────────────
 from routers.rest import register as _register_rest  # noqa: E402
-_register_rest(app)
+_register_rest(app, core=sys.modules[__name__])
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
 def _bind_port(host: str, preferred: int) -> socket.socket:

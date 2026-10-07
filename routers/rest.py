@@ -19,8 +19,14 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
-def register(app: FastAPI) -> None:
-    import api as core
+def register(app: FastAPI, core=None) -> None:
+    # `python api.py` runs the backend as `__main__`. Importing `api` here then loads
+    # a second module instance with separate Governor/model state; WebSocket settings
+    # change one instance while Telegram's REST route keeps using the other. The entry
+    # point passes its live module explicitly. Keep the import fallback for callers that
+    # register routes while running the app as `api:app`.
+    if core is None:
+        import api as core
 
     _routing_label = core._routing_label
     _active_model = core._active_model
