@@ -29,6 +29,22 @@ type Task = {
   error?: string;
   at?: string;
 };
+type Goal = {
+  gid?: string;
+  title: string;
+  deadline?: string;
+  priority?: "low" | "normal" | "high";
+  status?: "active" | "done" | "cancelled";
+  progress?: number;
+};
+type Reminder = {
+  id?: string;
+  next_run?: string;
+  status?: string;
+  when?: string;
+  message?: string;
+  recurrence?: string;
+};
 type ToolInfo = { name: string; description: string };
 type AgentTrace = {
   step: number;
@@ -91,6 +107,8 @@ type AgentStatus = {
   local?: { enabled: boolean; fast: string; deep: string };
   tools?: ToolInfo[];
   tasks?: Task[];
+  goals?: Goal[];
+  reminders?: Reminder[];
   trace?: AgentTrace[];
   sys?: { cpu: number; ram: number; disk: number; disk_free_gb?: number; jarvis_rss_mb?: number };
 };
@@ -469,6 +487,13 @@ export default function PrimeDeck() {
           case "tasks":
             if (Array.isArray(d.tasks)) setStatus((p) => ({ ...p, tasks: d.tasks as Task[] }));
             break;
+          case "goals":
+            if (Array.isArray(d.goals)) setStatus((p) => ({ ...p, goals: d.goals as Goal[] }));
+            break;
+          case "reminders":
+            if (Array.isArray(d.reminders))
+              setStatus((p) => ({ ...p, reminders: d.reminders as Reminder[] }));
+            break;
           case "model_pull": {
             const m = String(d.model ?? "");
             setPulls((p) => ({
@@ -642,6 +667,21 @@ export default function PrimeDeck() {
   const tasks = status.tasks ?? [];
   const activeTasks = tasks.filter((t) => t.status === "active");
   const queuedTasks = tasks.filter((t) => t.status === "queued");
+  const activeGoals = (status.goals ?? []).filter((g) => (g.status ?? "active") === "active");
+  const reminders = (status.reminders ?? []).filter((r) => r && (r.message || r.next_run));
+  const fmtDeadline = (iso?: string) => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    return isNaN(d.getTime())
+      ? iso
+      : d.toLocaleString([], {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        });
+  };
   const doneTasks = tasks
     .filter((t) => t.status === "done")
     .slice(-5)
@@ -1496,6 +1536,56 @@ export default function PrimeDeck() {
                     </div>
                   </div>
                 ))}
+
+                <div className="pr-sec">
+                  <span className="pr-lab">goals</span>
+                </div>
+                {activeGoals.length === 0 && (
+                  <div className="pr-empty">No goals yet. Say "I need to finish X by Friday".</div>
+                )}
+                {activeGoals.map((g) => (
+                  <div
+                    key={g.gid ?? g.title}
+                    className={`pr-card pr-task ${g.priority === "high" ? "pr-task--active" : ""}`}
+                  >
+                    <span className="pr-task-dot" />
+                    <div>
+                      <div className="pr-task-label">{g.title}</div>
+                      <div className="pr-task-meta">
+                        {g.gid ? `${g.gid} · ` : ""}
+                        {g.deadline ? `due ${fmtDeadline(g.deadline)}` : "no deadline"}
+                        {g.progress ? ` · ${g.progress}%` : ""}
+                        {g.priority === "high" ? " · high" : ""}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
+                <div className="pr-sec">
+                  <span className="pr-lab">reminders</span>
+                </div>
+                {reminders.length === 0 && (
+                  <div className="pr-empty">No reminders set. Say "remind me at 7pm to…".</div>
+                )}
+                {reminders.map((r, i) => (
+                  <div key={r.id ?? i} className="pr-card pr-task">
+                    <span className="pr-task-dot" />
+                    <div>
+                      <div className="pr-task-label">{r.message || "Reminder"}</div>
+                      <div className="pr-task-meta">
+                        {r.when
+                          ? fmtDeadline(r.when)
+                          : r.next_run && r.next_run !== "N/A"
+                            ? r.next_run
+                            : "scheduled"}
+                        {r.recurrence && r.recurrence !== "once"
+                          ? ` · ${r.recurrence.replace("weekly:", "every ")}`
+                          : ""}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+
                 <div className="pr-sec">
                   <span className="pr-lab">recent tool activity</span>
                 </div>

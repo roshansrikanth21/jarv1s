@@ -25,16 +25,41 @@ Time parsing:
 """
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 
 IS_WINDOWS = sys.platform.startswith("win")
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 TASK_PREFIX = "JARVIS_Reminder_"
+# Per-reminder toast scripts live here. schtasks /TR has a hard 261-char limit, so we CANNOT
+# inline the (long) toast PowerShell — we write it to a .ps1 and point /TR at the short path.
+_SCRIPT_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "JARVIS" / "reminders"
+# schtasks only remembers the task NAME + next-run, not the human message/when — so we keep a
+# tiny sidecar registry (id → message/when/recurrence) to enrich list_all for the UI.
+_REG_FILE = _SCRIPT_DIR / "registry.json"
+
+
+def _reg_load() -> dict:
+    import json
+    try:
+        return json.loads(_REG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _reg_save(reg: dict) -> None:
+    import json
+    try:
+        _SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        _REG_FILE.write_text(json.dumps(reg), encoding="utf-8")
+    except Exception:
+        pass
 
 
 # ── time parsing ────────────────────────────────────────────────────────────────
@@ -165,17 +190,26 @@ def _win_schedule(when: datetime, title: str, message: str,
                   recurrence: str | None = None) -> dict:
     rid = uuid.uuid4().hex[:12]
     task_name = f"{TASK_PREFIX}{rid}"
-    ps_payload = _toast_powershell(title, message)
+    # Write the toast to a per-reminder script; /TR just runs that file (short → within the
+    # 261-char /TR limit that a long inline -Command would blow past).
+    try:
+        _SCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+        script = _SCRIPT_DIR / f"{rid}.ps1"
+        script.write_text(_toast_powershell(title, message), encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "error": f"could not write reminder script: {exc}"}
     # schtasks wants /SC + /SD MM/DD/YYYY + /ST HH:MM (24h). /RL LIMITED so no admin.
     sd = when.strftime("%m/%d/%Y")
     st = when.strftime("%H:%M")
+    tr = (f'powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass '
+          f'-File "{script}"')
     argv = [
         "schtasks.exe", "/Create",
         "/TN", task_name,
         *_recurrence_argv(recurrence),
         "/SD", sd,
         "/ST", st,
-        "/TR", f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_payload}"',
+        "/TR", tr,
         "/RL", "LIMITED",
         "/F",   # overwrite if exists
     ]
@@ -186,6 +220,11 @@ def _win_schedule(when: datetime, title: str, message: str,
         return {"ok": False, "error": f"schtasks call failed: {exc}"}
     if r.returncode != 0:
         return {"ok": False, "error": (r.stderr or r.stdout or "").strip()[:300]}
+    reg = _reg_load()
+    reg[rid] = {"message": message, "title": title,
+                "when": when.isoformat(timespec="minutes"),
+                "recurrence": (recurrence or "once")}
+    _reg_save(reg)
     return {"ok": True, "id": rid, "task_name": task_name,
             "when": when.isoformat(timespec="minutes"),
             "recurrence": (recurrence or "once"),
@@ -203,6 +242,7 @@ def _win_list() -> list[dict]:
     if r.returncode != 0:
         return []
     lines = [ln for ln in (r.stdout or "").splitlines() if TASK_PREFIX in ln]
+    reg = _reg_load()
     out: list[dict] = []
     for ln in lines:
         # CSV columns can contain quoted commas; use csv module for safety.
@@ -215,13 +255,25 @@ def _win_list() -> list[dict]:
         status = row[3] if len(row) > 3 else ""
         name = name.strip().lstrip("\\")
         rid = name.replace(TASK_PREFIX, "", 1) if name.startswith(TASK_PREFIX) else name
+        meta = reg.get(rid, {})
         out.append({"id": rid, "task_name": name,
-                    "next_run": next_run, "status": status})
+                    "next_run": next_run, "status": status,
+                    "message": meta.get("message", ""),
+                    "when": meta.get("when", ""),
+                    "recurrence": meta.get("recurrence", "once")})
     return out
 
 
 def _win_cancel(rid: str) -> dict:
     task_name = rid if rid.startswith(TASK_PREFIX) else f"{TASK_PREFIX}{rid}"
+    short = rid.replace(TASK_PREFIX, "", 1)
+    try:
+        (_SCRIPT_DIR / f"{short}.ps1").unlink(missing_ok=True)   # tidy the toast script
+    except Exception:
+        pass
+    reg = _reg_load()
+    if reg.pop(short, None) is not None:
+        _reg_save(reg)
     argv = ["schtasks.exe", "/Delete", "/TN", task_name, "/F"]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=10,

@@ -107,6 +107,8 @@ def register(app: FastAPI) -> None:
                 for t in core.TOOLS
             ],
             "tasks": core.task_list,
+            "goals": [g for g in core.goal_list if g.get("status", "active") == "active"],
+            "reminders": core._reminders_cache,
             "trace": core.agent_trace[-25:],
             "sys": {
                 "cpu":  round(cpu),

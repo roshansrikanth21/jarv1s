@@ -57,6 +57,22 @@ type Task = {
   error?: string;
   at?: string;
 };
+type Goal = {
+  gid?: string;
+  title: string;
+  deadline?: string;
+  priority?: "low" | "normal" | "high";
+  status?: "active" | "done" | "cancelled";
+  progress?: number;
+};
+type Reminder = {
+  id?: string;
+  next_run?: string;
+  status?: string;
+  when?: string;
+  message?: string;
+  recurrence?: string;
+};
 type ToolInfo = { name: string; description: string };
 type AgentTrace = {
   step: number;
@@ -366,6 +382,8 @@ function CommandDeck() {
   const [lineCut, setLineCut] = useState(0);
   const [input, setInput] = useState("");
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [goals, setGoals] = useState<Goal[]>([]);
+  const [reminders, setReminders] = useState<Reminder[]>([]);
   const [agentStatus, setAgentStatus] = useState<AgentStatus>({});
   const [sysStats, setSysStats] = useState({ cpu: 0, ram: 0, disk: 0 });
   const [cmdHistory, setCmdHistory] = useState<string[]>([]);
@@ -438,6 +456,8 @@ function CommandDeck() {
       setAgentStatus(d);
       if (d.sys) setSysStats(d.sys);
       if (Array.isArray(d.tasks)) setTasks(d.tasks);
+      if (Array.isArray(d.goals)) setGoals(d.goals as Goal[]);
+      if (Array.isArray(d.reminders)) setReminders(d.reminders as Reminder[]);
     } catch {
       /* silent */
     }
@@ -568,6 +588,12 @@ function CommandDeck() {
             break;
           case "tasks":
             if (Array.isArray(d.tasks)) setTasks(d.tasks as Task[]);
+            break;
+          case "goals":
+            if (Array.isArray(d.goals)) setGoals(d.goals as Goal[]);
+            break;
+          case "reminders":
+            if (Array.isArray(d.reminders)) setReminders(d.reminders as Reminder[]);
             break;
           case "agent_tool": {
             const s = d.step as AgentTrace | undefined;
@@ -784,6 +810,21 @@ function CommandDeck() {
     .filter((t) => t.status === "done")
     .slice(-4)
     .reverse();
+  const activeGoals = goals.filter((g) => (g.status ?? "active") === "active");
+  const liveReminders = reminders.filter((r) => r && (r.message || r.next_run));
+  const fmtWhen = (iso?: string) => {
+    if (!iso) return "";
+    const d = new Date(iso);
+    return isNaN(d.getTime())
+      ? iso
+      : d.toLocaleString([], {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+        });
+  };
 
   const connTone: Tone = connected ? "online" : showReconnectHint ? "idle" : "warn";
   const connLabel = connected
@@ -1241,6 +1282,53 @@ function CommandDeck() {
                   {doneTasks.map((t) => (
                     <AnimatedTask key={t.id} task={t} done />
                   ))}
+
+                  <p className="hud-section-divider">goals</p>
+                  {activeGoals.length === 0 ? (
+                    <EmptyPane text='No goals yet. Say "I need to finish X by Friday".' />
+                  ) : (
+                    activeGoals.map((g) => (
+                      <div
+                        key={g.gid ?? g.title}
+                        className={`hud-task ${g.priority === "high" ? "hud-task--active" : ""}`}
+                      >
+                        <div className="hud-task-indicator" />
+                        <div className="flex-1 min-w-0">
+                          <p className="hud-task-label">{g.title}</p>
+                          <p className="hud-task-meta">
+                            {g.gid ? `${g.gid} · ` : ""}
+                            {g.deadline ? `due ${fmtWhen(g.deadline)}` : "no deadline"}
+                            {g.progress ? ` · ${g.progress}%` : ""}
+                            {g.priority === "high" ? " · high" : ""}
+                          </p>
+                        </div>
+                      </div>
+                    ))
+                  )}
+
+                  <p className="hud-section-divider">reminders</p>
+                  {liveReminders.length === 0 ? (
+                    <EmptyPane text='No reminders set. Say "remind me at 7pm to…".' />
+                  ) : (
+                    liveReminders.map((r, i) => (
+                      <div key={r.id ?? i} className="hud-task">
+                        <div className="hud-task-indicator" />
+                        <div className="flex-1 min-w-0">
+                          <p className="hud-task-label">{r.message || "Reminder"}</p>
+                          <p className="hud-task-meta">
+                            {r.when
+                              ? fmtWhen(r.when)
+                              : r.next_run && r.next_run !== "N/A"
+                                ? r.next_run
+                                : "scheduled"}
+                            {r.recurrence && r.recurrence !== "once"
+                              ? ` · ${r.recurrence.replace("weekly:", "every ")}`
+                              : ""}
+                          </p>
+                        </div>
+                      </div>
+                    ))
+                  )}
                 </motion.div>
               )}
 

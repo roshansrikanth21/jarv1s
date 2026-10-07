@@ -486,6 +486,7 @@ async def _lifespan(app: FastAPI):
     _ambient_task = asyncio.create_task(_ambient_loop())
     _monitor_task = asyncio.create_task(_monitor_loop())
     _proactive_task = asyncio.create_task(_proactive_loop())
+    asyncio.create_task(_send_reminders_snapshot())   # warm the reminders cache for status polls
     # (Cortex init above already embedded every fact + episode via vectors._bootstrap_from_store,
     #  so first recall is warm without a separate task.)
     # Serve the built SPA when present (packaged desktop); else Vite serves it in dev.
@@ -886,13 +887,19 @@ def _goals_changed(items: list[dict]) -> None:
 _goals = GoalStore(goal_list, GOAL_SEQ_FILE, on_change=_goals_changed)
 
 
+_reminders_cache: list[dict] = []
+
+
 async def _send_reminders_snapshot(ws=None) -> None:
-    """Fetch OS-scheduled reminders off the event loop and push them to one client (on
-    connect) or broadcast to all (after a change)."""
+    """Fetch OS-scheduled reminders off the event loop, cache them (so /api/agent/status can
+    serve them without re-running schtasks on every poll), and push to one client (on connect)
+    or broadcast to all (after a change)."""
+    global _reminders_cache
     try:
         items = await asyncio.to_thread(reminder.list_all)
     except Exception:
         items = []
+    _reminders_cache = items
     payload = {"type": "reminders", "reminders": items}
     if ws is not None:
         try:
@@ -5365,10 +5372,11 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
         if iso:
             # Auto-schedule an OS reminder at the deadline so it actually nudges (if future).
             r = reminder.schedule(iso, f"Deadline: {title}", title="JARVIS")
+            nudge = ""
             if r.get("ok"):
                 _goals.set(goal["gid"], reminder_id=r.get("id", ""))
-            return (f"Goal saved ({goal['gid']}): {title}, due {_fmt_deadline(iso)}. "
-                    f"I'll remind you then."), True
+                nudge = " I'll remind you then."
+            return (f"Goal saved ({goal['gid']}): {title}, due {_fmt_deadline(iso)}.{nudge}"), True
         return (f"Goal saved ({goal['gid']}): {title}. I couldn't pin an exact deadline from "
                 f"\"{p.get('deadline_text','')}\" — tell me a date and I'll set a reminder."), True
 
