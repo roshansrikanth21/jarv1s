@@ -5878,8 +5878,17 @@ async def _speak(text: str) -> None:
                          "text": "JARVIS is speaking. The microphone is paused until playback ends."})
     try:
         sent_any = False
+        # Pipeline synthesis: start the next sentence while the client plays the current one.
+        next_synth: asyncio.Task[bytes] | None = asyncio.create_task(_synth(chunks[0], rate, pitch))
         for i, piece in enumerate(chunks):
-            audio_bytes = await _synth(piece, rate, pitch)
+            if next_synth is None:
+                next_synth = asyncio.create_task(_synth(piece, rate, pitch))
+            audio_bytes = await next_synth
+            next_synth = (
+                asyncio.create_task(_synth(chunks[i + 1], rate, pitch))
+                if i + 1 < len(chunks)
+                else None
+            )
             if not audio_bytes:
                 continue
             b64 = base64.b64encode(audio_bytes).decode()
@@ -6061,11 +6070,36 @@ def _stt_available() -> bool:
     return bool(USE_GROQ and _HAS_GROQ)
 
 
+def _whisper_runtime() -> tuple[str, str, int]:
+    """Pick faster-whisper device/compute/threads — CUDA when available for lower latency."""
+    override = os.environ.get("JARVIS_STT_DEVICE", "").strip().lower()
+    compute_override = os.environ.get("JARVIS_STT_COMPUTE", "").strip()
+    _phys = psutil.cpu_count(logical=False) or 2
+    cpu_threads = max(1, min(4, int(os.environ.get("JARVIS_STT_THREADS", str(_phys)))))
+
+    def _cuda_ok() -> bool:
+        if override == "cpu":
+            return False
+        try:
+            import ctranslate2
+
+            return ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            return False
+
+    if override == "cuda" or (override != "cpu" and _cuda_ok()):
+        return (
+            "cuda",
+            compute_override or "float16",
+            cpu_threads,
+        )
+    return ("cpu", compute_override or "int8", cpu_threads)
+
+
 def _get_local_whisper():
-    """Process-level singleton faster-whisper model (CPU, int8, base.en) — the default STT
-    backend: offline, free, no per-request quota. Loaded lazily on first use so app boot
-    isn't delayed; returns None (and stays None) if it can't load, so callers fall back to
-    Groq's cloud Whisper."""
+    """Process-level singleton faster-whisper model — offline STT (CUDA when available, else CPU).
+    Loaded lazily on first use so app boot isn't delayed; returns None (and stays None) if it
+    can't load, so callers fall back to Groq's cloud Whisper."""
     global _whisper_model, _whisper_load_failed
     if _whisper_model is not None or _whisper_load_failed:
         return _whisper_model
@@ -6074,16 +6108,16 @@ def _get_local_whisper():
             return _whisper_model
         try:
             WhisperModel = _import_faster_whisper().WhisperModel
-            # Cap threads to physical cores (max 4) — over-allocating bloats RSS on CTranslate2.
-            _phys = psutil.cpu_count(logical=False) or 2
-            _threads = max(1, min(4, int(os.environ.get("JARVIS_STT_THREADS", str(_phys)))))
+            device, compute_type, cpu_threads = _whisper_runtime()
+            model_name = os.environ.get("JARVIS_STT_MODEL", "base.en")
             _whisper_model = WhisperModel(
-            os.environ.get("JARVIS_STT_MODEL", "base.en"),
-                device="cpu",
-                compute_type="int8",
-                cpu_threads=_threads,
+                model_name,
+                device=device,
+                compute_type=compute_type,
+                cpu_threads=cpu_threads,
                 num_workers=1,
             )
+            log.info("whisper: loaded model=%s device=%s compute=%s", model_name, device, compute_type)
         except Exception as exc:
             _whisper_load_failed = True
             broadcast_from_thread({"type": "system", "text": f"Local STT unavailable ({exc}); using Groq cloud Whisper."})
@@ -6120,6 +6154,8 @@ def _transcribe_local(pcm16, sample_rate: int):
             kwargs = dict(
                 language="en",
                 vad_filter=use_vad,
+                beam_size=1,
+                best_of=1,
                 temperature=0.0,
                 condition_on_previous_text=False,
                 no_speech_threshold=0.6,
@@ -6128,9 +6164,9 @@ def _transcribe_local(pcm16, sample_rate: int):
             )
             if use_vad:
                 kwargs["vad_parameters"] = dict(
-                    min_silence_duration_ms=300,
-                    speech_pad_ms=240,
-                    threshold=0.35,
+                    min_silence_duration_ms=int(os.environ.get("JARVIS_STT_VAD_MIN_SILENCE_MS", "180")),
+                    speech_pad_ms=int(os.environ.get("JARVIS_STT_VAD_SPEECH_PAD_MS", "120")),
+                    threshold=float(os.environ.get("JARVIS_STT_VAD_THRESHOLD", "0.35")),
                 )
             segments, _info = model.transcribe(audio_f32, **kwargs)
             kept = []
@@ -6582,7 +6618,9 @@ def _voice_session() -> str:
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
     START_PAD, START_VOICED = 6, 3       # ~3/6 voiced frames (~90–180 ms) opens the segment —
     #                                      sensitive enough to catch a quick/soft "Jarvis"
-    END_PAD, END_UNVOICED = 30, 24       # require ~720 ms of silence, not ordinary clause pauses
+    # End-of-utterance: shorter silence → faster STT start (tune up if clauses get cut off).
+    END_PAD = max(12, int(os.environ.get("JARVIS_VAD_END_PAD", "22")))
+    END_UNVOICED = max(8, int(os.environ.get("JARVIS_VAD_END_UNVOICED", "17")))
     RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
     MAX_UTTER_SEC = max(15, min(180, int(os.environ.get("JARVIS_MAX_UTTER_SEC", "60"))))
     MAX_UTTER_FRAMES = int(MAX_UTTER_SEC * 1000 / 30)  # configurable cap; 60 s by default
