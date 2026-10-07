@@ -527,6 +527,7 @@ STT_BACKOFF = float(os.environ.get("JARVIS_STT_BACKOFF", "4.0"))   # cool-off af
 _tts_playing = False          # frontend reports the exact playback window
 _tts_ended_at = 0.0           # when playback last ended — mic stays muted a beat after, so the
                               # acoustic tail/reverb of JARVIS's own voice can't retrigger the VAD
+TTS_TAIL_COOLDOWN = float(os.environ.get("JARVIS_TTS_TAIL_COOLDOWN", "0.12"))
 _tts_gen = 0                  # bumped per TTS clip; lets a stale mute-failsafe know it's superseded
 _tts_seq_counter = 0          # bumped per _speak() call; frontend groups a reply's streamed chunks by it
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
@@ -5568,8 +5569,6 @@ def _voice_worker() -> None:
         # which both wastes the model and corrupts the next real utterance. No echo cancellation
         # needed; we simply don't listen while we talk, like a real push-to-talk radio.
         return _tts_playing or (time.time() - _tts_ended_at) < TTS_TAIL_COOLDOWN
-
-    TTS_TAIL_COOLDOWN = 0.35   # seconds after playback before the mic is trusted again
 
     # Real speech detection via WebRTC VAD (spectral, gain-INDEPENDENT) at 16 kHz — replaces the
     # brittle energy-threshold VAD that couldn't separate speech from a noisy low-gain mic. A

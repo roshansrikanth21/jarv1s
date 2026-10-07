@@ -180,6 +180,10 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
     const a = new Audio(url);
     audioRef.current = a;
     setSpeaking(true);
+    if (!ttsStartedRef.current) {
+      ttsStartedRef.current = true;
+      wsRef.current?.send(JSON.stringify({ action: "tts_start" }));
+    }
     const advance = () => {
       URL.revokeObjectURL(url);
       if (audioRef.current === a) audioRef.current = null;
@@ -188,12 +192,6 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
     a.onended = advance;
     a.onerror = advance;
     a.play()
-      .then(() => {
-        if (!ttsStartedRef.current) {
-          ttsStartedRef.current = true;
-          wsRef.current?.send(JSON.stringify({ action: "tts_start" }));
-        }
-      })
       .catch(() => {
         addRef.current(
           "system",
