@@ -329,6 +329,25 @@ def register(app: FastAPI) -> None:
                              for f in ordered[:lim]]}
 
 
+    @app.get("/api/goals")
+    async def goals_endpoint(include_done: bool = False) -> dict:
+        """The user's goals (future intentions with deadlines). Backend-owned, so this reads
+        the same whichever UI asks. Active-only by default."""
+        gs = core.goal_list if include_done else [g for g in core.goal_list
+                                                  if g.get("status") == "active"]
+        return {"count": len(gs), "goals": gs}
+
+    @app.get("/api/reminders")
+    async def reminders_endpoint() -> dict:
+        """OS-scheduled reminders (survive the app being closed). Queried off the event loop."""
+        import asyncio as _a
+        try:
+            items = await _a.to_thread(core.reminder.list_all)
+        except Exception:
+            items = []
+        return {"count": len(items), "reminders": items}
+
+
     # ── Attachment uploads — images/docs the UI drops into chat ────────────────────
     # The endpoint extracts a plain-text digest at upload time (vision for images,
     # text extraction for documents), so by the time the user hits send, the brain

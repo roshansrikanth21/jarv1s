@@ -142,17 +142,37 @@ def _toast_powershell(title: str, message: str) -> str:
 
 
 # ── Windows: schtasks-backed schedule / list / cancel ──────────────────────────
-def _win_schedule(when: datetime, title: str, message: str) -> dict:
+_DOW = {"mon": "MON", "tue": "TUE", "wed": "WED", "thu": "THU", "fri": "FRI",
+        "sat": "SAT", "sun": "SUN"}
+
+
+def _recurrence_argv(recurrence: str | None) -> list[str]:
+    """Translate a recurrence token into schtasks /SC args. None/'' → one-shot (ONCE).
+    'daily' → every day. 'weekly:MON' (or any day prefix) → that weekday each week."""
+    rec = (recurrence or "").strip().lower()
+    if not rec or rec == "once":
+        return ["/SC", "ONCE"]
+    if rec.startswith("dai") or rec == "everyday":
+        return ["/SC", "DAILY"]
+    if rec.startswith("week"):
+        day = rec.split(":", 1)[1][:3] if ":" in rec else ""
+        dow = _DOW.get(day)
+        return ["/SC", "WEEKLY"] + (["/D", dow] if dow else [])
+    return ["/SC", "ONCE"]
+
+
+def _win_schedule(when: datetime, title: str, message: str,
+                  recurrence: str | None = None) -> dict:
     rid = uuid.uuid4().hex[:12]
     task_name = f"{TASK_PREFIX}{rid}"
     ps_payload = _toast_powershell(title, message)
-    # schtasks wants /SC ONCE + /SD MM/DD/YYYY + /ST HH:MM (24h). /RL LIMITED so no admin.
+    # schtasks wants /SC + /SD MM/DD/YYYY + /ST HH:MM (24h). /RL LIMITED so no admin.
     sd = when.strftime("%m/%d/%Y")
     st = when.strftime("%H:%M")
     argv = [
         "schtasks.exe", "/Create",
         "/TN", task_name,
-        "/SC", "ONCE",
+        *_recurrence_argv(recurrence),
         "/SD", sd,
         "/ST", st,
         "/TR", f'powershell.exe -NoProfile -WindowStyle Hidden -Command "{ps_payload}"',
@@ -168,6 +188,7 @@ def _win_schedule(when: datetime, title: str, message: str) -> dict:
         return {"ok": False, "error": (r.stderr or r.stdout or "").strip()[:300]}
     return {"ok": True, "id": rid, "task_name": task_name,
             "when": when.isoformat(timespec="minutes"),
+            "recurrence": (recurrence or "once"),
             "title": title, "message": message}
 
 
@@ -219,9 +240,11 @@ _NOT_WINDOWS_ERR = ("reminder: OS-native scheduling is Windows-only for now. On 
                     "`systemd-run` command themselves.")
 
 
-def schedule(when: str, message: str, title: str = "JARVIS") -> dict:
+def schedule(when: str, message: str, title: str = "JARVIS",
+             recurrence: str | None = None) -> dict:
     """Schedule a reminder. `when` accepts ISO, 'in 5 minutes', 'tomorrow 9am',
-    'today 15:00', 'HH:MM'. Returns {ok, id, when, ...} on success."""
+    'today 15:00', 'HH:MM'. `recurrence` is None/'once', 'daily', or 'weekly:MON'..'weekly:SUN'
+    (the first fire is at `when`). Returns {ok, id, when, ...} on success."""
     if not IS_WINDOWS:
         return {"ok": False, "error": _NOT_WINDOWS_ERR}
     if not message:
@@ -236,7 +259,7 @@ def schedule(when: str, message: str, title: str = "JARVIS") -> dict:
         return {"ok": False,
                 "error": f"reminder: {when_dt.isoformat(timespec='minutes')} is in the "
                          "past. Pick a future time."}
-    return _win_schedule(when_dt, title, message)
+    return _win_schedule(when_dt, title, message, recurrence)
 
 
 def list_all() -> list[dict]:

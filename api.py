@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +85,8 @@ from jarvis.events.bus import bus as _event_bus
 from jarvis.platform import telemetry as _telemetry
 from jarvis.session.state import SessionState, WorkflowPhase
 from jarvis.session.tasks import TaskManager
+from jarvis.session.goals import GoalStore
+import jarvis.act.reminder as reminder
 
 logging.basicConfig(
     level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
@@ -98,6 +100,8 @@ HISTORY_FILE  = BASE_DIR / "memory" / "jarvis_history.json"
 OVERHEARD_FILE = BASE_DIR / "memory" / "jarvis_overheard.json"  # rolling ambient speech log
 TASKS_FILE    = BASE_DIR / "memory" / "jarvis_tasks.json"
 TASK_SEQ_FILE = BASE_DIR / "memory" / "jarvis_task_seq.json"  # monotonic TASK-### counter
+GOALS_FILE    = BASE_DIR / "memory" / "jarvis_goals.json"
+GOAL_SEQ_FILE = BASE_DIR / "memory" / "jarvis_goal_seq.json"  # monotonic GOAL-### counter
 SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
 GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
 PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
@@ -793,6 +797,7 @@ def _user_name() -> str:
 
 memories  = _load_memory()
 task_list = _load_json(TASKS_FILE, [])
+goal_list = _load_json(GOALS_FILE, [])
 _overheard = _load_json(OVERHEARD_FILE, [])[-OVERHEARD_MAX:]
 _refresh_history_aliases()
 _settings = _load_json(SETTINGS_FILE, {})
@@ -869,6 +874,35 @@ def _tasks_changed(items: list[dict]) -> None:
 _tasks = TaskManager(task_list, TASK_SEQ_FILE, on_change=_tasks_changed)
 
 
+def _save_goals() -> None:
+    _save_json(GOALS_FILE, goal_list)
+
+
+def _goals_changed(items: list[dict]) -> None:
+    _save_goals()
+    broadcast_from_thread({"type": "goals", "goals": items})
+
+
+_goals = GoalStore(goal_list, GOAL_SEQ_FILE, on_change=_goals_changed)
+
+
+async def _send_reminders_snapshot(ws=None) -> None:
+    """Fetch OS-scheduled reminders off the event loop and push them to one client (on
+    connect) or broadcast to all (after a change)."""
+    try:
+        items = await asyncio.to_thread(reminder.list_all)
+    except Exception:
+        items = []
+    payload = {"type": "reminders", "reminders": items}
+    if ws is not None:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            pass
+    else:
+        await broadcast(payload)
+
+
 async def _emit_content_panel(title: str, body: str) -> None:
     if not body or len(body) < websearch_mod.PANEL_MIN_CHARS:
         return
@@ -888,6 +922,7 @@ async def _monitor_loop() -> None:
             _maybe_unload_whisper()          # reclaim STT RAM when idle (esp. while disconnected)
             if not active_connections:
                 continue
+            await _check_goal_deadlines()
             alert = await asyncio.to_thread(_sys_monitor.check)
             if not alert:
                 continue
@@ -905,6 +940,28 @@ async def _monitor_loop() -> None:
             raise
         except Exception as exc:
             log.warning("monitor loop: %s", exc)
+
+
+_GOAL_WARN_HOURS = float(os.environ.get("JARVIS_GOAL_WARN_HOURS", "24"))
+
+
+async def _check_goal_deadlines() -> None:
+    """Warn once, calmly, when an active goal's deadline is within the warning window. Marks
+    the goal warned so it never nags again for the same deadline."""
+    try:
+        due = _goals.due_within(_GOAL_WARN_HOURS)
+    except Exception:
+        return
+    for g in due:
+        _goals.set(g["gid"], warned=True)
+        when = _fmt_deadline(g.get("deadline", ""))
+        line = f"Heads up — \"{g['title']}\" is due {when}."
+        await broadcast({"type": "system_alert", "severity": "info",
+                         "metric": "deadline", "text": line,
+                         "ts": datetime.now().isoformat(timespec="seconds")})
+        # Speak it only if JARVIS isn't mid-turn, to stay unobtrusive.
+        if not (_tts_playing or (_current_task and not _current_task.done())):
+            await _schedule_speak(line)
 
 
 async def _run_startup_briefing(*, force: bool = False) -> None:
@@ -1035,6 +1092,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     # the tasks and the turn that ran while the old view was torn down are both still here.
     try:
         await websocket.send_json({"type": "tasks", "tasks": task_list})
+        await websocket.send_json({"type": "goals", "goals": goal_list})
         _recent_turns = _history_messages()[-16:]
         if _recent_turns:
             await websocket.send_json({
@@ -1043,6 +1101,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                            "text": m.get("content", "")}
                           for m in _recent_turns if m.get("content")],
             })
+        # Reminders come from schtasks (a subprocess) — fetch off the event loop so a slow
+        # query never delays the connect handshake, then push them to this client.
+        asyncio.create_task(_send_reminders_snapshot(websocket))
     except Exception as _exc:
         log.debug("connect snapshot failed: %s", _exc)
     if _groq_key_alert:
@@ -1615,6 +1676,34 @@ TOOLS: list[dict] = [
                     "task_id": {"type": "string", "description": "Task id to cancel, e.g. TASK-003 (a bare number also works)"},
                 },
                 "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "goals",
+            "description": (
+                "Manage the user's goals — future intentions with a deadline ('finish the "
+                "report by Friday'), distinct from queue tasks and timed reminders. Simple "
+                "phrasings like 'I need to finish X by Friday' are already captured "
+                "automatically; use this to list them, mark one done/cancelled, or update "
+                "progress. action: list (default) | add | complete | cancel | update. For add, "
+                "pass title and optionally deadline (natural: 'Friday', 'Oct 20', ISO) and "
+                "priority (low|normal|high). For complete/cancel/update, pass goal_id "
+                "(GOAL-002 or a number); update also takes progress (0-100) or priority."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action":   {"type": "string", "enum": ["list", "add", "complete", "cancel", "update"]},
+                    "title":    {"type": "string"},
+                    "deadline": {"type": "string"},
+                    "priority": {"type": "string", "description": "low | normal | high"},
+                    "goal_id":  {"type": "string"},
+                    "progress": {"type": "integer", "description": "0-100"},
+                },
+                "required": ["action"],
             },
         },
     },
@@ -2818,6 +2907,43 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
             return f"Task {args['task_id']} not found."
         return f"{it['tid']} cancelled."
 
+    if name == "goals":
+        act = (args.get("action") or "list").strip().lower()
+        if act == "add":
+            title = str(args.get("title") or "").strip()
+            if not title:
+                return "goals add: needs a title."
+            iso = _resolve_deadline(str(args.get("deadline") or ""))
+            g = _goals.create(title, deadline=iso,
+                              priority=str(args.get("priority") or "normal"))
+            if iso:
+                r = reminder.schedule(iso, f"Deadline: {title}", title="JARVIS")
+                if r.get("ok"):
+                    _goals.set(g["gid"], reminder_id=r.get("id", ""))
+                return f"Goal {g['gid']} saved: {title}, due {_fmt_deadline(iso)}."
+            return f"Goal {g['gid']} saved: {title} (no deadline set)."
+        if act in ("complete", "done"):
+            it = _goals.complete(args.get("goal_id"))
+            return f"{it['gid']} marked done." if it else f"Goal {args.get('goal_id')} not found."
+        if act == "cancel":
+            it = _goals.cancel(args.get("goal_id"))
+            return f"{it['gid']} cancelled." if it else f"Goal {args.get('goal_id')} not found."
+        if act == "update":
+            it = _goals.set(args.get("goal_id"),
+                            progress=args.get("progress"),
+                            priority=args.get("priority"))
+            return f"{it['gid']} updated." if it else f"Goal {args.get('goal_id')} not found."
+        # list
+        gs = _goals.active()
+        if not gs:
+            return "No active goals."
+        lines = []
+        for g in gs:
+            dl = f" — due {_fmt_deadline(g['deadline'])}" if g.get("deadline") else ""
+            prog = f" ({g['progress']}%)" if g.get("progress") else ""
+            lines.append(f"{g['gid']}: {g['title']}{dl}{prog}")
+        return "\n".join(lines)
+
     if name == "capture_screen":
         try:
             import mss
@@ -3765,8 +3891,8 @@ async def _emit_final(text: str) -> None:
 # this keeps a typical tool call around ~1.5k tool-tokens instead of ~5.7k.
 _CORE_TOOLS = {
     "remember", "recall_memory", "search_web", "calculate", "get_weather",
-    "get_system_info", "add_task", "complete_task", "cancel_task", "run_command", "launch_app",
-    "close_app", "files", "capture_screen", "use_skill", "create_skill",
+    "get_system_info", "add_task", "complete_task", "cancel_task", "goals", "run_command",
+    "launch_app", "close_app", "files", "capture_screen", "use_skill", "create_skill",
 }
 _TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
     (re.compile(r"\b(desktop|click|type this|keyboard|mouse|window|gui|automate|drag|scroll)\b", re.I),
@@ -5057,6 +5183,62 @@ def _fs_path(location: str, *parts: str) -> str:
     return os.path.join(base, *parts)
 
 
+_MONTHS = {m.lower(): i for i, m in enumerate(
+    ["January", "February", "March", "April", "May", "June", "July", "August",
+     "September", "October", "November", "December"], start=1)}
+_MONTHS.update({m[:3].lower(): i for m, i in list(_MONTHS.items())})
+_WEEKDAYS = {"monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3, "friday": 4,
+             "saturday": 5, "sunday": 6, "mon": 0, "tue": 1, "tues": 1, "wed": 2,
+             "thu": 3, "thur": 3, "thurs": 3, "fri": 4, "sat": 5, "sun": 6}
+
+
+def _resolve_deadline(text: str) -> str:
+    """Turn a deadline phrase into an ISO datetime string, or '' if unparseable. Handles
+    reminder.parse_when forms (ISO/tomorrow/today/in N/HH:MM), weekday names (next occurrence,
+    default 18:00), 'Month DD' / 'DD Month', and 'next week'. Default time of day is 6 PM."""
+    t = (text or "").strip().strip(".")
+    if not t:
+        return ""
+    # reminder.parse_when covers ISO, 'tomorrow[ time]', 'today[ time]', 'in N units', HH:MM.
+    dt = reminder.parse_when(t)
+    if dt:
+        return dt.isoformat(timespec="minutes")
+    low = t.lower()
+    now = datetime.now()
+    if "next week" in low:
+        return (now + timedelta(days=7)).replace(hour=18, minute=0, second=0,
+                                                 microsecond=0).isoformat(timespec="minutes")
+    # weekday name → next occurrence at 18:00
+    for name, wd in _WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", low):
+            ahead = (wd - now.weekday()) % 7
+            ahead = ahead or 7                      # "Friday" said on Friday → next Friday
+            d = (now + timedelta(days=ahead)).replace(hour=18, minute=0, second=0, microsecond=0)
+            return d.isoformat(timespec="minutes")
+    # "October 20" / "20 October" / "Oct 20"
+    m = re.search(r"\b([A-Za-z]{3,9})\s+(\d{1,2})\b", t) or re.search(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\b", t)
+    if m:
+        a, b = m.group(1), m.group(2)
+        month = _MONTHS.get(a.lower()) or _MONTHS.get(b.lower())
+        day = int(b) if b.isdigit() else int(a)
+        if month and 1 <= day <= 31:
+            year = now.year + (1 if (month, day) < (now.month, now.day) else 0)
+            try:
+                return datetime(year, month, day, 18, 0).isoformat(timespec="minutes")
+            except ValueError:
+                return ""
+    return ""
+
+
+def _fmt_deadline(iso: str) -> str:
+    try:
+        d = datetime.fromisoformat(iso)
+    except Exception:
+        return iso
+    fmt = "%a %b %d, %I:%M %p" if os.name == "nt" else "%a %b %-d, %-I:%M %p"
+    return d.strftime(fmt)
+
+
 def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
     """Run a fast-path intent and return (spoken_reply, handled). handled=False means we
     couldn't honour it deterministically (e.g. an unknown app) and the caller should fall
@@ -5159,6 +5341,37 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
     if kind == "FS_OPEN":
         return filesystem.open_path(_fs_path(p.get("location", ""))), True
 
+    if kind == "REMINDER":
+        when = p.get("when")
+        rec = p.get("recurrence")
+        msg = p.get("message") or "reminder"
+        if not when and rec:
+            # Recurring with no explicit clock — default to 9 AM.
+            when = "09:00"
+        res = reminder.schedule(when or "", msg, title="JARVIS", recurrence=rec)
+        if not res.get("ok"):
+            return f"I couldn't set that reminder — {res.get('error', 'unknown error')}", True
+        when_str = _fmt_deadline(res.get("when", "")) or (when or "")
+        if rec and rec != "once":
+            human = "every day" if rec == "daily" else ("weekly" if rec == "weekly"
+                     else f"every {rec.split(':')[1].title()}")
+            return f"Reminder set: \"{msg}\" {human} (first at {when_str}).", True
+        return f"Reminder set for {when_str}: \"{msg}\".", True
+
+    if kind == "GOAL":
+        title = p.get("title") or "goal"
+        iso = _resolve_deadline(p.get("deadline_text", ""))
+        goal = _goals.create(title, deadline=iso)
+        if iso:
+            # Auto-schedule an OS reminder at the deadline so it actually nudges (if future).
+            r = reminder.schedule(iso, f"Deadline: {title}", title="JARVIS")
+            if r.get("ok"):
+                _goals.set(goal["gid"], reminder_id=r.get("id", ""))
+            return (f"Goal saved ({goal['gid']}): {title}, due {_fmt_deadline(iso)}. "
+                    f"I'll remind you then."), True
+        return (f"Goal saved ({goal['gid']}): {title}. I couldn't pin an exact deadline from "
+                f"\"{p.get('deadline_text','')}\" — tell me a date and I'll set a reminder."), True
+
     if kind == "TASK_ADD":
         task = _tasks.create(p["text"])
         return f"Added it — that's {task['tid']}.", True
@@ -5197,6 +5410,9 @@ async def _run_fastpath(user_text: str, intent: "fastpath.FastIntent",
     # Announce the tool only now that we know we handled it (so a fall-through to the agent
     # doesn't leave a phantom fastpath step in the turn's tool list).
     await broadcast({"type": "agent_tool", "step": {"action": f"fastpath:{intent.kind.lower()}"}})
+    # A new reminder/goal → refresh the OS-reminder list so the UI reflects it promptly.
+    if intent.kind in ("REMINDER", "GOAL"):
+        asyncio.create_task(_send_reminders_snapshot())
     await _emit_final(reply)
     _record_turn(user_text, reply)
     if trace:

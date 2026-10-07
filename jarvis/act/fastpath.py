@@ -105,6 +105,146 @@ _MEDIA = [
     (re.compile(r"^(?:previous|prev|last)(?:\s+(?:track|song))?$", re.I), "prevtrack"),
 ]
 
+# ── reminders & goals (deterministic creation) ─────────────────────────────────────
+# A clock like "7pm", "7:30 am", "19:00", normalised to 24h "HH:MM" for reminder.parse_when
+# (whose HH:MM branch rolls to the next day if the time is already past).
+_CLOCK = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.I)
+_DOW_WORDS = {"monday": "MON", "tuesday": "TUE", "wednesday": "WED", "thursday": "THU",
+              "friday": "FRI", "saturday": "SAT", "sunday": "SUN",
+              "mon": "MON", "tue": "TUE", "tues": "TUE", "wed": "WED", "thu": "THU",
+              "thur": "THU", "thurs": "THU", "fri": "FRI", "sat": "SAT", "sun": "SUN"}
+
+
+def _clock_to_hhmm(hh: str, mm: str | None, ampm: str | None) -> str | None:
+    try:
+        hour = int(hh)
+    except (TypeError, ValueError):
+        return None
+    minute = int(mm) if mm else 0
+    if ampm:
+        ampm = ampm.lower()
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+# Time phrases we can lift out of a sentence, longest/most-specific first.
+_WHEN_PATTERNS = [
+    re.compile(r"\bin\s+\d+\s*(?:min\w*|hour\w*|hr\w*|day\w*|sec\w*)\b", re.I),
+    re.compile(r"\btomorrow(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b", re.I),
+    re.compile(r"\btoday(?:\s+(?:at\s+)?\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b", re.I),
+    re.compile(r"\btonight\b", re.I),
+    re.compile(r"\b(?:at|by|around|@)\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b", re.I),
+    re.compile(r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b", re.I),
+    re.compile(r"\b\d{1,2}\s*(?:am|pm)\b", re.I),
+]
+_REMIND_TRIGGER = re.compile(r"\b(?:please\s+)?remind\s+me(?:\s+(?:to|that|about))?\b", re.I)
+_EVERY_RE = re.compile(r"\bevery\s+(day|morning|night|evening|week|"
+                       r"mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:r|rs|rsday)?|"
+                       r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b", re.I)
+
+
+def _extract_when(low: str) -> tuple[str | None, tuple[int, int] | None]:
+    """Find a time phrase in `low`; return (normalised when-string, (start,end) span) or
+    (None, None). The when-string is something reminder.parse_when understands."""
+    for rx in _WHEN_PATTERNS:
+        m = rx.search(low)
+        if not m:
+            continue
+        phrase = m.group(0)
+        span = m.span()
+        if phrase.startswith(("tomorrow", "today", "in ", "tonight")):
+            if phrase == "tonight":
+                return "today 20:00", span
+            # normalise "tomorrow at 9am" → "tomorrow 9am" (parse_when accepts that)
+            return phrase.replace(" at ", " "), span
+        # a clock, possibly prefixed with at/by/around/@
+        cm = _CLOCK.search(phrase)
+        if cm:
+            hhmm = _clock_to_hhmm(cm.group(1), cm.group(2), cm.group(3))
+            if hhmm:
+                return hhmm, span
+    return None, None
+
+
+def parse_reminder(text: str):
+    """Deterministically pull a reminder out of a sentence. Returns {message, when, recurrence}
+    or None. Handles 'remind me to X at 7pm', 'remind me at 7pm to X', 'tomorrow at 9am remind
+    me to call mom', 'every monday remind me to update the tracker'."""
+    raw = (text or "").strip().strip(".!?")
+    low = raw.lower()
+    has_remind = bool(_REMIND_TRIGGER.search(low))
+    ev = _EVERY_RE.search(low)
+    if not has_remind and not (ev and "remind" in low):
+        return None
+    if not has_remind:
+        return None
+
+    recurrence = None
+    if ev:
+        word = ev.group(1).lower()
+        if word in ("day", "morning", "night", "evening"):
+            recurrence = "daily"
+        elif word == "week":
+            recurrence = "weekly"
+        else:
+            dow = _DOW_WORDS.get(word)
+            recurrence = f"weekly:{dow}" if dow else None
+
+    when, _span = _extract_when(low)
+    if when is None and recurrence is None:
+        return None   # a reminder with no time is just a note — let the agent handle it
+
+    # Build the message from the original text: drop the trigger, the every-phrase, the time
+    # phrase, and connective leftovers — keeping original casing for the content.
+    msg = _REMIND_TRIGGER.sub(" ", raw)
+    msg = _EVERY_RE.sub(" ", msg)
+    for rx in _WHEN_PATTERNS:
+        msg = rx.sub(" ", msg)
+    msg = re.sub(r"\b(?:to|that|about|at|by|on)\b\s*$", " ", msg, flags=re.I)
+    msg = re.sub(r"^\s*(?:to|that|about)\b", " ", msg, flags=re.I)
+    msg = re.sub(r"\s+", " ", msg).strip(" ,.:;-")
+    return {"message": msg or "reminder", "when": when, "recurrence": recurrence}
+
+
+# Goal: a future intention with a deadline.
+_GOAL_TRIGGER = re.compile(
+    r"^(?:i\s+(?:need|have|want|'ve\s+got|got)\s+to|i\s+must|remind me that i (?:need|have) to|"
+    r"remember\s+(?:that\s+)?(?:my|i)|my)\b", re.I)
+_GOAL_BY = re.compile(r"\b(?:by|before|due|deadline(?:\s+is)?|on)\b", re.I)
+_DEADLINE_PATTERNS = [
+    re.compile(r"\b(?:by|before|due(?:\s+on)?|deadline(?:\s+is)?(?:\s+on)?|on)\s+(.+)$", re.I),
+]
+
+
+def parse_goal(text: str):
+    """Pull a goal + deadline out of 'I need to finish X by Friday', 'my report deadline is
+    Oct 20', 'I have to submit the form by tomorrow'. Returns {title, deadline_text} or None.
+    Only fires when there's a clear deadline cue — otherwise it's just conversation."""
+    raw = (text or "").strip().strip(".!?")
+    low = raw.lower()
+    if not _GOAL_TRIGGER.search(low) or not _GOAL_BY.search(low):
+        return None
+    # Split on the deadline cue; everything before is the goal, after is the deadline.
+    m = _DEADLINE_PATTERNS[0].search(raw)
+    if not m:
+        return None
+    deadline_text = m.group(1).strip(" .")
+    title = raw[:m.start()].strip()
+    # Trim leading intent words so the title reads as the goal itself.
+    title = re.sub(r"^(?:i\s+(?:need|have|want|'ve\s+got|got)\s+to|i\s+must|"
+                   r"remind me that i (?:need|have) to|remember\s+(?:that\s+)?(?:my|i\s+need\s+to|i)|my)\s+",
+                   "", title, flags=re.I).strip(" ,.:;-")
+    title = re.sub(r"\s+(?:is|are|will be)$", "", title, flags=re.I).strip(" ,.:;-")
+    if not title or not deadline_text:
+        return None
+    return {"title": title, "deadline_text": deadline_text}
+
+
 # ── filesystem (verified, deterministic) ───────────────────────────────────────────
 # "create a folder called X [in my documents]", "make a file notes.txt [in X] [with ...]",
 # and the compound "folder X and a file Y in it". Deterministic so it works even when the
@@ -172,6 +312,15 @@ def match(text: str) -> FastIntent | None:
     for rx, key in _MEDIA:
         if rx.match(t):
             return FastIntent("MEDIA", {"key": key})
+
+    # Reminders & goals — deterministic creation (checked before filesystem/open so a
+    # "remind me to open X" isn't misread as an app launch).
+    rem = parse_reminder(text)
+    if rem is not None:
+        return FastIntent("REMINDER", rem)
+    goal = parse_goal(text)
+    if goal is not None:
+        return FastIntent("GOAL", goal)
 
     # Filesystem — match against the ORIGINAL text to keep names/content casing. Compound first.
     raw0 = (text or "").strip().strip(".!?")

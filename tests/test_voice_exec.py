@@ -64,8 +64,20 @@ class FastPathRouter(unittest.TestCase):
         self.assertEqual(self.fp.match("complete task 3").params["n"], 3)
         self.assertEqual(self.fp.match("mark task 2 as done").params["n"], 2)
         self.assertEqual(self.fp.match("cancel task 5").params["n"], 5)
-        # "remind me to ..." is a scheduled reminder, NOT a queue task — don't fast-path it.
-        self.assertIsNone(self.fp.match("remind me to call mom at 6pm"))
+        # "remind me to ..." is a scheduled reminder, NOT a queue task.
+        self.assertEqual(self.fp.match("remind me to call mom at 6pm").kind, "REMINDER")
+
+    def test_reminder_and_goal_intents(self):
+        r = self.fp.match("remind me at 7pm to submit the report")
+        self.assertEqual((r.kind, r.params["when"], r.params["message"]),
+                         ("REMINDER", "19:00", "submit the report"))
+        self.assertEqual(self.fp.match("every monday remind me to update the tracker").params["recurrence"],
+                         "weekly:MON")
+        g = self.fp.match("I need to finish the project report by Friday")
+        self.assertEqual((g.kind, g.params["deadline_text"]), ("GOAL", "Friday"))
+        # Not reminders/goals:
+        self.assertIsNone(self.fp.match("remind me what the capital of france is"))
+        self.assertIsNone(self.fp.match("I need coffee"))
 
     def test_filesystem_intents(self):
         a = self.fp.match("create a folder called JarvisDemo in my documents")
