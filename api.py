@@ -528,6 +528,7 @@ _tts_playing = False          # frontend reports the exact playback window
 _tts_ended_at = 0.0           # when playback last ended — mic stays muted a beat after, so the
                               # acoustic tail/reverb of JARVIS's own voice can't retrigger the VAD
 _tts_gen = 0                  # bumped per TTS clip; lets a stale mute-failsafe know it's superseded
+_tts_seq_counter = 0          # bumped per _speak() call; frontend groups a reply's streamed chunks by it
 _speaking_text = ""           # current TTS text (lowercased) — used as an echo guard
 _current_task = None          # in-flight handle_command task (for barge-in cancel)
 _speak_task: asyncio.Task[None] | None = None  # in-flight _speak task (for barge-in cancel)
@@ -4897,8 +4898,33 @@ def _arm_tts_failsafe(est_seconds: float) -> None:
         pass   # no running loop (shouldn't happen here) — frontend tts_end will still clear it
 
 
+def _split_for_tts(text: str, rest_min: int = 160) -> list[str]:
+    """Split a reply into TTS chunks so the FIRST chunk is short — just the opening
+    sentence — which is all edge-tts has to synthesize before playback can start, so
+    time-to-first-word drops from "synthesize the whole reply" to "synthesize one
+    sentence". Later sentences are merged back into chunks of at least `rest_min`
+    chars so playback doesn't turn choppy, sentence-by-sentence. Sentence-aware, never
+    splits mid-word; a single unpunctuated blob returns as one chunk (today's behavior)."""
+    text = text.strip()
+    if not text:
+        return []
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+    if len(parts) <= 1:
+        return [text]
+    chunks = [parts[0]]           # first sentence alone -> fastest possible start
+    buf = ""
+    for p in parts[1:]:
+        buf = f"{buf} {p}".strip() if buf else p
+        if len(buf) >= rest_min:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
+
+
 async def _speak(text: str) -> None:
-    global _speaking_text, _tts_playing
+    global _speaking_text, _tts_playing, _tts_seq_counter
     try:
         import edge_tts
     except ImportError:
@@ -4910,32 +4936,45 @@ async def _speak(text: str) -> None:
     if not clean:
         return
 
-    _speaking_text = clean.lower()
+    _speaking_text = clean.lower()   # echo guard covers the WHOLE reply, not just one chunk
     await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+    chunks = _split_for_tts(clean)
+    _tts_seq_counter += 1
+    seq = _tts_seq_counter
+    base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
+    rate, pitch = _voice_params(base_rate)
     try:
-        audio_bytes = b""
-        base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
-        rate, pitch = _voice_params(base_rate)
-        communicate = edge_tts.Communicate(clean, _tts_voice, rate=rate, pitch=pitch)
-        async for chunk in communicate.stream():
-            if chunk.get("type") == "audio":
-                data = chunk.get("data")
-                if isinstance(data, (bytes, bytearray)):
-                    audio_bytes += bytes(data)
-        if not audio_bytes:
+        sent_any = False
+        total_bytes = 0
+        for i, chunk in enumerate(chunks):
+            audio_bytes = b""
+            communicate = edge_tts.Communicate(chunk, _tts_voice, rate=rate, pitch=pitch)
+            async for part in communicate.stream():
+                if part.get("type") == "audio":
+                    data = part.get("data")
+                    if isinstance(data, (bytes, bytearray)):
+                        audio_bytes += bytes(data)
+            if not audio_bytes:
+                continue
+            total_bytes += len(audio_bytes)
+            is_last = i == len(chunks) - 1
+            b64 = base64.b64encode(audio_bytes).decode()
+            # Mute the mic BEFORE the first clip reaches the speakers — closes the ~100 ms gap
+            # before the frontend confirms tts_start, so no echo leading-edge leaks. Stays muted
+            # across the whole streamed sequence; the frontend's single tts_end (sent after the
+            # LAST chunk) clears it, and the failsafe (re-armed per chunk to cover all audio sent
+            # so far) clears it if that's lost. edge-tts mp3 ≈ 48 kbit/s → bytes / 6000 ≈ seconds.
+            if not sent_any:
+                _tts_playing = True
+                sent_any = True
+            _arm_tts_failsafe(total_bytes / 6000.0)
+            await broadcast({"type": "tts_audio", "data": b64, "tts_seq": seq, "final": is_last})
+        if not sent_any:
             await broadcast({"type": "tts_error",
                              "text": "Speech failed — Edge TTS returned no audio. Check internet."})
             _speaking_text = ""
             await broadcast({"type": "state", "status": "idle"})
             return
-        b64 = base64.b64encode(audio_bytes).decode()
-        # Mute the mic BEFORE the audio reaches the speakers — closes the ~100 ms gap between
-        # sending the clip and the frontend confirming tts_start, so no echo leading-edge leaks.
-        # The frontend's tts_end clears this normally; the failsafe clears it if that's lost.
-        # edge-tts mp3 ≈ 48 kbit/s → bytes / 6000 ≈ seconds of audio.
-        _tts_playing = True
-        _arm_tts_failsafe(len(audio_bytes) / 6000.0)
-        await broadcast({"type": "tts_audio", "data": b64})
     except asyncio.CancelledError:
         _speaking_text = ""
         raise

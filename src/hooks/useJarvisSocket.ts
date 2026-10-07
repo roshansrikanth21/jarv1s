@@ -63,6 +63,14 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
 
   const wsRef = useRef<WebSocket | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Streamed-TTS queue: a reply arrives as one or more `tts_audio` chunks sharing a
+  // `tts_seq`; we play them back-to-back and only end the turn (tts_end) after the
+  // chunk flagged `final`. Lets the backend start sending the first sentence while it
+  // is still synthesizing the rest, so speech starts sooner.
+  const ttsQueueRef = useRef<string[]>([]);        // pending object URLs for the active seq
+  const ttsSeqRef = useRef<number | null>(null);   // seq currently playing/queued
+  const ttsFinalRef = useRef(false);               // last chunk of this seq has arrived
+  const ttsStartedRef = useRef(false);             // tts_start already sent for this seq
   const addRef = useRef<(r: Role, t: string) => void>(null!);
   const connRef = useRef<() => void>(null!);
   const tapsRef = useRef<Set<(msg: Record<string, unknown>) => void>>(new Set());
@@ -142,36 +150,80 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
   }, []);
   addRef.current = add;
 
-  const playTts = useCallback((b64: string) => {
+  // Stop playback, drop any queued chunks, and reset the streamed-TTS sequence state.
+  const resetTtsQueue = useCallback(() => {
     if (audioRef.current) {
       audioRef.current.pause();
       audioRef.current = null;
     }
-    const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], {
-      type: "audio/mpeg",
-    });
-    const url = URL.createObjectURL(blob);
+    for (const url of ttsQueueRef.current) URL.revokeObjectURL(url);
+    ttsQueueRef.current = [];
+    ttsSeqRef.current = null;
+    ttsFinalRef.current = false;
+    ttsStartedRef.current = false;
+  }, []);
+
+  // Play the next queued chunk; when the queue drains AND the final chunk has been
+  // seen, the turn is over -> tell the backend (tts_end) so it can unmute the mic.
+  const playNextTts = useCallback(() => {
+    const url = ttsQueueRef.current.shift();
+    if (!url) {
+      if (ttsFinalRef.current) {
+        setSpeaking(false);
+        ttsSeqRef.current = null;
+        ttsStartedRef.current = false;
+        wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+      }
+      // else: queue is empty but more chunks are still coming — wait for them.
+      return;
+    }
     const a = new Audio(url);
     audioRef.current = a;
     setSpeaking(true);
-    const end = () => {
-      setSpeaking(false);
+    const advance = () => {
       URL.revokeObjectURL(url);
-      audioRef.current = null;
-      wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
+      if (audioRef.current === a) audioRef.current = null;
+      playNextTts();
     };
-    a.onended = end;
-    a.onerror = end;
+    a.onended = advance;
+    a.onerror = advance;
     a.play()
-      .then(() => wsRef.current?.send(JSON.stringify({ action: "tts_start" })))
+      .then(() => {
+        if (!ttsStartedRef.current) {
+          ttsStartedRef.current = true;
+          wsRef.current?.send(JSON.stringify({ action: "tts_start" }));
+        }
+      })
       .catch(() => {
         addRef.current(
           "system",
           "Audio blocked by the browser — click the orb or send a message first, then try again.",
         );
-        end();
+        resetTtsQueue();
+        setSpeaking(false);
+        wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
       });
-  }, []);
+  }, [resetTtsQueue]);
+
+  // Enqueue one streamed chunk. `seq` groups a reply's chunks; a new seq resets the
+  // queue. `final` marks the last chunk. A chunk with no seq (older backend) is its
+  // own one-shot sequence, so behavior is unchanged for a single, whole-reply clip.
+  const playTts = useCallback(
+    (b64: string, seq?: number, final = true) => {
+      const effSeq = typeof seq === "number" ? seq : (ttsSeqRef.current ?? 0) + 1;
+      if (ttsSeqRef.current !== effSeq) {
+        resetTtsQueue();
+        ttsSeqRef.current = effSeq;
+      }
+      if (final) ttsFinalRef.current = true;
+      const blob = new Blob([Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))], {
+        type: "audio/mpeg",
+      });
+      ttsQueueRef.current.push(URL.createObjectURL(blob));
+      if (!audioRef.current) playNextTts();
+    },
+    [resetTtsQueue, playNextTts],
+  );
 
   const connect = useCallback(() => {
     const cur = wsRef.current;
@@ -245,15 +297,17 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
           resetStream();
           addRef.current("agent", txt);
         }
-        if (d.type === "tts_audio" && d.data) playTts(d.data as string);
+        if (d.type === "tts_audio" && d.data)
+          playTts(
+            d.data as string,
+            typeof d.tts_seq === "number" ? (d.tts_seq as number) : undefined,
+            d.final !== false,
+          );
         if ((d.type === "system" || d.type === "tts_error") && txt.trim()) {
           addRef.current("system", txt);
         }
         if (d.type === "tts_stop") {
-          if (audioRef.current) {
-            audioRef.current.pause();
-            audioRef.current = null;
-          }
+          resetTtsQueue();
           setSpeaking(false);
           resetStream();
           wsRef.current?.send(JSON.stringify({ action: "tts_end" }));
@@ -305,7 +359,7 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
         /* ignore malformed packet */
       }
     };
-  }, [playTts, scheduleReconnect, flushPendingActions, resetStream, scheduleFlush]);
+  }, [playTts, resetTtsQueue, scheduleReconnect, flushPendingActions, resetStream, scheduleFlush]);
   connRef.current = connect;
 
   useEffect(() => {
