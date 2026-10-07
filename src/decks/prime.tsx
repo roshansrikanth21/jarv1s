@@ -21,9 +21,12 @@ const CoreOrb3D = lazy(() =>
 /* ── types (mirrors api.py payloads) ─────────────────────── */
 type Task = {
   id: number;
+  tid?: string;
   t: string;
   eta?: string;
   status: "queued" | "active" | "done";
+  state?: "created" | "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled";
+  error?: string;
   at?: string;
 };
 type ToolInfo = { name: string; description: string };
@@ -1473,7 +1476,8 @@ export default function PrimeDeck() {
                     <div>
                       <div className="pr-task-label">{t.t}</div>
                       <div className="pr-task-meta">
-                        {t.status}
+                        {t.tid ? `${t.tid} · ` : ""}
+                        {t.state ?? t.status}
                         {t.eta ? ` · ${t.eta}` : ""}
                       </div>
                     </div>
@@ -1484,6 +1488,11 @@ export default function PrimeDeck() {
                     <span className="pr-task-dot" />
                     <div>
                       <div className="pr-task-label">{t.t}</div>
+                      <div className="pr-task-meta">
+                        {t.tid ? `${t.tid} · ` : ""}
+                        {t.state ?? "done"}
+                        {t.state === "failed" && t.error ? ` — ${t.error}` : ""}
+                      </div>
                     </div>
                   </div>
                 ))}

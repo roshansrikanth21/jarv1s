@@ -105,6 +105,14 @@ _MEDIA = [
     (re.compile(r"^(?:previous|prev|last)(?:\s+(?:track|song))?$", re.I), "prevtrack"),
 ]
 
+# ── task queue ────────────────────────────────────────────────────────────────────
+# Explicit "add a task ..." only — unambiguous queue intent. NOT "remind me to ..." (that's
+# a scheduled reminder, a different tool). Fast-pathing this guarantees the task is really
+# created instead of the model sometimes just replying "done".
+_TASK_ADD = re.compile(r"^(?:add|create|queue|new)\s+(?:a\s+|an\s+)?task\s*(?:to|for|that|:|-|called)?\s*(.+)$", re.I)
+_TASK_DONE = re.compile(r"^(?:complete|finish|close|mark)\s+task\s+#?(\d+)(?:\s+(?:as\s+)?(?:done|complete|completed|finished))?$", re.I)
+_TASK_CANCEL = re.compile(r"^cancel\s+task\s+#?(\d+)$", re.I)
+
 # ── wifi / lock / screenshot ──────────────────────────────────────────────────────
 _WIFI = re.compile(r"^(?:turn\s+)?(?:wifi|wireless)\s+(on|off)$|^(?:turn\s+)?(on|off)\s+(?:the\s+)?wifi$", re.I)
 _LOCK = re.compile(r"^lock\s+(?:my\s+|the\s+)?(?:pc|computer|screen|laptop|machine|desktop|workstation|session)$", re.I)
@@ -143,6 +151,21 @@ def match(text: str) -> FastIntent | None:
     for rx, key in _MEDIA:
         if rx.match(t):
             return FastIntent("MEDIA", {"key": key})
+
+    m = _TASK_DONE.match(t)
+    if m:
+        return FastIntent("TASK_DONE", {"n": int(m.group(1))})
+    m = _TASK_CANCEL.match(t)
+    if m:
+        return FastIntent("TASK_CANCEL", {"n": int(m.group(1))})
+    # Match the ADD description against the ORIGINAL text so the task keeps the user's casing
+    # (e.g. "review the PR", not "review the pr").
+    raw = (text or "").strip().strip(".!?,;: ")
+    m = _TASK_ADD.match(raw)
+    if m:
+        desc = m.group(1).strip(" .")
+        if desc and len(desc) >= 2:
+            return FastIntent("TASK_ADD", {"text": desc})
 
     m = _WIFI.match(t)
     if m:

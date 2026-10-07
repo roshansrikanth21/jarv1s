@@ -49,9 +49,12 @@ type LineRole = "user" | "agent" | "system" | "tool";
 type Line = { id: string; role: LineRole; text: string; at: string };
 type Task = {
   id: number;
+  tid?: string;
   t: string;
   eta?: string;
   status: "queued" | "active" | "done";
+  state?: "created" | "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled";
+  error?: string;
   at?: string;
 };
 type ToolInfo = { name: string; description: string };
@@ -2980,7 +2983,12 @@ function AnimatedTask({ task, done = false }: { task: Task; done?: boolean }) {
       )}
       <div className="flex-1 min-w-0">
         <p className="hud-task-label">{task.t}</p>
-        {task.eta && <p className="hud-task-meta">{task.eta}</p>}
+        <p className="hud-task-meta">
+          {task.tid ? `${task.tid} · ` : ""}
+          {task.state ?? task.status}
+          {task.eta ? ` · ${task.eta}` : ""}
+          {task.state === "failed" && task.error ? ` — ${task.error}` : ""}
+        </p>
       </div>
     </motion.div>
   );

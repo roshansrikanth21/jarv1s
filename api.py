@@ -72,6 +72,7 @@ import jarvis.act.desktop as desktop
 import jarvis.act.web_search as websearch_mod
 import jarvis.act.fastpath as fastpath
 import jarvis.act.verify as verify
+import jarvis.act.wake as wake
 
 import cortex
 from jarvis.memory.dialogue import DialogueStore
@@ -82,6 +83,7 @@ from jarvis.cognition.router import plan_from_governor, provider_for_rung, healt
 from jarvis.events.bus import bus as _event_bus
 from jarvis.platform import telemetry as _telemetry
 from jarvis.session.state import SessionState, WorkflowPhase
+from jarvis.session.tasks import TaskManager
 
 logging.basicConfig(
     level=os.environ.get("JARVIS_LOG_LEVEL", "INFO"),
@@ -94,6 +96,7 @@ MEMORY_FILE   = BASE_DIR / "memory" / "jarvis_memory.json"
 HISTORY_FILE  = BASE_DIR / "memory" / "jarvis_history.json"
 OVERHEARD_FILE = BASE_DIR / "memory" / "jarvis_overheard.json"  # rolling ambient speech log
 TASKS_FILE    = BASE_DIR / "memory" / "jarvis_tasks.json"
+TASK_SEQ_FILE = BASE_DIR / "memory" / "jarvis_task_seq.json"  # monotonic TASK-### counter
 SETTINGS_FILE = BASE_DIR / "memory" / "jarvis_settings.json"
 GOVERNOR_FILE = BASE_DIR / "memory" / "jarvis_governor.json"
 PERSONA_FILE  = BASE_DIR / "memory" / "jarvis_persona.json"
@@ -524,6 +527,7 @@ _overheard_dirty = 0           # utterances since last persist (throttles disk w
 _main_loop:  asyncio.AbstractEventLoop | None = None
 _listening = False
 _awake_until = 0.0             # armed-for-command deadline after a bare wake word
+_last_ack_at = 0.0            # last time a wake-ack played — dedupes acoustic + text wake
 _listen_thread: threading.Thread | None = None
 _voice_lock = threading.Lock() # serializes mic start/stop so they can't spawn two InputStreams
 # Whisper rate gate — a trigger-happy mic (noisy room / weak VAD) can fire dozens of
@@ -849,6 +853,17 @@ async def broadcast(data: dict) -> None:
 def broadcast_from_thread(data: dict) -> None:
     if _main_loop and not _main_loop.is_closed():
         asyncio.run_coroutine_threadsafe(broadcast(data), _main_loop)
+
+
+# Task lifecycle manager — owns task state (stable TASK-### ids, real states), operates in
+# place on `task_list` so every existing reader/snapshot keeps working, and persists +
+# broadcasts on every change so all UIs stay in sync.
+def _tasks_changed(items: list[dict]) -> None:
+    _save_tasks()
+    broadcast_from_thread({"type": "tasks", "tasks": items})
+
+
+_tasks = TaskManager(task_list, TASK_SEQ_FILE, on_change=_tasks_changed)
 
 
 async def _emit_content_panel(title: str, body: str) -> None:
@@ -1551,7 +1566,21 @@ TOOLS: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "task_id": {"type": "integer", "description": "Task ID to complete"},
+                    "task_id": {"type": "string", "description": "Task id to complete, e.g. TASK-003 (a bare number also works)"},
+                },
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_task",
+            "description": "Cancel a queued or running task (it won't be done).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task id to cancel, e.g. TASK-003 (a bare number also works)"},
                 },
                 "required": ["task_id"],
             },
@@ -2739,28 +2768,20 @@ def execute_tool(name: str, args: dict[str, Any], gen: int | None = None) -> str
         return desktop.run(action, args)
 
     if name == "add_task":
-        task = {
-            "id": _next_id(task_list),
-            "t": args["task"],
-            "eta": args.get("eta", ""),
-            "status": "queued",
-            "at": datetime.now().strftime("%H:%M"),
-        }
-        task_list.append(task)
-        _save_tasks()
-        broadcast_from_thread({"type": "tasks", "tasks": task_list})
-        return f"Task added: {args['task']}"
+        task = _tasks.create(args["task"], args.get("eta", ""))
+        return f"Task added ({task['tid']}): {args['task']}"
 
     if name == "complete_task":
-        tid = args["task_id"]
-        for t in task_list:
-            if t["id"] == tid:
-                t["status"] = "done"
-                t["at"] = datetime.now().strftime("%H:%M")
-                _save_tasks()
-                broadcast_from_thread({"type": "tasks", "tasks": task_list})
-                return f"Task {tid} marked complete."
-        return f"Task {tid} not found."
+        it = _tasks.complete(args["task_id"])
+        if it is None:
+            return f"Task {args['task_id']} not found."
+        return f"{it['tid']} marked complete."
+
+    if name == "cancel_task":
+        it = _tasks.cancel(args["task_id"])
+        if it is None:
+            return f"Task {args['task_id']} not found."
+        return f"{it['tid']} cancelled."
 
     if name == "capture_screen":
         try:
@@ -3706,7 +3727,7 @@ async def _emit_final(text: str) -> None:
 # this keeps a typical tool call around ~1.5k tool-tokens instead of ~5.7k.
 _CORE_TOOLS = {
     "remember", "recall_memory", "search_web", "calculate", "get_weather",
-    "get_system_info", "add_task", "complete_task", "run_command", "launch_app",
+    "get_system_info", "add_task", "complete_task", "cancel_task", "run_command", "launch_app",
     "close_app", "capture_screen", "use_skill", "create_skill",
 }
 _TOOL_GROUPS: list[tuple[re.Pattern, set[str]]] = [
@@ -4848,10 +4869,25 @@ async def _prewarm_wake_acks() -> None:
             pass
 
 
+def _acoustic_wake_fire() -> None:
+    """Called from the capture thread when the openWakeWord detector hears 'hey jarvis':
+    arm the command window and play the ack — WITHOUT Whisper, so the wake is near-instant.
+    The following utterance is transcribed and taken as the command via the _awake_until
+    window (same path as a text-matched bare wake)."""
+    global _awake_until
+    if time.time() - _last_ack_at < 1.5:
+        return   # already acknowledged a wake a moment ago — don't double-fire
+    _awake_until = time.time() + WAKE_WINDOW
+    broadcast_from_thread({"type": "voice", "state": "wake"})
+    if _main_loop and not _main_loop.is_closed():
+        asyncio.run_coroutine_threadsafe(_wake_ack(), _main_loop)
+
+
 async def _wake_ack() -> None:
     """Heard a bare 'jarvis' — acknowledge and open the command window. Any speech mid-
     reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
-    global _speaking_text, _tts_playing
+    global _speaking_text, _tts_playing, _last_ack_at
+    _last_ack_at = time.time()
     await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
     phrase = random.choice(WAKE_ACKS)
     cached = _wake_ack_cache.get((phrase, _tts_voice))
@@ -5005,6 +5041,18 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
 
     if kind == "SCREENSHOT":
         return _save_screenshot(), True
+
+    if kind == "TASK_ADD":
+        task = _tasks.create(p["text"])
+        return f"Added it — that's {task['tid']}.", True
+
+    if kind == "TASK_DONE":
+        it = _tasks.complete(p["n"])
+        return (f"{it['tid']} marked done." if it else f"I don't see a task number {p['n']}."), True
+
+    if kind == "TASK_CANCEL":
+        it = _tasks.cancel(p["n"])
+        return (f"{it['tid']} cancelled." if it else f"I don't see a task number {p['n']}."), True
 
     return "", False
 
@@ -5958,7 +6006,8 @@ def _voice_worker() -> None:
             if not cmd:
                 # Bare "jarvis" — arm the window and cue the user to say the command.
                 _awake_until = now + WAKE_WINDOW
-                _run(_wake_ack())
+                if time.time() - _last_ack_at >= 1.5:   # the acoustic engine may have just acked
+                    _run(_wake_ack())
                 return
             _act(cmd)                    # "jarvis <command>" in one breath
             return
@@ -6034,6 +6083,14 @@ def _voice_worker() -> None:
     except Exception:
         _vad = None
 
+    # Optional dedicated acoustic wake engine (openWakeWord). Off unless JARVIS_WAKE_ENGINE=
+    # openwakeword and the package is installed; None keeps the reliable text-match wake. When
+    # active it fires on the raw frames in ~tens of ms, independent of Whisper — so "hey jarvis"
+    # wakes near-instantly and the FOLLOWING utterance is transcribed as the command.
+    _wake_det = wake.maybe_create()
+    if _wake_det is not None:
+        broadcast_from_thread({"type": "system", "text": "Acoustic wake word active (openWakeWord)."})
+
     # Loudness floor a frame must clear (mean |amplitude| of int16) to count as speech, on top
     # of the spectral VAD. ~250 keeps distant TV / fans / room tone from triggering while normal
     # talking near the mic clears it easily. Raise if background still gets through, lower if it
@@ -6103,6 +6160,17 @@ def _voice_worker() -> None:
                 while len(leftover) >= FRAME:
                     frame = leftover[:FRAME]
                     leftover = leftover[FRAME:]
+
+                    # Dedicated acoustic wake (optional): runs on every frame, independent of
+                    # the VAD/Whisper path below, so "hey jarvis" fires near-instantly. Muted
+                    # while JARVIS is speaking so it can't trigger on its own voice.
+                    if _wake_det is not None and not _tts_muted():
+                        try:
+                            if _wake_det.triggered(frame):
+                                broadcast_from_thread({"type": "voice", "state": "transcribing"})
+                                _acoustic_wake_fire()
+                        except Exception:
+                            pass
 
                     energy = int(np.abs(frame).mean())
                     # A working mic always has a noise floor. Nine straight seconds of exact

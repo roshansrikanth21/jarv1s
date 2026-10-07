@@ -290,6 +290,10 @@ This is both the latency win (simple commands finish in well under a second inst
 
 **Debug mode.** With `JARVIS_DEBUG=1` (or the UI toggle) every turn emits a `debug_trace` with per-stage timings — `stt`, `route`, `exec`, `verify`, `respond`, `total` — to the ops console, and the same breakdown is logged at INFO (`[trace] …`). Use it to find the real bottleneck before optimizing.
 
+**Tasks.** The task queue is backend-owned state (`jarvis/session/tasks.py`), not UI state — it survives a deck switch and reads the same from every view. Each task has a stable, never-reused id (`TASK-001`, `TASK-002`, …) and a real lifecycle: *created → queued → running → waiting → completed*, or *failed* / *cancelled*. "add a task to …", "complete task 3", and "cancel task 2" take the deterministic fast path so the task is actually created/updated (not just acknowledged); the `add_task` / `complete_task` / `cancel_task` tools accept a `TASK-###` or a bare number.
+
+**Wake word.** The default path transcribes each utterance and string-matches "jarvis" (reliable, but gated by STT speed). For a dedicated, near-instant acoustic wake, `pip install openwakeword` and set `JARVIS_WAKE_ENGINE=openwakeword` — it runs openWakeWord's pretrained *hey jarvis* model on the raw audio frames, independent of Whisper, and the following utterance is taken as the command. It's optional and falls back to the text match if the package or model is unavailable; the threshold (`JARVIS_WAKE_THRESHOLD`) is mic-dependent and worth tuning.
+
 ---
 
 ## Troubleshooting
@@ -324,6 +328,8 @@ Copy `.env.example` → `.env`. Common keys (full comments live in `.env.example
 | `JARVIS_FASTPATH` | Deterministic fast path for simple OS commands (default on; `0` forces everything through the agent) |
 | `JARVIS_DEBUG` | Emit a per-turn latency trace (`debug_trace`) to the ops console; also toggleable live from the UI |
 | `JARVIS_CLIENT_GRACE_SEC` | Seconds to keep the mic/tasks alive after the last client drops, so a deck switch doesn't kill them (default 3) |
+| `JARVIS_WAKE_ENGINE` | `text` (default, Whisper + string match) or `openwakeword` (dedicated acoustic engine; needs `pip install openwakeword`) |
+| `JARVIS_WAKE_MODEL` / `JARVIS_WAKE_THRESHOLD` | openWakeWord model (default `hey_jarvis`) and detection threshold (default `0.5`, tune live per mic) |
 | `JARVIS_EMOTION` / `JARVIS_SARCASM` | Affect layer (`0` disables emotion) |
 | `JARVIS_HOME_CITY` | Pin ambient location |
 | `JARVIS_SHELL_APPROVAL` / `JARVIS_APPROVAL_TOOLS` | UI confirm before privileged tools (default includes `run_command`) |

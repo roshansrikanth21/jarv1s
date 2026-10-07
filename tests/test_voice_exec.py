@@ -58,6 +58,15 @@ class FastPathRouter(unittest.TestCase):
         # "turn it up" must be VOLUME, never OPEN_APP "it up".
         self.assertEqual(self.fp.match("turn it up").kind, "VOLUME")
 
+    def test_task_intents(self):
+        self.assertEqual(self.fp.match("add a task to review the PR").params["text"], "review the PR")
+        self.assertEqual(self.fp.match("create task buy milk").params["text"], "buy milk")
+        self.assertEqual(self.fp.match("complete task 3").params["n"], 3)
+        self.assertEqual(self.fp.match("mark task 2 as done").params["n"], 2)
+        self.assertEqual(self.fp.match("cancel task 5").params["n"], 5)
+        # "remind me to ..." is a scheduled reminder, NOT a queue task — don't fast-path it.
+        self.assertIsNone(self.fp.match("remind me to call mom at 6pm"))
+
 
 class VerifyHelpers(unittest.TestCase):
     def setUp(self):
