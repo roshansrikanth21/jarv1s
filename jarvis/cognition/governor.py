@@ -49,7 +49,7 @@ def _np():
 # latency = wall-clock prior. `requires` gates feasibility; `local` marks on-device.
 RUNGS: list[dict] = [
     {"id": "local_fast", "label": "local · fast",  "kind": "local",   "tier": 0,
-     "quality": 0.46, "energy": 0.45, "latency": 0.55, "requires": "ollama", "local": True},
+     "quality": 0.34, "energy": 0.45, "latency": 0.55, "requires": "ollama", "local": True},
     {"id": "cloud_fast", "label": "cloud · fast",  "kind": "cloud",   "tier": 1,
      "quality": 0.76, "energy": 0.12, "latency": 0.25, "requires": "groq",   "local": False},
     {"id": "local_deep", "label": "local · deep",  "kind": "local",   "tier": 1,
@@ -86,6 +86,11 @@ _MULTISTEP_WORDS = {"then", "after", "first", "step", "plan", "design", "compare
 _HARD_WORDS = {"exploit", "vulnerability", "reverse", "cryptography", "proof", "prove",
                "optimi", "algorithm", "concurren", "lock-free", "race condition",
                "threat model", "rationale", "distributed", "kernel", "pointer", "throughput"}
+_SHORT_CHAT_RE = re.compile(
+    r"^(?:hi|hello|hey(?: jarvis)?|good morning|good afternoon|good evening|good night|"
+    r"thanks|thank you|yes|no|ok|okay|cool|nice|how are you|what's up|whats up|who are you)[.!? ]*$",
+    re.I,
+)
 
 
 def estimate_difficulty(text: str, history: list[dict] | None = None) -> dict:
@@ -107,8 +112,10 @@ def estimate_difficulty(text: str, history: list[dict] | None = None) -> dict:
         score += 0.16                       # multi-part technical asks compound
     if hard >= 0.5 and (code or mathy):
         score += 0.12                       # hard domain + formal/code => genuinely deep
-    # Very short greetings / acks are trivial regardless.
-    if words <= 3 and not (code or mathy):
+    # Don't classify every short request as trivial: "explain photosynthesis" and
+    # "capital of Japan" need knowledge even though they're only a few words.
+    is_short_chat = bool(_SHORT_CHAT_RE.fullmatch(t))
+    if is_short_chat and not (code or mathy):
         score = min(score, 0.12)
     score = max(0.0, min(1.0, score))
     return {
@@ -312,7 +319,11 @@ def decide(text: str, history: list[dict] | None, device: dict,
 
     lam = lambda_eff(device, mode)
     x = _feature_vector(diff["score"], device)
-    min_q = 0.35 + 0.60 * diff["score"]       # quality bar implied by difficulty
+    # The smallest local rung is often a 1–2B model (on this machine, a tiny coder
+    # model). Keep it for acknowledgements, but route real questions to a stronger
+    # available model instead of treating their low heuristic difficulty as proof
+    # that the small model will answer accurately.
+    min_q = 0.30 if _SHORT_CHAT_RE.fullmatch((text or "").strip()) else 0.35 + 0.60 * diff["score"]
 
     def _cost(r: dict) -> float:
         # Energy + learned latency (EWMA from this machine), minus bandit bonus.
