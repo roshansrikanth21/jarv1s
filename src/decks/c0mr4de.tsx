@@ -40,12 +40,42 @@ export default function Comr4deDeck() {
     respondApproval,
   } = useJarvisSocket("c0mr4de console online. Authorized targets only. Type a task or [MIC].");
   const [input, setInput] = useState("");
+  const [modelLabel, setModelLabel] = useState<string>("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 9e6 });
   }, [lines.length, stream]);
+
+  // Show which model is active, and (if none is) what the advisor suggests picking -
+  // including already-downloaded local models it found on disk.
+  useEffect(() => {
+    let alive = true;
+    const load = () => {
+      fetch("/api/models")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!alive || !d) return;
+          const active = d.active as { deep?: string; enabled?: boolean } | undefined;
+          const sug = d.suggestion as { name?: string; ready?: boolean; kind?: string } | undefined;
+          if (active?.enabled && active.deep) {
+            setModelLabel(`local: ${active.deep}`);
+          } else if (sug?.name) {
+            setModelLabel(sug.ready ? `pick: ${sug.name}` : `import: ${sug.name}`);
+          } else {
+            setModelLabel("cloud brain");
+          }
+        })
+        .catch(() => {});
+    };
+    load();
+    const t = setInterval(load, 15000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, []);
 
   const submit = () => {
     if (!input.trim()) return;
@@ -88,7 +118,14 @@ export default function Comr4deDeck() {
             fontSize: 11,
           }}
         >
-          <span style={{ letterSpacing: "0.2em", color: RED, fontWeight: 700 }}>c0mr4de</span>
+          <span>
+            <span style={{ letterSpacing: "0.2em", color: RED, fontWeight: 700 }}>c0mr4de</span>
+            {modelLabel && (
+              <span style={{ marginLeft: 10, fontSize: 10, color: OK, opacity: 0.9 }}>
+                {modelLabel}
+              </span>
+            )}
+          </span>
           <span style={{ opacity: 0.85 }}>
             {mood?.enabled ? `[${mood.emotion}] ` : ""}
             {connected

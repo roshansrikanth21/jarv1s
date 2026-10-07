@@ -252,15 +252,23 @@ def register(app: FastAPI) -> None:
             dev = core.device.profile()
             budget = core.models_advisor.model_budget(dev)
             ranked = core.models_advisor.ranked_for_device(dev, set())
+            # Scan disk for already-downloaded GGUF models regardless of Ollama state -
+            # "the ones I already downloaded" may be raw files Ollama never registered.
+            raw_disk = core.models_advisor.scan_disk_models()
+            disk_dirs = [str(p) for p in core.models_advisor.common_model_dirs()]
             if not up:
+                disk = core.models_advisor.annotate_disk_models(dev, raw_disk, set())
                 return {"ollama": False, "tier": dev.get("tier"), "budget": budget,
                         "recommended": core.models_advisor.recommend_for_device(dev, set()),
                         "ranked": ranked,
                         "benchmarks": core.models_advisor.load_benchmarks(),
-                        "allowed_count": len(core.models_advisor.allowed_models(dev))}
+                        "allowed_count": len(core.models_advisor.allowed_models(dev)),
+                        "disk": disk, "disk_dirs": disk_dirs,
+                        "suggestion": core.models_advisor.suggest_local(dev, [], disk)}
             inst = core.models_advisor.annotate_installed(dev, core.models_advisor.installed(with_caps=True))
             names = {m["name"] for m in inst}
             ranked = core.models_advisor.ranked_for_device(dev, names)
+            disk = core.models_advisor.annotate_disk_models(dev, raw_disk, names)
             out = {"ollama": True, "version": ver, "tier": dev.get("tier"),
                     "installed": inst, "running": core.models_advisor.running(),
                     "recommended": core.models_advisor.recommend_for_device(dev, names),
@@ -269,9 +277,24 @@ def register(app: FastAPI) -> None:
                     "budget": budget,
                     "allowed_count": len(core.models_advisor.allowed_models(dev)),
                     "active": {"fast": core.LOCAL_FAST, "deep": core.LOCAL_DEEP, "enabled": core._LOCAL_OK},
-                    "pinned": core._settings.get("local_model")}
+                    "pinned": core._settings.get("local_model"),
+                    "disk": disk, "disk_dirs": disk_dirs,
+                    "suggestion": core.models_advisor.suggest_local(dev, inst, disk)}
             return out
         return await asyncio.to_thread(_gather)
+
+    @app.post("/api/models/import_gguf")
+    async def import_gguf_endpoint(body: dict) -> dict:
+        """Register a scanned .gguf with Ollama (ollama create) so JARVIS can run it.
+        Body: {path: str, name?: str}. Returns {ok, model|error, manual?}."""
+        path = (body or {}).get("path", "")
+        name = (body or {}).get("name") or None
+        if not path:
+            return {"ok": False, "error": "path is required"}
+        res = await asyncio.to_thread(core.models_advisor.import_gguf, path, name)
+        if res.get("ok"):
+            await asyncio.to_thread(core._detect_local_models)
+        return res
 
 
     @app.get("/api/models/loaded")
