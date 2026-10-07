@@ -6,6 +6,7 @@ import TerminalDeck from "@/decks/terminal";
 import PrimeDeck from "@/decks/prime";
 import ChatDeck from "@/decks/chat";
 import StarkDeck from "@/decks/stark";
+import Comr4deDeck from "@/decks/c0mr4de";
 import { Onboarding } from "@/components/jarvis/Onboarding";
 import { ArcReactor } from "@/components/jarvis/ArcReactor";
 import { BootIntro } from "@/components/jarvis/BootIntro";
@@ -43,6 +44,7 @@ const PRESETS = [
   { id: "overhaul", label: "Command Deck" },
   { id: "focus", label: "Focus" },
   { id: "terminal", label: "Terminal" },
+  { id: "c0mr4de", label: "c0mr4de" },
   { id: "chat", label: "Chat" },
 ];
 const DECKS = {
@@ -51,6 +53,7 @@ const DECKS = {
   overhaul: OverhaulDeck,
   focus: FocusDeck,
   terminal: TerminalDeck,
+  c0mr4de: Comr4deDeck,
   chat: ChatDeck,
 } as const;
 
