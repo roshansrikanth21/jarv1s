@@ -47,6 +47,7 @@ You interact through an Electron app with several UI decks (Prime, Stark, Comman
   - [Tools](#tools)
   - [Skills](#skills)
   - [OpenClaw](#openclaw)
+  - [Telegram bot (direct)](#telegram-bot-direct)
   - [Optional: Docker pentest image](#optional-docker-pentest-image)
   - [Repository layout](#repository-layout)
   - [Development checks](#development-checks)
@@ -59,7 +60,7 @@ You interact through an Electron app with several UI decks (Prime, Stark, Comman
 
 | Area | Maturity | What’s in the tree |
 | --- | --- | --- |
-| Voice (VAD → STT → wake → TTS) | **Beta** | `webrtcvad-wheels` / energy gate; local `faster-whisper`; Groq Whisper fallback; Edge TTS |
+| Voice (VAD → STT → wake → TTS) | **Beta** | `webrtcvad-wheels`; local `faster-whisper` (`base.en`); Groq Whisper fallback; Microsoft Edge neural TTS |
 | Governor routing | **Beta** | Lattice + LinUCB (`jarvis/cognition/governor.py`) |
 | Cortex memory | **Beta** | SQLite WAL + optional Chroma; WordHash embeddings if Ollama embed model missing |
 | Desktop / OS control | **Beta** | Windows-oriented (`desktop.py`) |
@@ -444,6 +445,22 @@ venv\Scripts\python -m jarvis.agent_mcp --http 8766 --host 0.0.0.0
 and on the OpenClaw side: `openclaw mcp add jarvis --url http://<pc-ip>:8766/mcp --transport streamable-http --header "Authorization=Bearer <token>" --timeout 180`. The server refuses to start without the token. The JARVIS backend itself stays on loopback; only the bridge port is exposed.
 
 Under the hood the bridge calls `POST /api/ask` (`{"message", "speak", "timeout_s"}` → `{"status", "reply", "tools", "elapsed_s"}`). Unlike `/api/command` it waits for the turn and returns what JARVIS said. Remote turns go through the same dispatch as voice and typed input, so they show up in the HUD, can be barged in on (`status: "interrupted"`), and privileged tools still wait for approval in the UI. `/api/ask` accepts loopback/trusted-origin callers, or only a matching bearer once `JARVIS_AGENT_TOKEN` is set.
+
+## Telegram bot (direct)
+
+The direct Telegram bridge polls Telegram from this PC and forwards private messages to the running JARVIS backend at `127.0.0.1:8000/api/ask`. It does not require a webhook, public URL, or inbound port. The PC, JARVIS backend, and bridge process must remain running.
+
+Create a bot with @BotFather and keep its token private. Install the isolated bridge environment and start the interactive launcher:
+
+```powershell
+py -3 -m venv .venv-telegram
+.\.venv-telegram\Scripts\python.exe -m pip install -r requirements-telegram.txt
+.\scripts\start_telegram_bot.ps1
+```
+
+The launcher asks for the bot token without echoing it, the allowed Telegram user ID, and (only if configured by the backend) the matching `JARVIS_AGENT_TOKEN`. On the first run, leave the user ID blank, open a private chat with the bot, and send `/id`. Stop the bridge with Ctrl+C, then launch it again and enter that numeric ID. The bridge rejects non-private chats and every sender outside the ID allowlist. `/start` and `/id` remain available to identify the owner during pairing.
+
+Telegram turns call `/api/ask` with `speak=false`, so replies appear in Telegram without playing desktop audio. The turn uses JARVIS's normal tools and memory. Privileged shell commands still require the existing desktop approval. Do not disable `JARVIS_SHELL_APPROVAL` for Telegram access.
 
 ---
 

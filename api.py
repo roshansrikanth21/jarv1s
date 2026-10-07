@@ -21,6 +21,7 @@ import random
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -535,6 +536,7 @@ _listening = False
 _user_stopped_voice = False    # True after an explicit stop — tells the supervisor NOT to recover
 _awake_until = 0.0             # armed-for-command deadline after a bare wake word
 _last_ack_at = 0.0            # last time a wake-ack played — dedupes acoustic + text wake
+_awake_utterance_id = 0        # lets the UI keep the wake acknowledgement tied to the heard phrase
 _listen_thread: threading.Thread | None = None
 _voice_lock = threading.Lock() # serializes mic start/stop so they can't spawn two InputStreams
 # Whisper rate gate — a trigger-happy mic (noisy room / weak VAD) can fire dozens of
@@ -815,7 +817,11 @@ if isinstance(_settings.get("store_overheard"), bool):
 
 
 def _ollama_chat_options(**extra) -> dict:
-    opts = {"keep_alive": OLLAMA_KEEP_ALIVE}
+    # Small local models are prone to confidently filling gaps. Keep sampling
+    # conservative; this improves consistency, though it cannot make a tiny
+    # model as capable as a larger one.
+    opts = {"keep_alive": OLLAMA_KEEP_ALIVE,
+            "temperature": 0.2, "top_p": 0.9, "repeat_penalty": 1.1}
     opts.update(extra)
     return opts
 
@@ -1092,7 +1098,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     await websocket.send_json({"type": "state", "status": "connected"})
     # Tell this client the real mic state up front so its UI doesn't guess (a fresh client
     # showing "tap to speak" while the mic is already hot under ALWAYS_LISTEN was the desync).
-    await websocket.send_json({"type": "mic", "listening": _listening})
+    await websocket.send_json({"type": "mic", "listening": _listening,
+                               "wake_required": WAKE_REQUIRED,
+                               "wake_word": WAKE_WORDS[0] if WAKE_WORDS else "jarvis"})
+    await websocket.send_json({"type": "voice", "state": "listening" if _listening else "off",
+                               "text": (f'Waiting for "Hey {WAKE_WORDS[0].title()}".'
+                                        if WAKE_REQUIRED else "Ready for speech.") if _listening else "Microphone is off."})
     # Snapshot: the backend is the source of truth, the UI is a view. A client that just
     # mounted (first load OR a deck/preset switch that remounted the socket) gets the live
     # task list and recent conversation replayed so nothing *looks* lost on a UI change —
@@ -1145,6 +1156,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 _tts_playing = False
                 _tts_ended_at = time.time()   # start the acoustic-tail cooldown
                 _speaking_text = ""
+                if _awake_until > time.time():
+                    asyncio.create_task(_activate_wake_window(_awake_utterance_id, wait_for_tail=True))
+                elif _listening:
+                    asyncio.create_task(_resume_voice_status())
             elif action == "set_voice":
                 vid = data.get("voice", "")
                 if vid in {v["id"] for v in VOICE_OPTIONS}:
@@ -3623,6 +3638,8 @@ Language matching: reply in the same language the user is using. Match their reg
 
 Grounding: when a tool returns data, your answer MUST be built from that exact data — quote the real numbers/values it gave you. Never invent or hand-wave a result, and never pad with unrelated facts about the user. If a tool failed or returned nothing, say so plainly.
 
+Accuracy: If you are unsure, say so instead of guessing. Treat tool errors and empty results as failures. Never say an app opened, a message was sent, a file changed, or a live fact was checked unless a tool result explicitly confirms it.
+
 NEVER FABRICATE ACTIONS OR RESULTS. This is absolute. You have not done something unless a tool actually returned the result to you in this conversation. Do not claim to have run a scan, launched an attack, created or read a file, or found ports/vulns/paths unless the matching tool call produced that output. Do not invent progress updates, log files, log contents, or findings. If a task needs a tool, CALL THE TOOL — do not describe what it would output. If you were asked to recon or pentest a target, you MUST call the `recon` or `pentest` tool; narrating scan results you didn't get from the tool is a serious failure. If you haven't run it yet, say "running it now" and actually call the tool — never pretend it's done.
 
 This applies just as hard to opening/closing apps and desktop control. NEVER say "Done", "Opened", "Closed", or "I've launched it" unless the `launch_app` / `close_app` / `desktop` tool returned a success to you. Those tools VERIFY the real OS state and tell you exactly what happened — relay that verbatim in spirit. If a tool says it couldn't confirm, couldn't find the app, or failed, say that plainly ("I couldn't open X — it may not be installed") and do NOT dress it up as success. A wrong "done" is worse than an honest "that didn't work."
@@ -4159,6 +4176,8 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
     model = _groq_model_for(decision, use_tools)
     tool_subset = _relevant_tools(text) if use_tools else None
     final_answer = ""
+    requires_tool = _needs_tools(text)
+    ran_tool = False
     keys_tried = 1   # rotate through additional keys on rate-limit, each at most once per turn
     swapped_model = False
     for _ in range(8):
@@ -4244,6 +4263,7 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
                                                  "function": {"name": name,
                                                               "arguments": json.dumps(args)}}]})
                 obs = await _run_tool(name, args)
+                ran_tool = True
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": obs})
                 continue
             if full_text.strip():
@@ -4275,8 +4295,11 @@ async def _brain_groq(text: str, history: list[dict], *, decision: dict, device:
             if not isinstance(args, dict):   # Groq sometimes streams 'null'
                 args = {}
             obs = await _run_tool(tc["name"], args)
+            ran_tool = True
             messages.append({"role": "tool", "tool_call_id": tc["id"], "content": obs})
 
+    if requires_tool and not ran_tool:
+        return ""
     return final_answer
 
 
@@ -4289,6 +4312,8 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
     # model can't act and (rightly forbidden from fabricating) returns nothing.
     use_tools = governor.agent_needs_tools(decision, device) or _needs_tools(text)
     final_answer = ""
+    requires_tool = _needs_tools(text)
+    ran_tool = False
     for _ in range(8):
         req: dict = {
             "model": CLAUDE_MODEL,
@@ -4308,6 +4333,7 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
                     raw_in = block.input
                     tool_args = dict(raw_in) if isinstance(raw_in, dict) else {}
                     obs = await _run_tool(block.name, tool_args)
+                    ran_tool = True
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -4323,7 +4349,7 @@ async def _brain_claude(text: str, history: list[dict], *, decision: dict, devic
         ).strip()
         break
 
-    return final_answer
+    return "" if requires_tool and not ran_tool else final_answer
 
 
 # ── Ollama agent loop (fallback) ────────────────────────────────────────────────
@@ -4354,6 +4380,8 @@ async def _brain_ollama(
         return (response.message.content or "").strip()
 
     final_answer = ""
+    requires_tool = _needs_tools(text)
+    ran_tool = False
     for _ in range(8):
         response = await client.chat(model=model, messages=messages, tools=TOOLS, options=opts)
         msg = response.message
@@ -4381,7 +4409,11 @@ async def _brain_ollama(
                 except Exception:
                     tool_args = {}
             obs = await _run_tool(tc.function.name, tool_args)
+            ran_tool = True
             messages.append({"role": "tool", "content": obs})
+
+    if requires_tool and not ran_tool:
+        return ""
 
     # Small local models often "fumble" tools: they emit an empty answer plus a spurious tool
     # call for a question that needed none (llama3.2:3b does this on plain Q&A). If the tool
@@ -4531,7 +4563,8 @@ _TOOL_INTENT_RE = re.compile(
     r"remember|recall|forget|memoriz|"
     r"open|launch|start|screenshot|capture|screen|"
     r"search|google|look up|browse|website|url|http|download|"
-    r"weather|market|price|stock|nifty|sensex|"
+    r"weather|forecast|temperature|rain|market|price|stock|nifty|sensex|"
+    r"current(?:ly)?|latest|recent|news|right now|"
     r"cpu|memory|ram|disk|processes|system info|uptime|"
     r"upload|read the file|pdf|"
     r"remind|reminder)\b",
@@ -5020,6 +5053,13 @@ def _match_wake_word(text: str):
     if not t:
         return None
     tokens = t.split()
+    # Some recognizers collapse a two-word wake phrase into one token, especially
+    # on a quick "Hey Jarvis". Split the common greeting prefixes before matching.
+    if tokens:
+        first = tokens[0]
+        for greeting in ("hello", "hey", "hiya", "hi"):
+            if first.startswith(greeting) and _wake_fuzzy(first[len(greeting):]):
+                return " ".join(tokens[1:]).strip(" ,.!:;-'\"")
     for idx in range(min(2, len(tokens))):          # wake word in the first one or two tokens
         tok = tokens[idx]
         hit = False
@@ -5098,6 +5138,9 @@ async def _wake_ack() -> None:
     reply is barged in on (the ack replaces it), so this doubles as an interrupt."""
     global _speaking_text, _tts_playing, _last_ack_at
     _last_ack_at = time.time()
+    await broadcast({"type": "voice", "state": "armed_wait",
+                     "text": "Wait for the acknowledgment to finish.",
+                     "utterance_id": _awake_utterance_id})
     await broadcast({"type": "state", "status": "listening", "text": "Yes? I'm listening…"})
     phrase = random.choice(WAKE_ACKS)
     cached = _wake_ack_cache.get((phrase, _tts_voice))
@@ -5112,6 +5155,39 @@ async def _wake_ack() -> None:
     else:
         await _schedule_speak(phrase)
         asyncio.create_task(_prewarm_wake_acks())   # warm the cache for next time
+
+
+async def _expire_wake_window(deadline: float, utterance_id: int) -> None:
+    """Return the pill to wake-word mode when an unused command window expires."""
+    global _awake_until
+    await asyncio.sleep(max(0.0, deadline - time.time()))
+    if _awake_until == deadline and time.time() >= deadline:
+        _awake_until = 0.0
+        await broadcast({"type": "voice", "state": "listening",
+                         "text": f'Waiting for "Hey {WAKE_WORDS[0].title()}".',
+                         "utterance_id": utterance_id})
+
+
+async def _activate_wake_window(utterance_id: int, *, wait_for_tail: bool = False) -> None:
+    """Start the user's full command window after the wake acknowledgement is finished."""
+    global _awake_until
+    deadline = time.time() + WAKE_WINDOW
+    _awake_until = deadline
+    if wait_for_tail:
+        await asyncio.sleep(0.4)
+    if _awake_until == deadline and time.time() < deadline:
+        await broadcast({"type": "voice", "state": "armed",
+                         "text": "Your turn — say your request now.",
+                         "utterance_id": utterance_id})
+        asyncio.create_task(_expire_wake_window(deadline, utterance_id))
+
+
+async def _resume_voice_status() -> None:
+    """Show wake-word readiness again after JARVIS's playback tail has cleared."""
+    await asyncio.sleep(0.4)
+    if _listening and not _tts_playing:
+        await broadcast({"type": "voice", "state": "listening",
+                         "text": f'Waiting for "Hey {WAKE_WORDS[0].title()}".' if WAKE_REQUIRED else "Ready for speech."})
 
 
 async def _stop_speaking() -> None:
@@ -5718,6 +5794,10 @@ def _arm_tts_failsafe(est_seconds: float) -> None:
         if _tts_gen == gen and _tts_playing:   # not superseded, and tts_end never cleared it
             _tts_playing = False
             _tts_ended_at = time.time()
+            if _awake_until > time.time():
+                await _activate_wake_window(_awake_utterance_id, wait_for_tail=True)
+            elif _listening:
+                await _resume_voice_status()
 
     try:
         asyncio.create_task(_clear())
@@ -5778,7 +5858,10 @@ async def _speak(text: str) -> None:
         return
 
     _speaking_text = clean.lower()
-    await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+    # Keep the voice-status pill honest while synthesis runs.
+    if _listening and _awake_until <= time.time():
+        await broadcast({"type": "voice", "state": "preparing",
+                         "text": "Preparing the reply. Say the wake phrase if you need to interrupt."})
     base_rate = _homeostasis(_last_device)["tts_rate"] if _last_device else TTS_RATE
     rate, pitch = _voice_params(base_rate)
 
@@ -5789,6 +5872,10 @@ async def _speak(text: str) -> None:
     # ~14 chars/sec of speech is a safe lower bound for the duration estimate.
     _tts_playing = True
     _arm_tts_failsafe(max(2.0, len(clean) / 14.0))
+    await broadcast({"type": "state", "status": "speaking", "text": "Speaking..."})
+    if _listening:
+        await broadcast({"type": "voice", "state": "speaking",
+                         "text": "JARVIS is speaking. The microphone is paused until playback ends."})
     try:
         sent_any = False
         for i, piece in enumerate(chunks):
@@ -5807,6 +5894,10 @@ async def _speak(text: str) -> None:
             await broadcast({"type": "tts_error",
                              "text": "Speech failed — Edge TTS returned no audio. Check internet."})
             _speaking_text = ""
+            if _awake_until > time.time():
+                await _activate_wake_window(_awake_utterance_id)
+            elif _listening:
+                await _resume_voice_status()
             await broadcast({"type": "state", "status": "idle"})
             return
     except asyncio.CancelledError:
@@ -5814,7 +5905,14 @@ async def _speak(text: str) -> None:
         raise
     except Exception as exc:
         _speaking_text = ""
-        await broadcast({"type": "tts_error", "text": f"Speech failed: {exc}"})
+        _tts_playing = False
+        _tts_ended_at = time.time()
+        await broadcast({"type": "tts_error",
+                         "text": f"Speech failed: Edge TTS is unavailable ({exc}). Check your internet connection and try again."})
+        if _awake_until > time.time():
+            await _activate_wake_window(_awake_utterance_id)
+        elif _listening:
+            await _resume_voice_status()
     await broadcast({"type": "state", "status": "idle"})
 
 
@@ -5838,7 +5936,10 @@ async def _start_voice() -> None:
         _listen_thread.start()
     hint = f"Listening — say \"{WAKE_WORDS[0]}\" to wake me." if WAKE_REQUIRED else "Listening..."
     await broadcast({"type": "state", "status": "listening", "text": hint})
-    await broadcast({"type": "mic", "listening": True})   # authoritative — UI mirrors this
+    await broadcast({"type": "mic", "listening": True, "wake_required": WAKE_REQUIRED,
+                     "wake_word": WAKE_WORDS[0] if WAKE_WORDS else "jarvis"})
+    await broadcast({"type": "voice", "state": "listening",
+                     "text": f'Waiting for "Hey {WAKE_WORDS[0].title()}".' if WAKE_REQUIRED else "Ready for speech."})
     asyncio.create_task(_prewarm_wake_acks())             # so the "Yes, sir." ack is instant
     _warm_local_whisper()                                  # so the first utterance isn't stuck behind model load
 
@@ -5850,6 +5951,7 @@ def _stop_voice() -> None:
         _listening = False
     broadcast_from_thread({"type": "state", "status": "idle", "text": "Mic off."})
     broadcast_from_thread({"type": "mic", "listening": False})
+    broadcast_from_thread({"type": "voice", "state": "off", "text": "Microphone is off."})
 
 
 # Whisper hallucinates these stock phrases on silence/noise — drop them.
@@ -5873,7 +5975,7 @@ def _is_stt_noise(text: str) -> bool:
     # A single very short word is almost always a noise artifact.
     if len(t.split()) == 1 and len(alnum) <= 2:
         return True
-    # Repetition = hallucination. On noise, tiny.en loops one phrase dozens of times
+    # Repetition = hallucination. Whisper can loop one phrase dozens of times on noise
     # ("take a look at how take a look at how ...", "see you in the next video, see you ...").
     # Real speech has variety; a transcript whose words are mostly the same handful, OR that
     # contains a phrase repeated 3+ times back-to-back, is a hallucination.
@@ -5960,7 +6062,7 @@ def _stt_available() -> bool:
 
 
 def _get_local_whisper():
-    """Process-level singleton faster-whisper model (CPU, int8, tiny.en) — the default STT
+    """Process-level singleton faster-whisper model (CPU, int8, base.en) — the default STT
     backend: offline, free, no per-request quota. Loaded lazily on first use so app boot
     isn't delayed; returns None (and stays None) if it can't load, so callers fall back to
     Groq's cloud Whisper."""
@@ -5976,7 +6078,7 @@ def _get_local_whisper():
             _phys = psutil.cpu_count(logical=False) or 2
             _threads = max(1, min(4, int(os.environ.get("JARVIS_STT_THREADS", str(_phys)))))
             _whisper_model = WhisperModel(
-                os.environ.get("JARVIS_STT_MODEL", "tiny.en"),
+            os.environ.get("JARVIS_STT_MODEL", "base.en"),
                 device="cpu",
                 compute_type="int8",
                 cpu_threads=_threads,
@@ -6000,7 +6102,7 @@ def _transcribe_local(pcm16, sample_rate: int):
     should fall back to Groq).
 
     Heavily hardened against Whisper's #1 failure mode: on background noise or near-silence,
-    tiny.en HALLUCINATES — usually a short phrase looped dozens of times ("thanks for watching,
+    Small Whisper models hallucinate — usually a short phrase looped dozens of times ("thanks for watching,
     see you in the next video, ..." / "take a look at how take a look at how ..."). Three gates
     kill it: (1) faster-whisper's built-in Silero VAD strips non-speech BEFORE decoding; (2)
     per-segment confidence — drop anything the model itself thinks is silence (high
@@ -6036,6 +6138,8 @@ def _transcribe_local(pcm16, sample_rate: int):
                 if getattr(seg, "no_speech_prob", 0.0) > 0.6:
                     continue
                 if getattr(seg, "avg_logprob", 0.0) < -1.0:
+                    continue
+                if getattr(seg, "compression_ratio", 0.0) > 2.2:
                     continue
                 kept.append(seg.text)
             return " ".join(kept).strip()
@@ -6107,6 +6211,7 @@ def _voice_stopped() -> None:
     global _listening
     _listening = False
     broadcast_from_thread({"type": "mic", "listening": False})
+    broadcast_from_thread({"type": "voice", "state": "off", "text": "Microphone is off."})
     broadcast_from_thread({"type": "audio_level", "level": 0})
 
 
@@ -6298,12 +6403,22 @@ def _voice_session() -> str:
     # before the peak-normalize below could rescue it). Universal across mics — not gain-tuned.
     MIN_UTTER_ENERGY = int(os.environ.get("JARVIS_MIN_UTTER_ENERGY", "150"))
 
-    def _flush(pcm16) -> None:
+    def _voice_feedback(state: str, text: str = "", utterance_id: int | None = None) -> None:
+        packet = {"type": "voice", "state": state}
+        if text:
+            packet["text"] = text
+        if utterance_id is not None:
+            packet["utterance_id"] = utterance_id
+        broadcast_from_thread(packet)
+
+    def _flush(pcm16, utterance_id: int) -> None:
         """Transcribe one utterance. `pcm16` is a 1-D int16 numpy array, 16 kHz mono."""
-        global _audio_arousal, _awake_until
+        global _audio_arousal, _awake_until, _awake_utterance_id
         if pcm16 is None or len(pcm16) < MIN_UTTER_SAMPLES:
+            _voice_feedback("not_heard", "That was too short to catch. Try again.", utterance_id)
             return
         if int(np.abs(pcm16).mean()) < MIN_UTTER_ENERGY:
+            _voice_feedback("not_heard", "I didn't catch clear speech. Try again.", utterance_id)
             return
         audio = pcm16.astype(np.float32)
         try:
@@ -6318,7 +6433,12 @@ def _voice_session() -> str:
         text = _transcribe(audio.astype(np.int16), 16000)
         stt_ms = (time.perf_counter() - _t_stt) * 1000.0
         if not text:
+            _voice_feedback("not_heard", "I didn't catch that clearly. Try saying “Hey Jarvis” again.", utterance_id)
             return
+
+        # Show the recognition result even if it didn't include the wake word.
+        # A failed wake attempt should never look like the mic ignored the user.
+        _voice_feedback("heard", text, utterance_id)
 
         # Ambient memory: log EVERYTHING heard first, so JARVIS can relate to it later.
         # This is independent of the wake word — acting still requires it (below).
@@ -6329,11 +6449,13 @@ def _voice_session() -> str:
         def _act(command: str) -> None:
             global _awake_until
             _awake_until = 0.0
+            _voice_feedback("accepted", "Request received.", utterance_id)
             broadcast_from_thread({"type": "transcription", "text": command})
             _run(dispatch_command(command, source="voice", stt_ms=stt_ms))
 
         if not WAKE_REQUIRED:
             if _is_echo(text) or _is_stt_noise(text):
+                _voice_feedback("not_heard", "I didn't catch that clearly. Try again.", utterance_id)
                 return
             if text.strip().lower() in STOP_WORDS:
                 _run(_stop_speaking())
@@ -6347,6 +6469,7 @@ def _voice_session() -> str:
             # This utterance was addressed to JARVIS ("jarvis ..." or bare "jarvis").
             cmd = after.strip()
             if _is_echo(cmd):
+                _voice_feedback("not_heard", "That sounded like my own voice. Try again.", utterance_id)
                 return
             if cmd.lower() in STOP_WORDS:
                 _awake_until = 0.0
@@ -6354,9 +6477,15 @@ def _voice_session() -> str:
                 return
             if not cmd:
                 # Bare "jarvis" — arm the window and cue the user to say the command.
-                _awake_until = now + WAKE_WINDOW
+                # Provisional deadline prevents an indefinitely armed UI if the
+                # acknowledgement never completes. The actual user window starts
+                # after tts_end (or the speech failsafe), not while the ack plays.
+                _awake_until = now + WAKE_WINDOW + 30.0
+                _awake_utterance_id = utterance_id
+                _voice_feedback("armed_wait", "Wait for the acknowledgment to finish.", utterance_id)
                 if time.time() - _last_ack_at >= 1.5:   # the acoustic engine may have just acked
                     _run(_wake_ack())
+                _run(_expire_wake_window(_awake_until, utterance_id))
                 return
             _act(cmd)                    # "jarvis <command>" in one breath
             return
@@ -6372,6 +6501,8 @@ def _voice_session() -> str:
                 _run(_stop_speaking())
                 return
             _act(cmd)
+        else:
+            _voice_feedback("unaddressed", text, utterance_id)
         # else: overheard but not addressed to JARVIS — already logged, nothing to do.
 
     # One dedicated STT worker (queue-and-worker), NOT a thread per utterance. Two reasons:
@@ -6385,15 +6516,17 @@ def _voice_session() -> str:
     def _stt_worker() -> None:
         while _listening:
             try:
-                pcm16 = stt_q.get(timeout=0.3)
+                item = stt_q.get(timeout=0.3)
             except Q.Empty:
                 continue
-            if pcm16 is None:
+            if item is None:
                 break
+            pcm16, utterance_id = item
             try:
-                _flush(pcm16)
+                _flush(pcm16, utterance_id)
             except Exception as exc:
                 broadcast_from_thread({"type": "system", "text": f"STT worker error: {exc}"})
+                _voice_feedback("not_heard", "I couldn't process that phrase. Try again.", utterance_id)
 
     def _flush_async(pcm16) -> None:
         try:
@@ -6440,18 +6573,19 @@ def _voice_session() -> str:
     if _wake_det is not None:
         broadcast_from_thread({"type": "system", "text": "Acoustic wake word active (openWakeWord)."})
 
-    # Loudness floor a frame must clear (mean |amplitude| of int16) to count as speech, on top
-    # of the spectral VAD. ~250 keeps distant TV / fans / room tone from triggering while normal
-    # talking near the mic clears it easily. Raise if background still gets through, lower if it
-    # misses you.
-    MIN_SPEECH_ENERGY = int(os.environ.get("JARVIS_MIC_MIN_ENERGY", "250"))
+    # A modest loudness floor on top of the spectral VAD. Kept low (150) so a soft/low-gain
+    # "hey jarvis" still clears it; Whisper confidence, compression, and repetition filters
+    # reject the extra noise segments after capture. Raise via JARVIS_MIC_MIN_ENERGY if a noisy
+    # room keeps triggering needless transcriptions.
+    MIN_SPEECH_ENERGY = int(os.environ.get("JARVIS_MIC_MIN_ENERGY", "150"))
 
     FRAME = 480                          # 30 ms @ 16 kHz — the frame size WebRTC VAD requires
     START_PAD, START_VOICED = 6, 3       # ~3/6 voiced frames (~90–180 ms) opens the segment —
     #                                      sensitive enough to catch a quick/soft "Jarvis"
-    END_PAD, END_UNVOICED = 12, 10       # end only on a clean ~360 ms pause (won't cut a sentence)
+    END_PAD, END_UNVOICED = 30, 24       # require ~720 ms of silence, not ordinary clause pauses
     RING_MAX = max(START_PAD, END_PAD)   # keep the larger window; doubles as the pre-roll buffer
-    MAX_UTTER_FRAMES = int(14000 / 30)   # ~14 s hard cap
+    MAX_UTTER_SEC = max(15, min(180, int(os.environ.get("JARVIS_MAX_UTTER_SEC", "60"))))
+    MAX_UTTER_FRAMES = int(MAX_UTTER_SEC * 1000 / 30)  # configurable cap; 60 s by default
 
     def _resample16(mono_f32):
         if sample_rate == 16000 or len(mono_f32) < 2:
@@ -6473,6 +6607,7 @@ def _voice_session() -> str:
             ring = deque(maxlen=RING_MAX)             # (frame, is_speech) — recent window + pre-roll
             triggered = False
             voiced: list = []
+            utterance_id = 0
             level_tick = 0
             dead_frames = 0                           # consecutive digital-silence frames (~30 ms each)
             dead_warned = False
@@ -6541,7 +6676,8 @@ def _voice_session() -> str:
                         # not on ambient hiss (the whole point of the spectral VAD).
                         broadcast_from_thread({"type": "audio_level",
                                                "level": min(energy * 6, 32767),
-                                               "energy": energy, "hearing": triggered})
+                                               "energy": energy, "hearing": triggered,
+                                               "thresh": MIN_SPEECH_ENERGY})
 
                     if _vad is not None:
                         try:
@@ -6563,24 +6699,26 @@ def _voice_session() -> str:
                         if len(recent) >= START_PAD and sum(1 for _, s in recent if s) >= START_VOICED:
                             triggered = True
                             voiced = [f for f, _ in ring]          # pre-roll → never clips the onset
-                            broadcast_from_thread({"type": "voice", "state": "hearing"})
+                            utterance_id += 1
+                            broadcast_from_thread({"type": "voice", "state": "hearing",
+                                                   "utterance_id": utterance_id})
                     else:
                         voiced.append(frame)
-                        recent = list(ring)[-END_PAD:]             # last ~360 ms
+                        recent = list(ring)[-END_PAD:]             # last ~900 ms
                         ended = len(recent) >= END_PAD and sum(1 for _, s in recent if not s) >= END_UNVOICED
                         if ended or len(voiced) >= MAX_UTTER_FRAMES:
                             triggered = False
                             # Don't flush a segment that ended right as JARVIS started talking —
                             # it's almost certainly the leading edge of the echo.
                             if not _tts_muted():
-                                broadcast_from_thread({"type": "voice", "state": "transcribing"})
-                                _flush_async(np.concatenate(voiced))
+                                broadcast_from_thread({"type": "voice", "state": "transcribing",
+                                                       "utterance_id": utterance_id})
+                                _flush_async((np.concatenate(voiced), utterance_id))
                             voiced = []
                             ring.clear()
-                            broadcast_from_thread({"type": "voice", "state": "listening"})
 
             if triggered and voiced and not _tts_muted():   # flush an in-progress utterance on mic-off
-                _flush_async(np.concatenate(voiced))
+                _flush_async((np.concatenate(voiced), utterance_id))
 
         # Loop exited because _listening went False → an intentional stop.
         reason = "user"
@@ -6642,7 +6780,7 @@ async def _broadcast_models_loaded() -> None:
 
 # ── HTTP API (routers/rest.py) ───────────────────────────────────────────────────
 from routers.rest import register as _register_rest  # noqa: E402
-_register_rest(app)
+_register_rest(app, core=sys.modules[__name__])
 
 # ── Entry ──────────────────────────────────────────────────────────────────────
 def _bind_port(host: str, preferred: int) -> socket.socket:
