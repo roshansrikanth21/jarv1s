@@ -89,7 +89,7 @@ def _norm(text: str) -> str:
 
 
 # ── web: search / youtube / sites ─────────────────────────────────────────────────
-_BROWSERS = r"(?:the\s+|a\s+)?(?:web\s+)?(?:browser|chrome|google\s+chrome|edge|microsoft\s+edge|firefox|brave)"
+_BROWSERS = r"(?:the\s+|a\s+)?(?:web\s+)?(?:browser|chrome|google\s+chrome|edge|microsoft\s+edge|firefox|brave|opera\s*gx|opera)"
 _SEARCH_VERB = r"(?:search(?:\s+(?:the\s+web|online|google|the\s+internet))?(?:\s+for)?|google|look\s+up|find)"
 _WEB_SEARCH = [
     # "open (the) browser/chrome and search (for) X"
@@ -154,7 +154,9 @@ def _clean_query(q: str) -> str:
 
 def _browser_key(raw: str | None) -> str:
     b = (raw or "").lower()
-    for key in ("chrome", "edge", "firefox", "brave"):
+    if "opera" in b and "gx" in b:
+        return "opera gx"
+    for key in ("opera", "chrome", "edge", "firefox", "brave"):
         if key in b:
             return key
     return ""                                   # the default browser

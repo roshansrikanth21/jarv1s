@@ -5349,23 +5349,65 @@ def _fmt_deadline(iso: str) -> str:
     return d.strftime(fmt)
 
 
+# Browsers reachable by the shell's App Paths lookup (`start chrome <url>`) — no hard-coded
+# install path needed. Opera is handled separately (full-path launch) because its folder name
+# has a space ("Opera GX") that `start` mis-parses, and its App Paths entry is unreliable.
 _BROWSER_EXE = {"chrome": "chrome", "edge": "msedge", "firefox": "firefox", "brave": "brave"}
+
+
+def _opera_exe(gx: bool) -> str | None:
+    """Full path to the installed Opera (or Opera GX) launcher, or None. Opera installs
+    per-user under %LOCALAPPDATA%/Programs; some builds keep opera.exe in a versioned subdir,
+    so we glob for the newest."""
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs",
+                        "Opera GX" if gx else "Opera")
+    candidates = []
+    direct = os.path.join(base, "opera.exe")
+    if os.path.exists(direct):
+        candidates.append(direct)
+    try:
+        import glob
+        candidates += glob.glob(os.path.join(base, "*", "opera.exe"))
+    except Exception:
+        pass
+    candidates = [c for c in candidates if os.path.exists(c)]
+    return max(candidates, key=os.path.getmtime) if candidates else None
+
+
+def _browser_fullpath(browser: str) -> str | None:
+    """Resolve a browser name that needs a full-path launch (Opera / Opera GX) to its exe."""
+    b = (browser or "").lower().replace("_", " ")
+    if "opera" in b and ("gx" in b or b.strip() == "opera gx"):
+        return _opera_exe(gx=True)
+    if "opera" in b:
+        return _opera_exe(gx=False) or _opera_exe(gx=True)
+    return None
 
 
 def _open_in_browser(url: str, browser: str = "") -> str | None:
     """Open `url` in the named browser (or the default one). Returns None on success, else
-    a short reason. Uses the shell's App Paths lookup (`start chrome <url>`), which finds
-    installed browsers without hard-coded install paths."""
-    exe = _BROWSER_EXE.get(browser or "")
+    a short reason."""
     try:
+        # Opera / Opera GX: launch by full path (its folder name has a space that `start`
+        # botches, and it's the user's logged-in browser — no isolated-profile CAPTCHA wall).
+        full = _browser_fullpath(browser) if browser else None
+        if full:
+            subprocess.Popen([full, url], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+            return None
+        exe = _BROWSER_EXE.get(browser or "")
         if exe and sys.platform == "win32":
             r = subprocess.run(["cmd", "/c", "start", "", exe, url], capture_output=True,
                                text=True, timeout=8, creationflags=0x08000000)
             if r.returncode == 0:
                 return None
             log.info("browser %s unavailable (%s) — using the default browser", exe, r.stderr.strip())
+        if browser and not exe:
+            # A named browser we don't special-case (e.g. "opera" not found) — fall back to the
+            # default browser rather than failing, so the search still happens.
+            log.info("browser %s not resolved — using the default browser", browser)
         if sys.platform == "win32":
-            os.startfile(url)                    # default browser
+            os.startfile(url)                    # default browser (Opera GX, here)
         else:
             import webbrowser
             if not webbrowser.open(url):
