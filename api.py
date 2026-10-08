@@ -539,6 +539,13 @@ app.add_middleware(
 
 # ── State ──────────────────────────────────────────────────────────────────────
 active_connections: list[WebSocket] = []
+# Only one renderer should play synthesized speech. The desktop UI may coexist with
+# a browser tab and the mic-monitor/pill sockets; broadcasting `tts_audio` to every
+# socket made multiple full UI clients speak the same reply at once. Audio-capable
+# clients identify themselves with `?client=desktop` or `?client=web`; monitor-only
+# sockets never become playback owners.
+_audio_output_clients: list[tuple[WebSocket, str]] = []
+_audio_output_owner: WebSocket | None = None
 # Remote callers (POST /api/ask, used by the OpenClaw MCP bridge) need the reply of the
 # turn they started, but replies only go out via broadcast(). A caller registers a queue
 # here for the life of its turn; broadcast() copies llm_response + agent_tool events in.
@@ -878,6 +885,28 @@ def _ict_cache_put(key: tuple, value: dict) -> None:
 
 
 # ── WebSocket broadcast ────────────────────────────────────────────────────────
+def _refresh_audio_output_owner() -> WebSocket | None:
+    """Keep one playback renderer, preferring the desktop app over browser tabs."""
+    global _audio_output_owner
+    _audio_output_clients[:] = [
+        (ws, role) for ws, role in _audio_output_clients if ws in active_connections
+    ]
+    current_role = next(
+        (role for ws, role in _audio_output_clients if ws is _audio_output_owner), None
+    )
+    desktop = next((ws for ws, role in _audio_output_clients if role == "desktop"), None)
+    web = next((ws for ws, role in _audio_output_clients if role == "web"), None)
+    if current_role == "desktop":
+        return _audio_output_owner
+    if desktop is not None:
+        _audio_output_owner = desktop
+    elif current_role == "web":
+        return _audio_output_owner
+    else:
+        _audio_output_owner = web
+    return _audio_output_owner
+
+
 async def broadcast(data: dict) -> None:
     if _reply_listeners and data.get("type") in ("llm_response", "agent_tool"):
         for q in list(_reply_listeners):
@@ -886,7 +915,12 @@ async def broadcast(data: dict) -> None:
     # concurrent connect/disconnect mutating the live list mid-iteration could
     # otherwise silently skip a socket (list iteration doesn't raise on resize).
     dead: list[WebSocket] = []
-    for ws in list(active_connections):
+    if data.get("type") == "tts_audio":
+        owner = _refresh_audio_output_owner()
+        targets = [owner] if owner is not None else []
+    else:
+        targets = list(active_connections)
+    for ws in targets:
         try:
             await ws.send_json(data)
         except Exception:
@@ -896,6 +930,8 @@ async def broadcast(data: dict) -> None:
             active_connections.remove(ws)
         except ValueError:
             pass
+    if dead:
+        _refresh_audio_output_owner()
 
 
 def broadcast_from_thread(data: dict) -> None:
@@ -1124,6 +1160,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         return
     await websocket.accept()
     active_connections.append(websocket)
+    client_role = websocket.query_params.get("client", "")
+    if client_role in {"desktop", "web"}:
+        _audio_output_clients.append((websocket, client_role))
+        _refresh_audio_output_owner()
     # No text: the UI already shows its own greeting on mount, and decks that
     # surface a non-empty "state" text (classic/overhaul) would otherwise
     # duplicate it with server/network language ("uplink established") that
@@ -1253,6 +1293,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             active_connections.remove(websocket)
         except ValueError:
             pass
+        _refresh_audio_output_owner()
         # A client that disconnects mid-playback can never send its tts_end. Release the mute
         # here so the mic can't stay wedged (there are no speakers playing once it's gone).
         if not active_connections:
@@ -4576,8 +4617,13 @@ async def _brain_ollama(
     final_answer = ""
     requires_tool = _needs_tools(text)
     ran_tool = False
+    # Local models are smaller and much more sensitive to an oversized tool menu.
+    # The Groq adapter already sends this request-specific subset; giving Ollama all
+    # ~25 schemas made simple desktop actions fall through with no tool call at all.
+    tool_subset = _relevant_tools(text)
     for _ in range(8):
-        response = await client.chat(model=model, messages=messages, tools=TOOLS, options=opts)
+        response = await client.chat(model=model, messages=messages,
+                                     tools=tool_subset, options=opts)
         msg = response.message
 
         if not msg.tool_calls:
@@ -4822,10 +4868,27 @@ async def _run_agent(text: str) -> None:
 
     dev = await asyncio.to_thread(device.profile)
     _last_device = dev
-    avail = _available_rungs()
+    # Apply the user's routing mode before building the provider plan. Passing every
+    # configured rung to plan_from_governor let its tool preference silently replace a
+    # local-mode choice with cloud_fast (and replaced cloud mode with local fallback).
+    # That made Telegram/desktop actions ignore the selected brain when tools were needed.
+    configured = _available_rungs()
+    if _gov.mode == "local":
+        avail = {r for r in configured if governor.RUNG_BY_ID.get(r, {}).get("local")}
+    elif _gov.mode == "cloud":
+        avail = {r for r in configured if not governor.RUNG_BY_ID.get(r, {}).get("local")}
+    elif _gov.mode == "eco":
+        avail = configured - {"council"}
+    else:
+        avail = configured
     if not avail:
-        await _emit_final("No brain is configured yet — add a Groq or Anthropic key in "
-                          "Settings, or start Ollama for fully-local mode.")
+        if _gov.mode == "local":
+            message = "Local mode needs a runnable Ollama model. Start Ollama and choose a model that fits your available memory."
+        elif _gov.mode == "cloud":
+            message = "Cloud mode needs a working Groq or Anthropic API key in Settings."
+        else:
+            message = "No brain is configured yet — add a Groq or Anthropic key in Settings, or start Ollama for fully-local mode."
+        await _emit_final(message)
         return
 
     cloud_rungs = {"cloud_fast", "cloud_deep", "council"}
@@ -5139,8 +5202,14 @@ async def _benchmark_model(model: str) -> None:
     if not model:
         return
     await broadcast({"type": "model_bench", "model": model, "status": "running"})
-    res = await asyncio.to_thread(models_advisor.benchmark, model)
-    await broadcast({"type": "model_bench", "status": "done", **res})
+    try:
+        res = await asyncio.to_thread(models_advisor.benchmark, model)
+    except Exception as exc:
+        # The UI needs the model on every completion event to clear its spinner.
+        res = {"ok": False, "error": str(exc)}
+    ok = bool(res.get("ok"))
+    await broadcast({"type": "model_bench", **res, "model": model,
+                     "status": "done" if ok else "error"})
     await _broadcast_models_loaded()
 
 
@@ -5562,7 +5631,7 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
         return (f"Here's {q} on YouTube." if not err else f"I couldn't open YouTube — {err}."), True
 
     if kind == "OPEN_URL":
-        err = _open_in_browser(p["url"])
+        err = _open_in_browser(p["url"], p.get("browser", ""))
         site = p.get("site") or p["url"]
         return (f"Opening {site}." if not err else f"I couldn't open {site} — {err}."), True
 

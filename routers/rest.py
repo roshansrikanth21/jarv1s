@@ -221,6 +221,13 @@ def register(app: FastAPI, core=None) -> None:
             if vid in {v["id"] for v in core.VOICE_OPTIONS}:
                 core._tts_voice = vid
                 core._settings["voice"] = vid
+                # The API is also called by the Settings panel. Update the already
+                # constructed engine as well; changing only _tts_voice left it speaking
+                # the previous (possibly unavailable) voice until the next backend restart.
+                engine = getattr(core, "_tts_engine", None)
+                if engine is not None:
+                    engine.set_voice(vid)
+                    engine.warm()
                 await broadcast({"type": "voice_changed", "voice": vid})
         if "mode" in body:
             mode = (str(body.get("mode") or "")).strip()

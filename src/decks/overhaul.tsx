@@ -424,7 +424,7 @@ function CommandDeck() {
   const [models, setModels] = useState<ModelsData | null>(null);
   const [memItems, setMemItems] = useState<MemItem[]>([]);
   const [pulls, setPulls] = useState<Record<string, { status: string; pct: number }>>({});
-  const [bench, setBench] = useState<Record<string, { tok?: number; status: string }>>({});
+  const [bench, setBench] = useState<Record<string, { tok?: number; status: string; error?: string }>>({});
   const [sleepMsg, setSleepMsg] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -561,11 +561,13 @@ function CommandDeck() {
             break;
           }
           case "model_bench":
+            if (d.status === "error" && d.error) addLine("system", String(d.error));
             setBench((b) => ({
               ...b,
               [String(d.model)]: {
                 tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined,
                 status: String(d.status ?? ""),
+                error: d.status === "error" ? String(d.error ?? "Benchmark failed.") : undefined,
               },
             }));
             break;
@@ -2473,7 +2475,7 @@ function GovernorPanel(p: {
 function RigPanel(p: {
   models: ModelsData | null;
   pulls: Record<string, { status: string; pct: number }>;
-  bench: Record<string, { tok?: number; status: string }>;
+  bench: Record<string, { tok?: number; status: string; error?: string }>;
   onPull: (t: string) => void;
   onBench: (n: string) => void;
   onUse: (n: string) => void;
@@ -2675,8 +2677,19 @@ function RigPanel(p: {
                     </button>
                   )}
                   {runnable && (
-                    <button onClick={() => p.onBench(mod.name)} style={benBtn}>
-                      {b?.status === "running" ? "…" : b?.tok ? `${b.tok} tok/s` : "benchmark"}
+                    <button
+                      onClick={() => p.onBench(mod.name)}
+                      style={benBtn}
+                      disabled={b?.status === "running"}
+                      title={b?.error}
+                    >
+                      {b?.status === "running"
+                        ? "…"
+                        : b?.tok != null
+                          ? `${b.tok} tok/s`
+                          : b?.status === "error"
+                            ? "failed"
+                            : "benchmark"}
                     </button>
                   )}
                   <button

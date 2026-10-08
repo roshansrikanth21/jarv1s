@@ -124,8 +124,11 @@ export function useJarvisSocket(greeting = "JARVIS online."): JarvisSocket {
     }
   }, []);
 
-  const wsUrl = () =>
-    `${window.location.protocol === "https:" ? "wss:" : "ws:"}//${window.location.host}/ws`;
+  const wsUrl = () => {
+    const scheme = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const client = window.electronAPI ? "desktop" : "web";
+    return `${scheme}//${window.location.host}/ws?client=${client}`;
+  };
 
   const scheduleReconnect = useCallback((reason: string) => {
     if (manualCloseRef.current) return;

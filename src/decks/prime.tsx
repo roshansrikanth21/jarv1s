@@ -284,7 +284,7 @@ export default function PrimeDeck() {
   const [rungs, setRungs] = useState<Rung[]>([]);
   const [models, setModels] = useState<ModelsData | null>(null);
   const [pulls, setPulls] = useState<Record<string, { status: string; pct: number }>>({});
-  const [bench, setBench] = useState<Record<string, { tok?: number; status: string }>>({});
+  const [bench, setBench] = useState<Record<string, { tok?: number; status: string; error?: string }>>({});
   const [customModel, setCustomModel] = useState("");
   const [mems, setMems] = useState<MemItem[]>([]);
   const [sleepMsg, setSleepMsg] = useState<string | null>(null);
@@ -508,14 +508,17 @@ export default function PrimeDeck() {
             break;
           }
           case "model_bench":
-            if (d.model)
+            if (d.model) {
+              if (d.status === "error" && d.error) push({ kind: "system", text: String(d.error) });
               setBench((b) => ({
                 ...b,
                 [String(d.model)]: {
                   tok: typeof d.tok_per_sec === "number" ? d.tok_per_sec : undefined,
                   status: String(d.status ?? ""),
+                  error: d.status === "error" ? String(d.error ?? "Benchmark failed.") : undefined,
                 },
               }));
+            }
             break;
           case "model_delete":
           case "local_model_set":
@@ -1264,6 +1267,11 @@ export default function PrimeDeck() {
                                   {b?.status === "running" && (
                                     <span className="pr-badge">benching…</span>
                                   )}
+                                  {b?.status === "error" && (
+                                    <span className="pr-badge pr-badge--warn" title={b.error}>
+                                      bench failed
+                                    </span>
+                                  )}
                                   {b?.tok != null && (
                                     <span className="pr-badge pr-badge--good">
                                       {b.tok.toFixed(1)} tok/s
@@ -1290,11 +1298,19 @@ export default function PrimeDeck() {
                                     </button>
                                     <button
                                       className="pr-btn"
+                                      disabled={inst.runnable === false || b?.status === "running"}
+                                      title={inst.runnable === false ? (inst.block_reason ?? "Not enough free RAM") : b?.error}
                                       onClick={() =>
                                         sendAction("benchmark_model", { model: inst.name })
                                       }
                                     >
-                                      bench
+                                      {b?.status === "running"
+                                        ? "benching…"
+                                        : b?.status === "error"
+                                          ? "retry bench"
+                                          : b?.tok != null
+                                            ? `${b.tok.toFixed(1)} tok/s`
+                                            : "bench"}
                                     </button>
                                     <button
                                       className="pr-btn pr-btn--danger"
@@ -1372,9 +1388,17 @@ export default function PrimeDeck() {
                                 </button>
                                 <button
                                   className="pr-btn"
+                                  disabled={m.runnable === false || b?.status === "running"}
+                                  title={m.runnable === false ? (m.block_reason ?? "Not enough free RAM") : b?.error}
                                   onClick={() => sendAction("benchmark_model", { model: m.name })}
                                 >
-                                  bench
+                                  {b?.status === "running"
+                                    ? "benching…"
+                                    : b?.status === "error"
+                                      ? "retry bench"
+                                      : b?.tok != null
+                                        ? `${b.tok.toFixed(1)} tok/s`
+                                        : "bench"}
                                 </button>
                                 <button
                                   className="pr-btn pr-btn--danger"

@@ -116,7 +116,9 @@ def main() -> None:
         MessageHandler(filters.TEXT & ~filters.COMMAND, chat_with_jarvis)
     )
     log.info("Polling Telegram; JARVIS API: %s", JARVIS_URL)
-    app.run_polling()
+    # A brief outage or a network that comes online late should not permanently
+    # kill the bridge during bootstrap. Keep retrying until Telegram is reachable.
+    app.run_polling(bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

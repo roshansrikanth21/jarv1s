@@ -90,7 +90,7 @@ export function MicMonitor() {
   useEffect(() => {
     let stop = false;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    const url = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws`;
+    const url = () => `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}/ws?client=monitor`;
     const connect = () => {
       if (stop) return;
       setConnected(false);

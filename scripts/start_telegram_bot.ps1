@@ -8,7 +8,6 @@ if (-not (Test-Path -LiteralPath $python)) {
     throw "Telegram environment is missing. From the repo root run: py -3 -m venv .venv-telegram"
 }
 
-Write-Host "Use the fresh token generated after revoking the one previously shared."
 $secureBotToken = Read-Host "Telegram bot token (input hidden)" -AsSecureString
 $botToken = [System.Net.NetworkCredential]::new("", $secureBotToken).Password
 if ([string]::IsNullOrWhiteSpace($botToken)) {

@@ -104,8 +104,13 @@ _YOUTUBE = [
     re.compile(r"^(?:please\s+)?(?:search|look\s+up)\s+youtube\s+for\s+(?P<q>.+)$", re.I),
     re.compile(r"^(?:please\s+)?(?:open|go\s+to)\s+youtube\s+and\s+(?:search\s+(?:for\s+)?|play\s+|find\s+)(?P<q>.+)$", re.I),
 ]
+_OPEN_BROWSER_URL = re.compile(
+    rf"^(?:please\s+)?(?:open|launch|start|use)\s+(?P<browser>{_BROWSERS})\s+"
+    rf"(?:and\s+)?(?:go\s+to|navigate\s+to|visit|open)\s+"
+    rf"(?P<url>https?://[^\s<>\"“”]+?)"
+    rf"(?:\s+using\s+(?:the\s+)?(?:web\s+)?browser(?:\s+tool)?)?$", re.I)
 _GOTO = re.compile(r"^(?:please\s+)?(?:go\s+to|navigate\s+to|visit|browse\s+to|open\s+(?:up\s+)?(?:the\s+)?(?:website|site|page))\s+(?P<site>.+)$", re.I)
-_OPEN_DOMAIN = re.compile(r"^(?:please\s+)?(?:open|launch|load)\s+(?P<site>[a-z0-9-]+(?:\s*(?:\.|\s+dot\s+)\s*[a-z0-9-]+)+(?:/\S*)?)$", re.I)
+_OPEN_DOMAIN = re.compile(r"^(?:please\s+)?(?:open|launch|load)\s+(?P<site>(?:https?://)?[a-z0-9-]+(?:\s*(?:\.|\s+dot\s+)\s*[a-z0-9-]+)+(?:/\S*)?(?:\?\S*)?)$", re.I)
 SITES = {
     "google": "https://www.google.com", "gmail": "https://mail.google.com",
     "youtube": "https://www.youtube.com", "github": "https://github.com",
@@ -164,7 +169,10 @@ def _browser_key(raw: str | None) -> str:
 
 def site_url(raw: str) -> str | None:
     """'github' / 'github.com' / 'nytimes dot com/world' → a URL, or None if it isn't a site."""
-    s = (raw or "").strip().strip(".!?,").lower()
+    original = (raw or "").strip().strip(".!?,;:")
+    if re.fullmatch(r"https?://[^\s<>\"“”]+", original, re.I):
+        return original
+    s = original.lower()
     s = re.sub(r"^the\s+", "", s)
     s = re.sub(r"\s+(?:website|site|page|homepage)$", "", s)
     if s in SITES:
@@ -463,7 +471,13 @@ def match(text: str) -> FastIntent | None:
     # so the typed content keeps the user's capitalisation and punctuation.
     m = _OPEN_TYPE.match(raw0) or _TYPE_IN.match(raw0)
     if m:
-        content = m.group("content").strip().strip('"“”')
+        content = m.group("content").strip()
+        content = re.sub(r"^(?:exactly|this exact text)\s*:\s*", "", content, flags=re.I)
+        content = content.strip()
+        if len(content) >= 2 and content[0] + content[-1] in {'""', "''", "“”", "‘’"}:
+            content = content[1:-1]
+        else:
+            content = content.strip('"“”‘’')
         if content:
             return FastIntent("OPEN_AND_TYPE",
                               {"app": _TYPE_APPS.get(_norm(m.group("app")), "notepad"),
@@ -482,11 +496,25 @@ def match(text: str) -> FastIntent | None:
             if q and not re.match(r"^(?:my|the)\s+(?:files|folders?|computer|pc|downloads|documents|desktop)\b", q):
                 return FastIntent("WEB_SEARCH", {"query": q,
                                                  "browser": _browser_key(m.groupdict().get("browser"))})
-    m = _GOTO.match(t) or _OPEN_DOMAIN.match(t)
+    raw_url_command = _OPEN_BROWSER_URL.match(raw0)
+    if raw_url_command:
+        url = raw_url_command.group("url").rstrip(".,!?;:)")
+        return FastIntent("OPEN_URL", {"url": url, "site": url,
+                                        "browser": _browser_key(raw_url_command.group("browser"))})
+
+    m = _GOTO.match(raw0) or _OPEN_DOMAIN.match(raw0)
     if m:
         url = site_url(m.group("site"))
         if url:
-            return FastIntent("OPEN_URL", {"url": url, "site": m.group("site").strip()})
+            params = {"url": url, "site": m.group("site").strip()}
+            browser_match = re.match(
+                rf"^(?P<site>.+?)\s+in\s+(?P<browser>{_BROWSERS})$", m.group("site"), re.I)
+            if browser_match:
+                url = site_url(browser_match.group("site"))
+                if url:
+                    params = {"url": url, "site": browser_match.group("site").strip(),
+                              "browser": _browser_key(browser_match.group("browser"))}
+            return FastIntent("OPEN_URL", params)
 
     if _TIME.match(t):
         return FastIntent("TIME", {})

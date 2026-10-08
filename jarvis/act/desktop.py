@@ -740,7 +740,9 @@ def _window_action(title: str, op: str) -> str:
             w.restore()
         else:
             return f"window_{op}: unknown op."
-        return f"window {op}d: {getattr(w, 'title', '')!r}"
+        verb = {"focus": "focused", "minimize": "minimized", "maximize": "maximized",
+                "restore": "restored", "close": "closed"}.get(op, op)
+        return f"window {verb}: {getattr(w, 'title', '')!r}"
     except Exception as exc:
         return f"window_{op} failed: {exc}"
 

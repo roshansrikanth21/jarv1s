@@ -85,7 +85,7 @@
     }
     function connect() {
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(proto + "//" + location.host + "/ws");
+      ws = new WebSocket(proto + "//" + location.host + "/ws?client=monitor");
       ws.onmessage = (e) => {
         let d; try { d = JSON.parse(e.data); } catch { return; }
         if (d.type === "audio_level") {

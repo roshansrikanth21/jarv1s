@@ -58,6 +58,19 @@ class FastPathRouter(unittest.TestCase):
         # "turn it up" must be VOLUME, never OPEN_APP "it up".
         self.assertEqual(self.fp.match("turn it up").kind, "VOLUME")
 
+    def test_demo_browser_url_and_exact_notepad_text(self):
+        browser = self.fp.match(
+            "Open Chrome and navigate to https://example.com using the browser tool.")
+        self.assertEqual(browser.kind, "OPEN_URL")
+        self.assertEqual((browser.params["url"], browser.params["browser"]),
+                         ("https://example.com", "chrome"))
+
+        note = self.fp.match(
+            "Open Notepad and type exactly: ‘The best way out is always through. — Robert Frost.’")
+        self.assertEqual(note.kind, "OPEN_AND_TYPE")
+        self.assertEqual(note.params["content"],
+                         "The best way out is always through. — Robert Frost.")
+
     def test_task_intents(self):
         self.assertEqual(self.fp.match("add a task to review the PR").params["text"], "review the PR")
         self.assertEqual(self.fp.match("create task buy milk").params["text"], "buy milk")
@@ -257,6 +270,16 @@ class FastExecuteHonesty(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(opened[-1], ("https://www.google.com/search?q=what+is+a+perceptron", "chrome"))
         self.assertIn("Searching for what is a perceptron", reply)
+
+    def test_full_url_opens_in_the_requested_browser(self):
+        opened = []
+        self.api._open_in_browser = lambda url, browser="": opened.append((url, browser))
+        intent = self.fp.match(
+            "Open Chrome and navigate to https://example.com using the browser tool.")
+        reply, handled = self.api._fast_execute(intent)
+        self.assertTrue(handled)
+        self.assertEqual(opened[-1], ("https://example.com", "chrome"))
+        self.assertIn("Opening", reply)
 
     def test_browser_failure_is_reported_honestly(self):
         self.api._open_in_browser = lambda url, browser="": "no browser is available"
