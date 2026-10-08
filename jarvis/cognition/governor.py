@@ -78,15 +78,21 @@ _LAMBDA_REG = 0.05    # ridge regularization
 
 
 # ── Difficulty estimation (cheap, prompt-only) ───────────────────────────────────
-_CODE_RE = re.compile(r"```|\bdef \b|\bclass \b|\bimport \b|\bfunction\b|[{};]|</?\w+>|\b0x[0-9a-f]+", re.I)
-_MATH_RE = re.compile(r"\$.+?\$|\\frac|\\sum|\b\d+\s*[\+\-\*/\^=]\s*\d+|\bintegral\b|\bderivative\b|\bprove\b|\bsolve\b", re.I)
+_CODE_RE = re.compile(
+    r"```|\bdef \b|\bclass \b|\bimport \b|\bfunction\b|[{};]|</?\w+>|\b0x[0-9a-f]+|"
+    r"\bc\+\+\b|\bc#\b|\brust\b|\bgolang\b|\btypescript\b|\bmutex\b|\bthread[- ]?safe\b|"
+    r"\bbig-?o\b|\bmerge sort\b|\blinked list\b|\bbinary tree\b", re.I)
+_MATH_RE = re.compile(r"\$.+?\$|\\frac|\\sum|\b\d+\s*[\+\-\*/\^=]\s*\d+|\bintegral\b|\bderivative\b|\bprove\b|\bsolve\b|\btheorem\b|\bmatrix\b|\beigen", re.I)
 _TOOL_WORDS = {"search", "news", "today", "latest", "file", "run", "scan", "screen",
                "command", "launch", "remember", "recall", "calculate", "weather", "price", "market"}
 _MULTISTEP_WORDS = {"then", "after", "first", "step", "plan", "design", "compare",
-                    "analyze", "refactor", "debug", "explain why", "trade-off", "architecture"}
+                    "analyze", "refactor", "debug", "explain why", "trade-off", "tradeoff",
+                    "architecture", "architect", "implement", "optimize", "optimise"}
 _HARD_WORDS = {"exploit", "vulnerability", "reverse", "cryptography", "proof", "prove",
                "optimi", "algorithm", "concurren", "lock-free", "race condition",
-               "threat model", "rationale", "distributed", "kernel", "pointer", "throughput"}
+               "threat model", "rationale", "distributed", "kernel", "pointer", "throughput",
+               "thread-safe", "thread safe", "deadlock", "atomic", "semaphore", "complexity",
+               "scalab", "compiler", "data structure", "parallel", "cache"}
 _SHORT_CHAT_RE = re.compile(
     r"^(?:hi|hello|hey(?: jarvis)?|good morning|good afternoon|good evening|good night|"
     r"thanks|thank you|yes|no|ok|okay|cool|nice|how are you|what's up|whats up|who are you)[.!? ]*$",
@@ -291,7 +297,7 @@ class GovernorState:
 # Difficulty at/above which a request is genuinely "deep" (multi-step technical work, hard
 # domain + code/math). Below it, the fast tier answers — a definition like "what is a
 # perceptron" scores ~0.01 and must never leave the fast tier.
-DEEP_DIFFICULTY = float(os.environ.get("JARVIS_DEEP_DIFFICULTY", "0.6"))
+DEEP_DIFFICULTY = float(os.environ.get("JARVIS_DEEP_DIFFICULTY", "0.5"))
 
 
 def _is_deep(diff: dict) -> bool:

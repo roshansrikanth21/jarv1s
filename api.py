@@ -2504,6 +2504,119 @@ def _shutdown_browser() -> None:
 atexit.register(_shutdown_browser)
 
 
+def _windows_for_proc(proc_name: str) -> dict[int, int]:
+    """Map visible-window HWND -> owning pid for every window owned by a process named
+    `proc_name` (e.g. 'notepad.exe'). Windows-only; {} elsewhere or on error."""
+    if os.name != "nt":
+        return {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        want = proc_name.lower()
+        pids = {pr.pid for pr in psutil.process_iter(["name"])
+                if (pr.info.get("name") or "").lower() == want}
+        out: dict[int, int] = {}
+        if not pids:
+            return out
+        user32 = ctypes.windll.user32
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                wpid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+                if wpid.value in pids:
+                    out[int(hwnd)] = wpid.value
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        return out
+    except Exception:
+        return {}
+
+
+def _foreground_hwnd(hwnd: int) -> bool:
+    """Force one specific window to the real foreground WITH keyboard focus. A plain
+    SetForegroundWindow from a background service is silently blocked by Windows' foreground
+    lock (the window raises but focus stays elsewhere, so synthesized keys miss). The reliable
+    workaround: attach our input queue to the target's thread, then set foreground + focus."""
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        user32.ShowWindow(hwnd, 9)               # SW_RESTORE
+        fg = user32.GetForegroundWindow()
+        this_tid = kernel32.GetCurrentThreadId()
+        tgt_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        for t in (tgt_tid, fg_tid):
+            if t and t != this_tid:
+                user32.AttachThreadInput(this_tid, t, True)
+        # Attaching our input queue to the target's thread lets SetForegroundWindow succeed
+        # without the ALT-key foreground nudge (which makes Notepad flash its menu mnemonics).
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+        user32.SetFocus(hwnd)
+        ok = bool(user32.GetForegroundWindow() == hwnd)
+        if not ok:
+            # Fall back to the ALT nudge only if attaching alone didn't win the foreground.
+            try:
+                user32.keybd_event(0x12, 0, 0, 0)    # ALT down
+                user32.keybd_event(0x12, 0, 2, 0)    # ALT up
+            except Exception:
+                pass
+            user32.SetForegroundWindow(hwnd)
+            ok = bool(user32.GetForegroundWindow() == hwnd)
+        for t in (tgt_tid, fg_tid):
+            if t and t != this_tid:
+                user32.AttachThreadInput(this_tid, t, False)
+        return ok
+    except Exception:
+        return False
+
+
+def _foreground_pids(pids: set[int]) -> bool:
+    """Raise ONE visible window owned by any pid in `pids` (the process + its children) to the
+    foreground, so a following type_text lands in it and nowhere else. Returns True if a window
+    was raised. Windows-only; silent no-op elsewhere."""
+    if os.name != "nt" or not pids:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # Expand to children — a launched app's visible window often belongs to a child process.
+        full = set(pids)
+        for pid in list(pids):
+            try:
+                full |= {c.pid for c in psutil.Process(pid).children(recursive=True)}
+            except Exception:
+                pass
+        user32 = ctypes.windll.user32
+        targets: list[int] = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                wpid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+                if wpid.value in full:
+                    targets.append(hwnd)
+            return True
+
+        user32.EnumWindows(_enum, 0)
+        if not targets:
+            return False
+        hwnd = targets[0]                        # one deterministic window, not a scattershot
+        user32.ShowWindow(hwnd, 9)               # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
 def _foreground_chrome() -> None:
     """Best-effort: raise our debug Chrome to the foreground (Windows) so the user actually
     sees it act, instead of it working behind the JARVIS window. Matches any window owned by
@@ -3901,6 +4014,7 @@ _TOOL_LABELS = {
 }
 _FAST_LABELS = {
     "OPEN_APP": "Opening the app…", "CLOSE_APP": "Closing the app…",
+    "OPEN_AND_TYPE": "Opening it and typing…",
     "VOLUME": "Adjusting volume…", "BRIGHTNESS": "Adjusting brightness…",
     "MEDIA": "Controlling media…", "WIFI": "Switching Wi-Fi…", "LOCK": "Locking…",
     "SCREENSHOT": "Taking a screenshot…", "REMINDER": "Setting the reminder…",
@@ -5345,6 +5459,50 @@ def _fast_execute(intent: "fastpath.FastIntent") -> tuple[str, bool]:
         if "fail" in r.lower() or "error" in r.lower() or "admin" in r.lower():
             return f"I couldn't turn Wi-Fi {state} — {r}", True
         return f"Wi-Fi {state}.", True
+
+    if kind == "OPEN_AND_TYPE":
+        app = p.get("app", "notepad")
+        content = p["content"]
+        cmd = _LAUNCH_ALLOWLIST.get(app)
+        target = _resolve_launch_target(cmd) if cmd else None
+        if not target:
+            return "", False                         # unknown editor — let the agent handle it
+        # Write the text to a file and open it in the editor. This is 100% reliable — the text
+        # is THERE when the window opens — unlike synthesising keystrokes from a background
+        # service, which Windows' foreground lock silently drops into the wrong window.
+        try:
+            notes_dir = os.path.join(os.path.expanduser("~"), "Documents", "JARVIS Notes")
+            os.makedirs(notes_dir, exist_ok=True)
+            fname = f"note-{datetime.now():%Y%m%d-%H%M%S}.txt"
+            fpath = os.path.join(notes_dir, fname)
+            with open(fpath, "w", encoding="utf-8") as fh:
+                fh.write(content + "\n")
+            proc_name = _CLOSE_PROCESS.get(app) or f"{app}.exe"
+            before = set(_windows_for_proc(proc_name))
+            subprocess.Popen([target, fpath], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+            # Surface the window on a background thread so the reply returns immediately (Win11's
+            # Store Notepad is single-instance and can cold-start slowly, and it steals focus back
+            # while loading — so we wait for the window to exist and settle, THEN raise it once,
+            # which is what reliably brings it to the front). The content is saved regardless.
+            def _surface():
+                deadline = time.time() + 8
+                hwnd = 0
+                while time.time() < deadline:
+                    time.sleep(0.2)
+                    wins = _windows_for_proc(proc_name)
+                    if not wins:
+                        continue
+                    new = [h for h in wins if h not in before]
+                    hwnd = new[0] if new else next(iter(wins))
+                    break
+                if hwnd:
+                    time.sleep(0.8)                  # let Store Notepad finish loading the tab
+                    _foreground_hwnd(hwnd)
+            threading.Thread(target=_surface, name="open-and-type-surface", daemon=True).start()
+        except Exception as exc:
+            return f"I couldn't open {app} with that text — {exc}.", True
+        return f"Done — opened {app} with “{content}”.", True
 
     if kind == "WEB_SEARCH":
         q = p["query"]

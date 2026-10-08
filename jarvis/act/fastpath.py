@@ -123,6 +123,17 @@ SITES = {
     "google calendar": "https://calendar.google.com", "news": "https://news.google.com",
 }
 
+# ── open-and-type (compound) ────────────────────────────────────────────────────────
+_TYPE_APPS = {"notepad": "notepad", "note pad": "notepad", "notepad.exe": "notepad",
+              "notes": "notepad", "a note": "notepad", "wordpad": "wordpad", "word": "wordpad"}
+_TYPE_APP_RX = r"(?P<app>notepad|note\s?pad|notes|a\s+note|wordpad|word)"
+_OPEN_TYPE = re.compile(
+    rf"^(?:please\s+)?(?:open|launch|start|fire\s+up)\s+(?:a\s+|the\s+)?{_TYPE_APP_RX}\s+"
+    rf"(?:and|then|,|to)?\s*(?:type|write|enter|put|say|jot\s+down|note)\s+(?P<content>.+)$", re.I)
+_TYPE_IN = re.compile(
+    rf"^(?:please\s+)?(?:type|write|enter|jot\s+down|note)\s+(?P<content>.+?)\s+"
+    rf"(?:in(?:to)?|on|to)\s+(?:a\s+|the\s+)?{_TYPE_APP_RX}$", re.I)
+
 # ── time / date / timer ───────────────────────────────────────────────────────────
 _TIME = re.compile(r"^(?:what(?:'?s|\s+is)\s+the\s+time(?:\s+now)?|what\s+time\s+is\s+it(?:\s+now)?|(?:tell\s+me\s+)?the\s+time|time\s+check)$", re.I)
 _DATE = re.compile(r"^(?:what(?:'?s|\s+is)\s+(?:the\s+|today'?s\s+)?date(?:\s+today)?|what\s+day\s+is\s+(?:it|today)(?:\s+today)?|what(?:'?s|\s+is)\s+today)$", re.I)
@@ -444,6 +455,17 @@ def match(text: str) -> FastIntent | None:
         return FastIntent("LOCK", {})
     if _SHOT.match(t):
         return FastIntent("SCREENSHOT", {})
+
+    # "open notepad and type X" / "write X in notepad" — a verified compound the model
+    # shouldn't have to orchestrate (two tool calls it can fumble). Match the ORIGINAL text
+    # so the typed content keeps the user's capitalisation and punctuation.
+    m = _OPEN_TYPE.match(raw0) or _TYPE_IN.match(raw0)
+    if m:
+        content = m.group("content").strip().strip('"“”')
+        if content:
+            return FastIntent("OPEN_AND_TYPE",
+                              {"app": _TYPE_APPS.get(_norm(m.group("app")), "notepad"),
+                               "content": content})
 
     # Web: YouTube first (most specific), then search, then sites.
     for rx in _YOUTUBE:
