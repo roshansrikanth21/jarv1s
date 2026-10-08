@@ -16,6 +16,12 @@ ever consulted:
     "take a screenshot"       -> SCREENSHOT
     "lock my pc"              -> LOCK
     "turn wifi off"           -> WIFI          state=off
+    "open chrome and search for perceptrons"
+                              -> WEB_SEARCH    query=perceptrons browser=chrome
+    "play lofi on youtube"    -> YOUTUBE       query=lofi
+    "go to github.com"        -> OPEN_URL      url=https://github.com
+    "what time is it"         -> TIME
+    "set a timer for 5 minutes" -> TIMER       amount=5 unit=minutes
 
 It is intentionally conservative: it matches only unambiguous, fully-specified commands and
 returns None for everything else (which then goes to the full agent). A match is a *promise*
@@ -80,6 +86,80 @@ def _norm(text: str) -> str:
     t = re.sub(r"\s+", " ", t)
     t = t.replace("wi-fi", "wifi").replace("wi fi", "wifi")
     return t
+
+
+# ── web: search / youtube / sites ─────────────────────────────────────────────────
+_BROWSERS = r"(?:the\s+|a\s+)?(?:web\s+)?(?:browser|chrome|google\s+chrome|edge|microsoft\s+edge|firefox|brave)"
+_SEARCH_VERB = r"(?:search(?:\s+(?:the\s+web|online|google|the\s+internet))?(?:\s+for)?|google|look\s+up|find)"
+_WEB_SEARCH = [
+    # "open (the) browser/chrome and search (for) X"
+    re.compile(rf"^(?:please\s+)?(?:open|launch|start|go\s+to|use)\s+(?P<browser>{_BROWSERS})\s+(?:and\s+|then\s+|to\s+)?{_SEARCH_VERB}\s+(?P<q>.+)$", re.I),
+    # "search (the web) for X (on chrome)", "google X"
+    re.compile(rf"^(?:please\s+)?(?:search(?:\s+(?:the\s+web|online|the\s+internet))?\s+for|search\s+google\s+for|google|web\s+search(?:\s+for)?)\s+(?P<q>.+?)(?:\s+(?:on|in|using)\s+(?P<browser>{_BROWSERS}))?$", re.I),
+    # "search X on google / in the browser", "look up X online"
+    re.compile(rf"^(?:please\s+)?(?:search|look\s+up|find)\s+(?:for\s+)?(?P<q>.+?)\s+(?:on\s+google|online|on\s+the\s+(?:web|internet)|(?:on|in|using)\s+(?P<browser>{_BROWSERS}))$", re.I),
+]
+_YOUTUBE = [
+    re.compile(r"^(?:please\s+)?(?:play|search\s+(?:for\s+)?|find|put\s+on|watch)\s+(?P<q>.+?)\s+(?:on|in)\s+youtube$", re.I),
+    re.compile(r"^(?:please\s+)?(?:search|look\s+up)\s+youtube\s+for\s+(?P<q>.+)$", re.I),
+    re.compile(r"^(?:please\s+)?(?:open|go\s+to)\s+youtube\s+and\s+(?:search\s+(?:for\s+)?|play\s+|find\s+)(?P<q>.+)$", re.I),
+]
+_GOTO = re.compile(r"^(?:please\s+)?(?:go\s+to|navigate\s+to|visit|browse\s+to|open\s+(?:up\s+)?(?:the\s+)?(?:website|site|page))\s+(?P<site>.+)$", re.I)
+_OPEN_DOMAIN = re.compile(r"^(?:please\s+)?(?:open|launch|load)\s+(?P<site>[a-z0-9-]+(?:\s*(?:\.|\s+dot\s+)\s*[a-z0-9-]+)+(?:/\S*)?)$", re.I)
+SITES = {
+    "google": "https://www.google.com", "gmail": "https://mail.google.com",
+    "youtube": "https://www.youtube.com", "github": "https://github.com",
+    "maps": "https://maps.google.com", "google maps": "https://maps.google.com",
+    "reddit": "https://www.reddit.com", "wikipedia": "https://en.wikipedia.org",
+    "chatgpt": "https://chatgpt.com", "claude": "https://claude.ai",
+    "twitter": "https://x.com", "x": "https://x.com", "amazon": "https://www.amazon.com",
+    "netflix": "https://www.netflix.com", "linkedin": "https://www.linkedin.com",
+    "instagram": "https://www.instagram.com", "facebook": "https://www.facebook.com",
+    "whatsapp": "https://web.whatsapp.com", "outlook": "https://outlook.live.com",
+    "stackoverflow": "https://stackoverflow.com", "stack overflow": "https://stackoverflow.com",
+    "notion": "https://www.notion.so", "twitch": "https://www.twitch.tv",
+    "google drive": "https://drive.google.com", "drive": "https://drive.google.com",
+    "google docs": "https://docs.google.com", "calendar": "https://calendar.google.com",
+    "google calendar": "https://calendar.google.com", "news": "https://news.google.com",
+}
+
+# ── time / date / timer ───────────────────────────────────────────────────────────
+_TIME = re.compile(r"^(?:what(?:'?s|\s+is)\s+the\s+time(?:\s+now)?|what\s+time\s+is\s+it(?:\s+now)?|(?:tell\s+me\s+)?the\s+time|time\s+check)$", re.I)
+_DATE = re.compile(r"^(?:what(?:'?s|\s+is)\s+(?:the\s+|today'?s\s+)?date(?:\s+today)?|what\s+day\s+is\s+(?:it|today)(?:\s+today)?|what(?:'?s|\s+is)\s+today)$", re.I)
+_NUM = r"\d+|a|an|one|two|three|five|ten|fifteen|twenty|thirty"
+_TIMER = re.compile(
+    rf"^(?:please\s+)?(?:set|start)\s+(?:a\s+|an\s+|the\s+)?(?:timer|countdown)\s+(?:for\s+)?(?P<n>{_NUM})\s*(?P<u>seconds?|secs?|minutes?|mins?|hours?|hrs?)$"
+    rf"|^(?:please\s+)?(?:set|start)\s+(?:a\s+|an\s+)?(?P<n2>{_NUM})[\s-]*(?P<u2>seconds?|secs?|minutes?|mins?|hours?|hrs?)\s+(?:timer|countdown)$", re.I)
+_NUMWORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "five": 5, "ten": 10,
+             "fifteen": 15, "twenty": 20, "thirty": 30}
+
+
+def _clean_query(q: str) -> str:
+    q = (q or "").strip().strip(".!?,;: \"'")
+    q = re.sub(r"^(?:for|about)\s+", "", q, flags=re.I)
+    q = re.sub(r"\s+(?:please|for\s+me|now)$", "", q, flags=re.I)
+    return q.strip()
+
+
+def _browser_key(raw: str | None) -> str:
+    b = (raw or "").lower()
+    for key in ("chrome", "edge", "firefox", "brave"):
+        if key in b:
+            return key
+    return ""                                   # the default browser
+
+
+def site_url(raw: str) -> str | None:
+    """'github' / 'github.com' / 'nytimes dot com/world' → a URL, or None if it isn't a site."""
+    s = (raw or "").strip().strip(".!?,").lower()
+    s = re.sub(r"^the\s+", "", s)
+    s = re.sub(r"\s+(?:website|site|page|homepage)$", "", s)
+    if s in SITES:
+        return SITES[s]
+    dom = re.sub(r"\s+dot\s+", ".", s).replace(" ", "")
+    if re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:/\S*)?", dom) and not re.fullmatch(r"[\d.]+", dom):
+        return f"https://{dom}"
+    return None
 
 
 # ── open / close ────────────────────────────────────────────────────────────────
@@ -364,6 +444,38 @@ def match(text: str) -> FastIntent | None:
         return FastIntent("LOCK", {})
     if _SHOT.match(t):
         return FastIntent("SCREENSHOT", {})
+
+    # Web: YouTube first (most specific), then search, then sites.
+    for rx in _YOUTUBE:
+        m = rx.match(t)
+        if m and _clean_query(m.group("q")):
+            return FastIntent("YOUTUBE", {"query": _clean_query(m.group("q"))})
+    for rx in _WEB_SEARCH:
+        m = rx.match(t)
+        if m:
+            q = _clean_query(m.group("q"))
+            # "search my files for X" is a filesystem ask, not the web
+            if q and not re.match(r"^(?:my|the)\s+(?:files|folders?|computer|pc|downloads|documents|desktop)\b", q):
+                return FastIntent("WEB_SEARCH", {"query": q,
+                                                 "browser": _browser_key(m.groupdict().get("browser"))})
+    m = _GOTO.match(t) or _OPEN_DOMAIN.match(t)
+    if m:
+        url = site_url(m.group("site"))
+        if url:
+            return FastIntent("OPEN_URL", {"url": url, "site": m.group("site").strip()})
+
+    if _TIME.match(t):
+        return FastIntent("TIME", {})
+    if _DATE.match(t):
+        return FastIntent("DATE", {})
+    m = _TIMER.match(t)
+    if m:
+        n_raw = (m.group("n") or m.group("n2") or "1").lower()
+        unit = (m.group("u") or m.group("u2") or "minutes").lower()
+        n = int(n_raw) if n_raw.isdigit() else _NUMWORDS.get(n_raw, 1)
+        unit = "seconds" if unit.startswith("s") else ("hours" if unit.startswith("h") else "minutes")
+        if n > 0:
+            return FastIntent("TIMER", {"amount": n, "unit": unit})
 
     # Open/close LAST: their captures are greedy, so specific patterns above win first
     # (e.g. "turn it up" must not be read as open-an-app "it up").

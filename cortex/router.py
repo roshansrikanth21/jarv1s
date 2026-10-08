@@ -47,13 +47,39 @@ def _has_claude() -> bool:
     return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 
+_ollama_models_cache: list[str] | None = None
+
+
+def _ollama_installed() -> list[str]:
+    """Names of models Ollama actually has, cached. [] if Ollama is down."""
+    global _ollama_models_cache
+    if _ollama_models_cache is None:
+        try:
+            import ollama
+            _ollama_models_cache = [m.model for m in ollama.list().models]
+        except Exception:
+            return []
+    return _ollama_models_cache
+
+
 def _ollama_up() -> bool:
-    try:
-        import ollama
-        ollama.list()
-        return True
-    except Exception:
-        return False
+    return bool(_ollama_installed())
+
+
+def _resolve_ollama(preferred: str) -> str:
+    """Map a configured model to one Ollama actually serves — exact, then prefix (so
+    'qwen2.5:7b' matches an installed 'qwen2.5:7b-instruct'), else the first installed
+    model. Stops the repeated 404s when the pinned name isn't present."""
+    have = _ollama_installed()
+    if not have:
+        return preferred
+    if preferred in have:
+        return preferred
+    base = preferred.split(":", 1)[0]
+    for m in have:
+        if m == preferred or m.split(":", 1)[0] == base:
+            return m
+    return have[0]
 
 
 async def _call_groq(model: str, prompt: str, max_tokens: int,
@@ -69,6 +95,10 @@ async def _call_groq(model: str, prompt: str, max_tokens: int,
                   "max_tokens": max_tokens}
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
+        if "qwen3" in model.lower():
+            kwargs["reasoning_effort"] = "none"      # background work doesn't need hidden thinking
+        elif "gpt-oss" in model.lower():
+            kwargs["reasoning_effort"] = "low"
         r = await client.chat.completions.create(**kwargs)
         return (r.choices[0].message.content or "").strip()
     except Exception as exc:
@@ -132,12 +162,12 @@ async def route(task_type: str, prompt: str, *, json_mode: bool = False,
         candidates = [
             ("groq", GROQ_MODEL_CONSOL) if _has_groq() else None,
             ("claude", CLAUDE_MODEL) if _has_claude() else None,
-            ("ollama", LOCAL_DEEP or LOCAL_FAST) if _ollama_up() else None,
+            ("ollama", _resolve_ollama(LOCAL_DEEP or LOCAL_FAST)) if _ollama_up() else None,
         ]
     else:
         # fast-first: local fast > groq small > claude haiku
         candidates = [
-            ("ollama", LOCAL_FAST) if _ollama_up() else None,
+            ("ollama", _resolve_ollama(LOCAL_FAST)) if _ollama_up() else None,
             ("groq", GROQ_MODEL_EXTRACT) if _has_groq() else None,
             ("claude", CLAUDE_MODEL) if _has_claude() else None,
         ]

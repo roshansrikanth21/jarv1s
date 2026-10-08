@@ -20,6 +20,7 @@ Pure module: no api.py imports. api.py binds rung ids to actual model calls.
 from __future__ import annotations
 
 import math
+import os
 import re
 import time
 from typing import Any
@@ -287,11 +288,62 @@ class GovernorState:
         }
 
 
+# Difficulty at/above which a request is genuinely "deep" (multi-step technical work, hard
+# domain + code/math). Below it, the fast tier answers — a definition like "what is a
+# perceptron" scores ~0.01 and must never leave the fast tier.
+DEEP_DIFFICULTY = float(os.environ.get("JARVIS_DEEP_DIFFICULTY", "0.6"))
+
+
+def _is_deep(diff: dict) -> bool:
+    f = diff.get("factors") or {}
+    if diff.get("score", 0.0) >= DEEP_DIFFICULTY:
+        return True
+    return bool(f.get("hard", 0) >= 0.5 and (f.get("code") or f.get("math")))
+
+
+def _tier_pick(feas: list[dict], diff: dict, mode: str, device: dict) -> dict:
+    """Deterministic, explainable tiering (the router used to subtract a learned bonus of up
+    to ±0.25 from costs that only differ by ~0.03–0.2, so the bandit could push a trivial
+    question onto the slow local 'deep' model or the multi-model council).
+
+      fast cloud for everything ordinary (fastest + strong on this setup: ~0.5 s TTFT),
+      deep cloud only for genuinely hard work, local only when cloud isn't available or
+      the user chose local mode; the council is never picked automatically — it's 3+
+      model calls, so it only runs when explicitly asked ("deliberate", "convene", …)."""
+    ids = {r["id"] for r in feas}
+    deep = _is_deep(diff)
+
+    def first(*order: str) -> dict | None:
+        for rid in order:
+            if rid in ids:
+                return RUNG_BY_ID[rid]
+        return None
+
+    if mode == "local":
+        pick = first("local_deep", "local_fast") if deep else first("local_fast", "local_deep")
+    elif mode == "cloud":
+        pick = first("cloud_deep", "cloud_fast") if deep else first("cloud_fast", "cloud_deep")
+    elif mode == "eco":
+        pick = first("cloud_fast", "local_fast", "cloud_deep", "local_deep")
+    else:  # auto
+        if deep:
+            pick = first("cloud_deep", "cloud_fast", "local_deep", "local_fast")
+        else:
+            # A tiny local model is fine for small talk but not for real questions.
+            small_talk = bool(_SHORT_CHAT_RE.fullmatch(diff.get("_text", "")))
+            pick = first("cloud_fast", *(("local_fast",) if small_talk else ()),
+                         "local_deep", "local_fast", "cloud_deep")
+    if pick is None:
+        pick = next((r for r in feas if r["id"] != "council"), feas[0])
+    return pick
+
+
 def decide(text: str, history: list[dict] | None, device: dict,
            available: set[str], state: GovernorState, decision_id: str) -> dict:
     """Choose a rung. Returns a Decision dict (also appended to state.log)."""
     mode = state.mode
     diff = estimate_difficulty(text, history)
+    diff["_text"] = (text or "").strip()
     feas = feasible_rungs(available, device, mode)
     if not feas:
         pool = RUNGS
@@ -331,16 +383,7 @@ def decide(text: str, history: list[dict] | None, device: dict,
         lat = learned if learned is not None else r["latency"]
         return lam * r["energy"] + _MU * lat - state._bonus(r["id"], x)
 
-    adequate = [r for r in feas if r["quality"] >= min_q]
-    if mode == "cloud":
-        best = max(feas, key=lambda r: r["quality"] + 0.3 * state._bonus(r["id"], x))
-    elif (diff["score"] >= 0.85 and _on_ac(device) and mode == "auto"
-          and any(r["id"] == "council" for r in feas)):
-        best = RUNG_BY_ID["council"]          # hardest asks on a healthy machine convene the panel
-    elif adequate:
-        best = min(adequate, key=_cost)        # cheapest rung that clears the bar
-    else:
-        best = max(feas, key=lambda r: r["quality"] + 0.3 * state._bonus(r["id"], x))
+    best = _tier_pick(feas, diff, mode, device)
 
     # Scored list for the UI: net = quality - cost (higher is better).
     scored = sorted(((round(r["quality"] - _cost(r), 3), r) for r in feas),

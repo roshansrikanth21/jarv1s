@@ -17,7 +17,10 @@ type VoiceState =
   | "armed"
   | "accepted"
   | "unaddressed"
-  | "not_heard";
+  | "not_heard"
+  | "conversation"
+  | "thinking"
+  | "executing";
 
 const BARS = 12;
 const VOICE_STATES = new Set<VoiceState>([
@@ -34,6 +37,9 @@ const VOICE_STATES = new Set<VoiceState>([
   "accepted",
   "unaddressed",
   "not_heard",
+  "conversation",
+  "thinking",
+  "executing",
 ]);
 
 function isPillSurface() {
@@ -46,6 +52,9 @@ export function MicMonitor() {
   const [wakeRequired, setWakeRequired] = useState(true);
   const [wakeWord, setWakeWord] = useState("jarvis");
   const [heard, setHeard] = useState("");
+  // The backend's own wording for the current state ("Opening the search…", "Listening — go
+  // ahead…"). Preferred over the generic labels below whenever it's present.
+  const [detail, setDetail] = useState("");
   const [open, setOpen] = useState(false);
   const [connected, setConnected] = useState(false);
   const heardTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -53,6 +62,7 @@ export function MicMonitor() {
   const wsRef = useRef<WebSocket | null>(null);
   const energyRef = useRef(0);
   const threshRef = useRef(650);
+  const hearingRef = useRef(false);
   const barsRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<VoiceState>("connecting");
   const utteranceRef = useRef(-1);
@@ -99,6 +109,7 @@ export function MicMonitor() {
           const en = Number(d.energy) || 0;
           energyRef.current = energyRef.current * 0.55 + en * 0.45;
           if (d.thresh) threshRef.current = Number(d.thresh);
+          hearingRef.current = Boolean(d.hearing);
         }
         if (
           d.type === "state" &&
@@ -107,6 +118,7 @@ export function MicMonitor() {
           stateRef.current !== "connecting"
         ) {
           setState("speaking");
+          setDetail("");
         }
         if (d.type === "mic") {
           const active = Boolean(d.listening);
@@ -119,6 +131,7 @@ export function MicMonitor() {
           }
           utteranceRef.current = -1;
           setState(active ? (d.wake_required === false ? "ready" : "waiting") : "off");
+          setDetail("");
         }
         if (
           d.type === "voice" &&
@@ -146,6 +159,7 @@ export function MicMonitor() {
             clearTimeout(statusTimer.current);
           }
           setState(visible as VoiceState);
+          setDetail(typeof d.text === "string" ? d.text : "");
           if (["accepted", "unaddressed", "not_heard"].includes(visible)) {
             const seenId = id;
             statusTimer.current = setTimeout(() => {
@@ -164,6 +178,7 @@ export function MicMonitor() {
       ws.onclose = () => {
         setConnected(false);
         setState("connecting");
+        setDetail("");
         if (!stop) retry = setTimeout(connect, 1500);
       };
       ws.onerror = () => {
@@ -186,7 +201,7 @@ export function MicMonitor() {
       const el = barsRef.current;
       if (!el) return;
       const rel = Math.min(1, energyRef.current / Math.max(120, threshRef.current * 1.5));
-      const over = energyRef.current > threshRef.current;
+      const over = hearingRef.current || energyRef.current > threshRef.current;
       const children = el.children;
       for (let i = 0; i < children.length; i++) {
         const b = children[i] as HTMLElement;
@@ -218,38 +233,54 @@ export function MicMonitor() {
   };
 
   const wakePhrase = `Hey ${wakeWord.charAt(0).toUpperCase()}${wakeWord.slice(1)}`;
+  const fallback =
+    state === "conversation"
+      ? "Listening — just keep talking"
+      : state === "thinking"
+        ? "Thinking…"
+        : state === "executing"
+          ? "Working on it…"
+          : null;
   const label =
-    state === "off"
-      ? "Mic off"
-      : state === "connecting"
-        ? "Connecting…"
-        : state === "waiting"
-          ? `Waiting for “${wakePhrase}”`
-          : state === "ready"
-            ? "Ready — say something"
-            : state === "hearing"
-              ? "Hearing you…"
-              : state === "transcribing"
-                ? "Checking what you said…"
-                : state === "preparing"
-                  ? "Preparing reply audio…"
-                  : state === "speaking"
-                    ? "JARVIS speaking — mic paused"
-                    : state === "armed_wait"
-                      ? "Wait for my cue…"
-                      : state === "armed"
-                        ? "Your turn — speak now"
-                        : state === "accepted"
-                          ? "Request received"
-                          : state === "unaddressed"
-                            ? `Heard speech — say “${wakePhrase}”`
-                            : "Didn't catch that — try again";
+    state !== "off" && state !== "connecting" && detail
+      ? detail
+      : fallback
+        ? fallback
+        : state === "off"
+          ? "Mic off"
+          : state === "connecting"
+            ? "Connecting…"
+            : state === "waiting"
+              ? `Waiting for “${wakePhrase}”`
+              : state === "ready"
+                ? "Ready — say something"
+                : state === "hearing"
+                  ? "Hearing you…"
+                  : state === "transcribing"
+                    ? "Checking what you said…"
+                    : state === "preparing"
+                      ? "Preparing reply audio…"
+                      : state === "speaking"
+                        ? "JARVIS speaking — say “Hey Jarvis” to interrupt"
+                        : state === "armed_wait"
+                          ? "Wait for my cue…"
+                          : state === "armed"
+                            ? "Your turn — speak now"
+                            : state === "accepted"
+                              ? "Request received"
+                              : state === "unaddressed"
+                                ? `Heard speech — say “${wakePhrase}”`
+                                : "Didn't catch that — try again";
   const dot =
     state === "hearing"
       ? "#68d391"
-      : state === "transcribing" || state === "preparing" || state === "armed_wait"
+      : state === "transcribing" ||
+          state === "preparing" ||
+          state === "armed_wait" ||
+          state === "thinking" ||
+          state === "executing"
         ? "#c8a050"
-        : state === "accepted" || state === "armed"
+        : state === "accepted" || state === "armed" || state === "conversation"
           ? "#8ad7d2"
           : state === "off" || state === "connecting"
             ? "#626b78"
@@ -386,12 +417,14 @@ export function MicMonitor() {
                 : !connected
                   ? "Connecting to JARVIS…"
                   : state === "speaking"
-                    ? "JARVIS is speaking; the microphone is paused until playback ends."
-                    : state === "preparing"
-                      ? "JARVIS is preparing speech. Say the wake phrase if you need to interrupt."
-                      : wakeRequired
-                        ? `Say “${wakePhrase}” and your request together. Or say the wake phrase, wait for “Your turn,” then speak.`
-                        : "The microphone is on. Say your request whenever the status says “Ready.”"}
+                    ? "JARVIS is speaking. Say “Hey Jarvis” to interrupt."
+                    : state === "conversation"
+                      ? "Conversation mode — keep talking, no wake word needed. Say “that's all” to end it."
+                      : state === "preparing"
+                        ? "JARVIS is preparing speech. Say the wake phrase if you need to interrupt."
+                        : wakeRequired
+                          ? `Say “${wakePhrase}” and your request together. Or say the wake phrase, wait for “Your turn,” then speak.`
+                          : "The microphone is on. Say your request whenever the status says “Ready.”"}
               {heard && (
                 <div style={{ marginTop: 5, color: "rgba(232,236,240,0.9)" }}>
                   Last heard: “{heard}”

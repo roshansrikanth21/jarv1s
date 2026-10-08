@@ -11,17 +11,17 @@ websockets
 # Brain / vision / STT — all via Groq's free OpenAI-compatible API
 openai
 
-# Text-to-speech (Microsoft Edge neural voice, online)
+# Text-to-speech. Piper is the default: local, offline, ~50-250 ms to first audio
+# (voices download once to %LOCALAPPDATA%/JARVIS/models). Edge neural voices stay
+# available as an online option.
+piper-tts
 edge-tts
 
-# Voice input capture + VAD
+# Voice input capture + VAD + wake word. Silero VAD (bundled with faster-whisper) and the
+# openWakeWord "hey jarvis" model run on onnxruntime; models download on first use.
 sounddevice
 numpy
-
-# Robust speech detection (spectral VAD) — separates speech from mic/background noise far
-# better than an energy threshold. Prebuilt wheels, no C compiler needed. If absent, voice
-# capture degrades to a simple energy gate rather than breaking.
-webrtcvad-wheels
+onnxruntime
 
 # Local speech-to-text (CTranslate2 Whisper, base.en, CPU int8) — the default STT backend.
 # Runs offline with zero network round-trip, so wake-word detection is instant and doesn't

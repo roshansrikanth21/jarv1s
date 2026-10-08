@@ -197,11 +197,13 @@ class FastExecuteHonesty(unittest.TestCase):
         self.api = api
         self.fp = fastpath
         self._saved = (api.verify.is_running, api.verify.terminate,
-                       api.verify.wait_until_running, api._resolve_launch_target)
+                       api.verify.wait_until_running, api._resolve_launch_target,
+                       api._open_in_browser)
 
     def tearDown(self):
         (self.api.verify.is_running, self.api.verify.terminate,
-         self.api.verify.wait_until_running, self.api._resolve_launch_target) = self._saved
+         self.api.verify.wait_until_running, self.api._resolve_launch_target,
+         self.api._open_in_browser) = self._saved
 
     def test_open_reports_failure_when_process_never_appears(self):
         import subprocess
@@ -235,12 +237,32 @@ class FastExecuteHonesty(unittest.TestCase):
         self.assertIn("couldn't find", reply.lower())
         self.assertNotIn("open", reply.lower().split(".")[0])  # never "Opened ..."
 
-    def test_website_name_falls_through_to_agent_browse(self):
+    def test_website_name_opens_the_site_directly(self):
         self.api._resolve_launch_target = lambda cmd: None
+        opened = []
+        self.api._open_in_browser = lambda url, browser="": opened.append((url, browser))
         reply, handled = self.api._fast_execute(self.fp.FastIntent("OPEN_APP", {"app": "gmail"}))
-        self.assertFalse(handled)   # a known site → agent browses to it
+        self.assertTrue(handled)
+        self.assertEqual(opened[-1][0], "https://mail.google.com")
         reply, handled = self.api._fast_execute(self.fp.FastIntent("OPEN_APP", {"app": "nytimes.com"}))
-        self.assertFalse(handled)   # domain-looking → agent browses to it
+        self.assertTrue(handled)
+        self.assertEqual(opened[-1][0], "https://nytimes.com")
+
+    def test_web_search_opens_the_requested_browser(self):
+        opened = []
+        self.api._open_in_browser = lambda url, browser="": opened.append((url, browser))
+        intent = self.fp.match("open chrome and search for what is a perceptron")
+        self.assertEqual(intent.kind, "WEB_SEARCH")
+        reply, handled = self.api._fast_execute(intent)
+        self.assertTrue(handled)
+        self.assertEqual(opened[-1], ("https://www.google.com/search?q=what+is+a+perceptron", "chrome"))
+        self.assertIn("Searching for what is a perceptron", reply)
+
+    def test_browser_failure_is_reported_honestly(self):
+        self.api._open_in_browser = lambda url, browser="": "no browser is available"
+        reply, handled = self.api._fast_execute(self.fp.FastIntent("YOUTUBE", {"query": "lofi"}))
+        self.assertTrue(handled)
+        self.assertIn("couldn't", reply)
 
     def test_close_reports_gone_only_when_verified(self):
         self.api.verify.terminate = lambda exe, timeout=5.0: self.api.verify.VerifyResult(True, True, "closed")
@@ -257,3 +279,28 @@ class FastExecuteHonesty(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebAndClockIntents(unittest.TestCase):
+    """The everyday spoken commands that must never reach (or be fabricated by) the LLM."""
+
+    def test_matches(self):
+        from jarvis.act.fastpath import match
+        cases = {
+            "open a browser and search for perceptrons": ("WEB_SEARCH", {"query": "perceptrons", "browser": ""}),
+            "open edge and google best laptops": ("WEB_SEARCH", {"query": "best laptops", "browser": "edge"}),
+            "search the web for python asyncio": ("WEB_SEARCH", {"query": "python asyncio", "browser": ""}),
+            "play lofi beats on youtube": ("YOUTUBE", {"query": "lofi beats"}),
+            "go to github": ("OPEN_URL", {"url": "https://github.com", "site": "github"}),
+            "what time is it": ("TIME", {}),
+            "set a 10 minute timer": ("TIMER", {"amount": 10, "unit": "minutes"}),
+        }
+        for text, (kind, params) in cases.items():
+            intent = match(text)
+            self.assertIsNotNone(intent, text)
+            self.assertEqual((intent.kind, intent.params), (kind, params), text)
+
+    def test_questions_and_file_searches_are_not_web_commands(self):
+        from jarvis.act.fastpath import match
+        for text in ("what is a perceptron", "search my files for report", "find a good restaurant"):
+            self.assertIsNone(match(text), text)
